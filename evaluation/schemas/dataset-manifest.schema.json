@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bfl.example/schemas/rag/dataset-manifest.schema.json",
+  "title": "Protected RAG Dataset Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "datasetVersion",
+    "domain",
+    "useCase",
+    "source",
+    "classifications",
+    "contentVariants",
+    "documents",
+    "coverage",
+    "createdAt"
+  ],
+  "properties": {
+    "datasetVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "domain": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "useCase": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceId", "driveId", "libraryFingerprint"],
+      "properties": {
+        "sourceId": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "driveId": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "libraryFingerprint": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "classifications": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 100 }
+    },
+    "contentVariants": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 100 }
+    },
+    "documents": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/document" }
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "documentCount",
+        "queryTargetCount",
+        "classificationCounts",
+        "variantCounts"
+      ],
+      "properties": {
+        "documentCount": { "type": "integer", "minimum": 1 },
+        "queryTargetCount": { "type": "integer", "minimum": 100 },
+        "classificationCounts": { "$ref": "#/$defs/countMap" },
+        "variantCounts": { "$ref": "#/$defs/countMap" }
+      }
+    },
+    "createdAt": { "$ref": "#/$defs/dateTime" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "dateTime": { "type": "string", "format": "date-time" },
+    "countMap": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "itemId",
+        "eTag",
+        "contentHash",
+        "classification",
+        "format",
+        "structures",
+        "securityClass"
+      ],
+      "properties": {
+        "itemId": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "eTag": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "contentHash": { "$ref": "#/$defs/sha256" },
+        "classification": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "format": { "const": "pdf" },
+        "structures": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 100 }
+        },
+        "securityClass": { "type": "string", "minLength": 1, "maxLength": 100 }
+      }
+    }
+  }
+}

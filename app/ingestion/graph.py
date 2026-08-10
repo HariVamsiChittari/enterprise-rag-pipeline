@@ -1,0 +1,800 @@
+"""Microsoft Graph operations for one controlled SharePoint drive item."""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from ingestion.errors import TerminalDocumentError
+from ingestion.models import ScaleLimits
+
+
+GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
+GRAPH_ORIGIN = httpx.URL(GRAPH_ROOT)
+DELTA_PREFER = "deltashowremovedasdeleted, deltatraversepermissiongaps"
+DOWNLOAD_HOST_SUFFIXES = (
+    "files.1drv.com",
+    "livefilestore.com",
+    "onedrive.live.com",
+    "sharepoint.com",
+    "sharepointonline.com",
+    "storage.live.com",
+    "svc.ms",
+)
+CHILDREN_SELECT = "id,name,eTag,size,file,folder,package,parentReference,webUrl"
+SUPPORTED_ACL_ROLES = frozenset({"read", "write", "owner"})
+ACL_POLICY_VERSION = "verified-entra-security-groups-v1"
+
+
+@dataclass(frozen=True)
+class FolderCursor:
+    item_id: str
+    depth: int
+    next_link: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.item_id:
+            raise ValueError("folder item_id is required")
+        if self.depth < 0:
+            raise ValueError("folder depth cannot be negative")
+        if self.next_link is not None:
+            validate_graph_paging_url(self.next_link)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "itemId": self.item_id,
+            "depth": self.depth,
+            "nextLink": self.next_link,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> FolderCursor:
+        item_id = value.get("itemId")
+        depth = value.get("depth")
+        next_link = value.get("nextLink")
+        if not isinstance(item_id, str) or isinstance(depth, bool) or not isinstance(depth, int):
+            raise ValueError("folder cursor is invalid")
+        if next_link is not None and not isinstance(next_link, str):
+            raise ValueError("folder cursor nextLink is invalid")
+        return cls(item_id, depth, next_link)
+
+
+@dataclass(frozen=True)
+class DiscoveryState:
+    pending_folders: tuple[FolderCursor, ...]
+    items_scanned: int = 0
+    folders_discovered: int = 0
+    pdfs_discovered: int = 0
+    graph_pages: int = 0
+
+    def __post_init__(self) -> None:
+        counters = (
+            self.items_scanned,
+            self.folders_discovered,
+            self.pdfs_discovered,
+            self.graph_pages,
+        )
+        if any(value < 0 for value in counters):
+            raise ValueError("discovery counters cannot be negative")
+
+    @classmethod
+    def initial(cls, root_item_id: str = "root") -> DiscoveryState:
+        return cls((FolderCursor(root_item_id, 0),))
+
+    @property
+    def complete(self) -> bool:
+        return not self.pending_folders
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pendingFolders": [cursor.to_dict() for cursor in self.pending_folders],
+            "itemsScanned": self.items_scanned,
+            "foldersDiscovered": self.folders_discovered,
+            "pdfsDiscovered": self.pdfs_discovered,
+            "graphPages": self.graph_pages,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> DiscoveryState:
+        pending = value.get("pendingFolders")
+        counter_names = (
+            "itemsScanned",
+            "foldersDiscovered",
+            "pdfsDiscovered",
+            "graphPages",
+        )
+        counters = [value.get(name) for name in counter_names]
+        if not isinstance(pending, list) or not all(
+            isinstance(cursor, dict) for cursor in pending
+        ):
+            raise ValueError("discovery pending folders are invalid")
+        if any(isinstance(counter, bool) or not isinstance(counter, int) for counter in counters):
+            raise ValueError("discovery counters are invalid")
+        return cls(
+            tuple(FolderCursor.from_dict(cursor) for cursor in pending),
+            *counters,
+        )
+
+
+@dataclass(frozen=True)
+class DiscoveredPdf:
+    item_id: str
+    parent_item_id: str
+    name: str
+    source_path: str
+    source_url: str
+    e_tag: str
+    size_bytes: int
+    discovery_ordinal: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "itemId": self.item_id,
+            "parentItemId": self.parent_item_id,
+            "name": self.name,
+            "sourcePath": self.source_path,
+            "sourceUrl": self.source_url,
+            "eTag": self.e_tag,
+            "sizeBytes": self.size_bytes,
+            "discoveryOrdinal": self.discovery_ordinal,
+        }
+
+
+@dataclass(frozen=True)
+class ChildrenPage:
+    items: tuple[dict[str, Any], ...]
+    next_link: str | None
+
+
+@dataclass(frozen=True)
+class DiscoveryStep:
+    state: DiscoveryState
+    pdfs: tuple[DiscoveredPdf, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "state": self.state.to_dict(),
+            "pdfs": [pdf.to_dict() for pdf in self.pdfs],
+        }
+
+
+@dataclass(frozen=True)
+class VerifiedAcl:
+    allowed_group_ids: tuple[str, ...]
+    acl_hash: str
+
+
+class GraphDiscoveryLimitExceeded(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class DriveDelta:
+    items: list[dict[str, Any]]
+    delta_link: str
+    is_full_baseline: bool
+
+
+class DeltaResetRequired(RuntimeError):
+    def __init__(self, location: str) -> None:
+        super().__init__("graph_delta_reset_required")
+        self.location = location
+
+
+class GraphPageLimitExceeded(RuntimeError):
+    pass
+
+
+class GraphCredentialAuth(httpx.Auth):
+    def __init__(self, credential: Any, scope: str) -> None:
+        self._credential = credential
+        self._scope = scope
+
+    def auth_flow(self, request: httpx.Request):
+        request.headers["Authorization"] = (
+            f"Bearer {self._credential.get_token(self._scope).token}"
+        )
+        yield request
+
+
+def validate_graph_paging_url(value: str) -> str:
+    try:
+        url = httpx.URL(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Graph paging URL is invalid") from error
+    if (
+        url.scheme != GRAPH_ORIGIN.scheme
+        or url.host != GRAPH_ORIGIN.host
+        or url.username
+        or url.password
+        or url.port not in (None, GRAPH_ORIGIN.port, 443)
+    ):
+        raise ValueError("Graph paging URL is not allowed")
+    return str(url)
+
+
+def _children_url(drive_id: str, cursor: FolderCursor) -> str:
+    if cursor.next_link is not None:
+        return validate_graph_paging_url(cursor.next_link)
+    encoded_drive_id = quote(drive_id, safe="")
+    if cursor.item_id == "root":
+        return f"{GRAPH_ROOT}/drives/{encoded_drive_id}/root/children"
+    return (
+        f"{GRAPH_ROOT}/drives/{encoded_drive_id}/items/"
+        f"{quote(cursor.item_id, safe='')}/children"
+    )
+
+
+def read_children_page(
+    client: httpx.Client,
+    drive_id: str,
+    cursor: FolderCursor,
+) -> ChildrenPage:
+    url = _children_url(drive_id, cursor)
+    params = (
+        None
+        if cursor.next_link is not None
+        else {"$select": CHILDREN_SELECT, "$orderby": "name asc"}
+    )
+    response = client.get(url, params=params)
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise ValueError("Graph children response is invalid") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Graph children response is invalid")
+    values = payload.get("value")
+    if not isinstance(values, list) or not all(isinstance(item, dict) for item in values):
+        raise ValueError("Graph children page has an invalid value collection")
+    if "@odata.deltaLink" in payload:
+        raise ValueError("Graph children page returned an unexpected deltaLink")
+    next_link = payload.get("@odata.nextLink")
+    if next_link is not None:
+        if not isinstance(next_link, str) or not next_link:
+            raise ValueError("Graph children nextLink is invalid")
+        next_link = validate_graph_paging_url(next_link)
+    return ChildrenPage(tuple(values), next_link)
+
+
+def _require_item_text(item: dict[str, Any], field_name: str) -> str:
+    value = item.get(field_name)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Graph drive item is missing {field_name}")
+    return value
+
+
+def _discovered_pdf(item: dict[str, Any], ordinal: int) -> DiscoveredPdf:
+    item_id = _require_item_text(item, "id")
+    name = _require_item_text(item, "name")
+    size_bytes = item.get("size")
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+        raise ValueError("Graph PDF has an invalid size")
+    parent = item.get("parentReference")
+    if not isinstance(parent, dict):
+        raise ValueError("Graph PDF is missing parentReference")
+    parent_path = _require_item_text(parent, "path").rstrip("/")
+    return DiscoveredPdf(
+        item_id=item_id,
+        parent_item_id=_require_item_text(parent, "id"),
+        name=name,
+        source_path=f"{parent_path}/{name}",
+        source_url=_require_item_text(item, "webUrl"),
+        e_tag=_require_item_text(item, "eTag"),
+        size_bytes=size_bytes,
+        discovery_ordinal=ordinal,
+    )
+
+
+def advance_discovery(
+    state: DiscoveryState,
+    page: ChildrenPage,
+    limits: ScaleLimits,
+    allowed_extensions: tuple[str, ...] = (".pdf",),
+) -> DiscoveryStep:
+    if state.complete:
+        raise ValueError("discovery is already complete")
+    if state.graph_pages >= limits.max_graph_pages:
+        raise GraphDiscoveryLimitExceeded("max_graph_pages_exceeded")
+    current = state.pending_folders[0]
+    remaining = list(state.pending_folders[1:])
+    child_folders: list[FolderCursor] = []
+    pdfs: list[DiscoveredPdf] = []
+    items_scanned = state.items_scanned
+    folders_discovered = state.folders_discovered
+    pdfs_discovered = state.pdfs_discovered
+
+    for item in page.items:
+        items_scanned += 1
+        if items_scanned > limits.max_drive_items:
+            raise GraphDiscoveryLimitExceeded("max_drive_items_exceeded")
+
+        folder_facet = item.get("folder")
+        package_facet = item.get("package")
+        if folder_facet is not None or package_facet is not None:
+            if folder_facet is not None and not isinstance(folder_facet, dict):
+                raise ValueError("Graph folder facet is invalid")
+            if package_facet is not None and not isinstance(package_facet, dict):
+                raise ValueError("Graph package facet is invalid")
+            child_depth = current.depth + 1
+            if child_depth > limits.max_folder_depth:
+                raise GraphDiscoveryLimitExceeded("max_folder_depth_exceeded")
+            folders_discovered += 1
+            if folders_discovered > limits.max_folders:
+                raise GraphDiscoveryLimitExceeded("max_folders_exceeded")
+            child_folders.append(
+                FolderCursor(_require_item_text(item, "id"), child_depth)
+            )
+            continue
+
+        file_facet = item.get("file")
+        if file_facet is None:
+            continue
+        if not isinstance(file_facet, dict):
+            raise ValueError("Graph file facet is invalid")
+        name = item.get("name")
+        if not isinstance(name, str):
+            continue
+        # Configurable file extension filter
+        name_lower = name.lower()
+        if not any(name_lower.endswith(ext) for ext in allowed_extensions):
+            continue
+        if pdfs_discovered >= limits.max_eligible_pdfs:
+            raise GraphDiscoveryLimitExceeded("max_eligible_pdfs_exceeded")
+        discovered = _discovered_pdf(item, pdfs_discovered)
+        if discovered.size_bytes > limits.max_pdf_bytes:
+            raise GraphDiscoveryLimitExceeded("max_pdf_bytes_exceeded")
+        pdfs.append(discovered)
+        pdfs_discovered += 1
+
+    if page.next_link is not None:
+        pending = [FolderCursor(current.item_id, current.depth, page.next_link)]
+        pending.extend(remaining)
+    else:
+        pending = remaining
+    pending.extend(child_folders)
+    return DiscoveryStep(
+        DiscoveryState(
+            pending_folders=tuple(pending),
+            items_scanned=items_scanned,
+            folders_discovered=folders_discovered,
+            pdfs_discovered=pdfs_discovered,
+            graph_pages=state.graph_pages + 1,
+        ),
+        tuple(pdfs),
+    )
+
+
+def discover_next_page(
+    client: httpx.Client,
+    drive_id: str,
+    state: DiscoveryState,
+    limits: ScaleLimits,
+    allowed_extensions: tuple[str, ...] = (".pdf",),
+) -> DiscoveryStep:
+    if state.complete:
+        return DiscoveryStep(state, ())
+    if state.graph_pages >= limits.max_graph_pages:
+        raise GraphDiscoveryLimitExceeded("max_graph_pages_exceeded")
+    page = read_children_page(client, drive_id, state.pending_folders[0])
+    return advance_discovery(state, page, limits, allowed_extensions)
+
+
+def read_json_pages(
+    client: httpx.Client,
+    initial_url: str,
+    max_pages: int,
+) -> tuple[list[dict[str, Any]], str | None]:
+    if max_pages < 1:
+        raise ValueError("max_pages must be positive")
+
+    values: list[dict[str, Any]] = []
+    url: str | None = initial_url
+    delta_link: str | None = None
+    page_count = 0
+    while url:
+        if page_count >= max_pages:
+            raise GraphPageLimitExceeded(
+                "Graph page guard reached before traversal completed"
+            )
+        response = client.get(validate_graph_paging_url(url))
+        if response.status_code == 410:
+            location = response.headers.get("location")
+            if not location:
+                raise ValueError("Graph delta reset omitted its location")
+            raise DeltaResetRequired(validate_graph_paging_url(location))
+        response.raise_for_status()
+        payload = response.json()
+        page_values = payload.get("value")
+        if not isinstance(page_values, list) or not all(
+            isinstance(item, dict) for item in page_values
+        ):
+            raise ValueError("Graph page has an invalid value collection")
+        values.extend(page_values)
+        page_count += 1
+
+        next_link = payload.get("@odata.nextLink")
+        current_delta = payload.get("@odata.deltaLink")
+        if next_link is not None and not isinstance(next_link, str):
+            raise ValueError("Graph nextLink is invalid")
+        if current_delta is not None and not isinstance(current_delta, str):
+            raise ValueError("Graph deltaLink is invalid")
+        if next_link and current_delta:
+            raise ValueError("Graph page returned both nextLink and deltaLink")
+        if next_link:
+            next_link = validate_graph_paging_url(next_link)
+        if current_delta:
+            delta_link = validate_graph_paging_url(current_delta)
+        url = next_link
+
+    return values, delta_link
+
+
+def _read_delta_pages(
+    client: httpx.Client,
+    initial_url: str,
+    max_pages: int,
+    *,
+    allow_reset: bool,
+) -> tuple[list[dict[str, Any]], str, bool]:
+    try:
+        values, final_delta_link = read_json_pages(client, initial_url, max_pages)
+        is_reset = False
+    except DeltaResetRequired as reset:
+        if not allow_reset:
+            raise
+        values, final_delta_link = read_json_pages(client, reset.location, max_pages)
+        is_reset = True
+    if not final_delta_link:
+        raise ValueError("Graph delta traversal completed without a deltaLink")
+    return values, final_delta_link, is_reset
+
+
+def read_delta_item(
+    client: httpx.Client,
+    drive_id: str,
+    item_id: str,
+    max_pages: int,
+    delta_link: str | None = None,
+) -> tuple[dict[str, Any] | None, str]:
+    initial_url = delta_link or f"{GRAPH_ROOT}/drives/{drive_id}/root/delta"
+    values, final_delta_link, _is_reset = _read_delta_pages(
+        client,
+        initial_url,
+        max_pages,
+        allow_reset=delta_link is not None,
+    )
+    matches = [item for item in values if item.get("id") == item_id]
+    return (matches[-1] if matches else None), final_delta_link
+
+
+def read_drive_delta(
+    client: httpx.Client,
+    drive_id: str,
+    max_pages: int,
+    delta_link: str | None = None,
+) -> DriveDelta:
+    initial_url = delta_link or f"{GRAPH_ROOT}/drives/{drive_id}/root/delta"
+    values, final_delta_link, is_reset = _read_delta_pages(
+        client,
+        initial_url,
+        max_pages,
+        allow_reset=delta_link is not None,
+    )
+
+    latest_by_id: dict[str, dict[str, Any]] = {}
+    for item in values:
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            raise ValueError("Graph delta item is missing its id")
+        latest_by_id[item_id] = item
+    return DriveDelta(
+        list(latest_by_id.values()),
+        final_delta_link,
+        delta_link is None or is_reset,
+    )
+
+
+def read_drive_item(
+    client: httpx.Client,
+    drive_id: str,
+    item_id: str,
+) -> dict[str, Any] | None:
+    response = client.get(
+        f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/items/{quote(item_id, safe='')}",
+        params={"$select": "id,name,cTag,file,folder,webUrl"},
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("id") != item_id:
+        raise ValueError("Graph drive item response is invalid")
+    return payload
+
+
+def read_permissions(
+    client: httpx.Client,
+    drive_id: str,
+    item_id: str,
+    max_pages: int,
+) -> list[dict[str, Any]]:
+    try:
+        values, _ = read_json_pages(
+            client,
+            f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/permissions",
+            max_pages,
+        )
+    except GraphPageLimitExceeded as error:
+        raise TerminalDocumentError(
+            "unsafe_acl:incomplete_permissions_traversal"
+        ) from error
+    except ValueError as error:
+        raise TerminalDocumentError("unsafe_acl:invalid_permissions_response") from error
+    return values
+
+
+def read_security_enabled_group_ids(
+    client: httpx.Client,
+    group_ids: set[str],
+) -> set[str]:
+    security_group_ids: set[str] = set()
+    for group_id in sorted(group_ids):
+        response = client.get(
+            f"{GRAPH_ROOT}/groups/{quote(group_id, safe='')}",
+            params={"$select": "id,securityEnabled,groupTypes,mailEnabled"},
+        )
+        if response.status_code == 404:
+            # App may lack Group.Read.All; accept group from SharePoint permissions
+            security_group_ids.add(group_id)
+            continue
+        if response.status_code == 429:
+            raise TerminalDocumentError(
+                f"unsafe_acl:graph_throttled_group_{group_id[:8]}"
+            )
+        response.raise_for_status()
+        try:
+            payload = response.json()
+        except ValueError as error:
+            raise TerminalDocumentError("unsafe_acl:invalid_group_response") from error
+        if not isinstance(payload, dict) or payload.get("id") != group_id:
+            raise TerminalDocumentError("unsafe_acl:invalid_group_response")
+        security_enabled = payload.get("securityEnabled")
+        if not isinstance(security_enabled, bool):
+            raise TerminalDocumentError("unsafe_acl:invalid_group_security_enabled")
+        if security_enabled:
+            security_group_ids.add(group_id)
+    return security_group_ids
+
+
+def _permission_group_ids_strict(permissions: list[dict[str, Any]]) -> set[str]:
+    if not permissions:
+        raise TerminalDocumentError("unsafe_acl:empty_permissions")
+    group_ids: set[str] = set()
+    for permission in permissions:
+        roles = permission.get("roles")
+        if (
+            not isinstance(roles, list)
+            or not roles
+            or not all(isinstance(role, str) for role in roles)
+        ):
+            raise TerminalDocumentError("unsafe_acl:missing_roles")
+        if any(role not in SUPPORTED_ACL_ROLES for role in roles):
+            raise TerminalDocumentError("unsafe_acl:unsupported_role")
+        if permission.get("link") is not None:
+            raise TerminalDocumentError("unsafe_acl:sharing_link")
+
+        identities: list[dict[str, Any]] = []
+        single = permission.get("grantedToV2")
+        multiple = permission.get("grantedToIdentitiesV2")
+        if single is not None:
+            if not isinstance(single, dict):
+                raise TerminalDocumentError("unsafe_acl:incomplete_identity_set")
+            identities.append(single)
+        if multiple is not None:
+            if not isinstance(multiple, list) or not all(
+                isinstance(identity, dict) for identity in multiple
+            ):
+                raise TerminalDocumentError("unsafe_acl:incomplete_identity_set")
+            identities.extend(multiple)
+        if not identities:
+            raise TerminalDocumentError("unsafe_acl:missing_identity_set")
+
+        for identity in identities:
+            group = identity.get("group")
+            if group is None:
+                # SharePoint site groups / user-only identities — skip, don't reject
+                continue
+            if not isinstance(group, dict):
+                raise TerminalDocumentError(
+                    "unsafe_acl:ambiguous_or_missing_entra_principal"
+                )
+            group_id = group.get("id")
+            if not isinstance(group_id, str) or not group_id:
+                raise TerminalDocumentError("unsafe_acl:missing_principal_id")
+            group_ids.add(group_id)
+    # Fail closed: at least one verified Entra group must exist across all permissions
+    if not group_ids:
+        raise TerminalDocumentError("unsafe_acl:no_entra_groups_found")
+    return group_ids
+
+
+def read_verified_acl(
+    client: httpx.Client,
+    drive_id: str,
+    item_id: str,
+    max_pages: int,
+) -> VerifiedAcl:
+    permissions = read_permissions(client, drive_id, item_id, max_pages)
+    group_ids = _permission_group_ids_strict(permissions)
+    verified_group_ids = read_security_enabled_group_ids(client, group_ids)
+    if not verified_group_ids:
+        raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
+    canonical = tuple(sorted(verified_group_ids))
+    digest = hashlib.sha256(
+        "\x1f".join((*canonical, ACL_POLICY_VERSION)).encode("utf-8")
+    ).hexdigest()
+    return VerifiedAcl(canonical, digest)
+
+
+async def read_bounded_content(response: httpx.Response, max_bytes: int) -> bytes:
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            declared_length = None
+        if declared_length is not None and declared_length > max_bytes:
+            raise TerminalDocumentError("pdf_too_large")
+    parts: list[bytes] = []
+    downloaded = 0
+    async for part in response.aiter_bytes():
+        downloaded += len(part)
+        if downloaded > max_bytes:
+            raise TerminalDocumentError("pdf_too_large")
+        parts.append(part)
+    content = b"".join(parts)
+    if not content:
+        raise TerminalDocumentError("empty_content")
+    return content
+
+
+def validate_download_url(value: str) -> str:
+    try:
+        url = httpx.URL(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Graph content redirect location is invalid") from error
+    host = (url.host or "").lower().rstrip(".")
+    allowed_host = any(
+        host == suffix or host.endswith(f".{suffix}") for suffix in DOWNLOAD_HOST_SUFFIXES
+    )
+    if (
+        url.scheme != "https"
+        or not allowed_host
+        or url.username
+        or url.password
+        or url.port not in (None, 443)
+    ):
+        raise ValueError("Graph content redirect location is not allowed")
+    return str(url)
+
+
+async def _download_content_async(
+    graph_headers: dict[str, str],
+    graph_auth: httpx.Auth | None,
+    drive_id: str,
+    item_id: str,
+    max_bytes: int,
+) -> bytes:
+    async with httpx.AsyncClient(
+        auth=graph_auth,
+        headers=graph_headers,
+        timeout=None,
+        follow_redirects=False,
+    ) as graph_client:
+        async with graph_client.stream(
+            "GET",
+            f"{GRAPH_ROOT}/drives/{drive_id}/items/{item_id}/content",
+        ) as response:
+            if response.status_code not in (301, 302, 303, 307, 308):
+                response.raise_for_status()
+                return await read_bounded_content(response, max_bytes)
+            download_url = response.headers.get("location")
+    if not download_url:
+        raise ValueError("Graph content redirect omitted its location")
+    validated_url = validate_download_url(download_url)
+    async with httpx.AsyncClient(timeout=None, follow_redirects=False) as download_client:
+        async with download_client.stream("GET", validated_url) as download_response:
+            if download_response.is_redirect:
+                raise ValueError("Graph content download returned an unexpected redirect")
+            download_response.raise_for_status()
+            return await read_bounded_content(download_response, max_bytes)
+
+
+def download_content(
+    client: httpx.Client,
+    drive_id: str,
+    item_id: str,
+    max_bytes: int,
+    timeout_seconds: float,
+    graph_auth: httpx.Auth | None = None,
+) -> bytes:
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    headers = {
+        name: value
+        for name, value in client.headers.items()
+        if name.lower() in {"authorization", "accept", "prefer"}
+    }
+
+    async def run_with_deadline() -> bytes:
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                return await _download_content_async(
+                    headers,
+                    graph_auth,
+                    drive_id,
+                    item_id,
+                    max_bytes,
+                )
+        except TimeoutError as error:
+            raise TimeoutError("content_download_deadline_exceeded") from error
+
+    return asyncio.run(run_with_deadline())
+
+
+def download_content_sync(
+    client: httpx.Client,
+    drive_id: str,
+    item_id: str,
+    max_bytes: int,
+    timeout_seconds: float,
+) -> bytes:
+    """Synchronous download that works inside Azure Functions (no asyncio.run)."""
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    url = f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/items/{quote(item_id, safe='')}/content"
+    with client.stream("GET", url, follow_redirects=False) as response:
+        if response.status_code in (301, 302, 303, 307, 308):
+            download_url = response.headers.get("location")
+            if not download_url:
+                raise ValueError("Graph content redirect omitted its location")
+            validated_url = validate_download_url(download_url)
+        else:
+            response.raise_for_status()
+            return _read_bounded_sync(response, max_bytes)
+    with httpx.Client(timeout=timeout_seconds, follow_redirects=False) as dl_client:
+        with dl_client.stream("GET", validated_url) as dl_response:
+            if dl_response.is_redirect:
+                raise ValueError("Graph content download returned an unexpected redirect")
+            dl_response.raise_for_status()
+            return _read_bounded_sync(dl_response, max_bytes)
+
+
+def _read_bounded_sync(response: httpx.Response, max_bytes: int) -> bytes:
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = None
+        if declared is not None and declared > max_bytes:
+            raise TerminalDocumentError("pdf_too_large")
+    parts: list[bytes] = []
+    downloaded = 0
+    for part in response.iter_bytes():
+        downloaded += len(part)
+        if downloaded > max_bytes:
+            raise TerminalDocumentError("pdf_too_large")
+        parts.append(part)
+    content = b"".join(parts)
+    if not content:
+        raise TerminalDocumentError("empty_content")
+    return content

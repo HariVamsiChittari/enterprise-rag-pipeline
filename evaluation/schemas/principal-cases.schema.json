@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bfl.example/schemas/rag/principal-cases.schema.json",
+  "title": "Protected RAG Principal Cases",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "cases"],
+  "properties": {
+    "version": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "label",
+          "userObjectId",
+          "groupIds",
+          "expectedAllowDocumentIds",
+          "expectedDenyDocumentIds"
+        ],
+        "properties": {
+          "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+          "userObjectId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "groupIds": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 100 }
+          },
+          "expectedAllowDocumentIds": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+          },
+          "expectedDenyDocumentIds": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,1112 @@
+"""Cosmos persistence owner for schema-v1 full-sync ingestion."""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime
+from typing import Any, Generic, Mapping, Sequence, TypeVar
+
+from azure.core import MatchConditions
+
+logger = logging.getLogger(__name__)
+
+from ingestion.models import (
+    ChunkingProfile,
+    DocumentStage,
+    DocumentStatus,
+    EmbeddingProfile,
+    EnrichmentProfile,
+    EnrichmentStatuses,
+    Entity,
+    ExtractionProfile,
+    IngestionRunRecord,
+    ModuleStatus,
+    ProfileSnapshot,
+    RunCounters,
+    RunStage,
+    RunStatus,
+    SafeError,
+    ScaleLimits,
+    SearchChunkRecord,
+    SourceControlRecord,
+    SourceDocumentRecord,
+    create_chunk_id,
+    create_source_run_id,
+    run_record_id,
+    serialized_size_bytes,
+)
+
+
+RecordT = TypeVar("RecordT")
+MAX_BATCH_OPERATIONS = 100
+MAX_BATCH_PAYLOAD_BYTES = 1_000_000
+BATCH_OPERATION_OVERHEAD_BYTES = 1_024
+MAX_CONFLICT_RETRIES = 3
+MAX_THROTTLE_RETRIES = 5
+THROTTLE_BASE_DELAY_SECONDS = 1.0
+INTERNAL_PAGE_SIZE = 100
+
+
+class RepositoryError(RuntimeError):
+    """Base error with a message safe to expose to application logs."""
+
+
+class RepositoryDataError(RepositoryError):
+    """Raised when persisted schema-v1 data is malformed."""
+
+
+class RepositoryConflictError(RepositoryError):
+    """Raised when persisted state conflicts with the requested operation."""
+
+
+@dataclass(frozen=True)
+class VersionedRecord(Generic[RecordT]):
+    """A domain record paired with its Cosmos concurrency token."""
+
+    record: RecordT
+    etag: str
+
+
+@dataclass(frozen=True)
+class ActivatedRun:
+    """The run and source control committed by one activation transaction."""
+
+    run: VersionedRecord[IngestionRunRecord]
+    source_control: VersionedRecord[SourceControlRecord]
+
+
+@dataclass(frozen=True)
+class QueryPage:
+    """One bounded SDK query page and its opaque resume token."""
+
+    items: tuple[Mapping[str, Any], ...]
+    continuation_token: str | None
+
+
+@dataclass(frozen=True)
+class CleanupPage:
+    """Bounded cleanup progress for one noncurrent run."""
+
+    documents_deleted: int
+    chunks_deleted: int
+    complete: bool
+
+
+class IngestionRepository:
+    """Own schema-v1 ingestion reads and writes across three Cosmos containers."""
+
+    def __init__(self, ingestion_runs: Any, source_documents: Any, search_chunks: Any) -> None:
+        self._ingestion_runs = ingestion_runs
+        self._source_documents = source_documents
+        self._search_chunks = search_chunks
+
+    def get_source_control(self, source_id: str) -> VersionedRecord[SourceControlRecord] | None:
+        item = self._read_item(self._ingestion_runs, "source-control", source_id)
+        return self._versioned(item, _source_control_from_item, "source control")
+
+    def get_run(self, source_id: str, run_id: str) -> VersionedRecord[IngestionRunRecord] | None:
+        item = self._read_item(self._ingestion_runs, run_record_id(run_id), source_id)
+        return self._versioned(item, _run_from_item, "ingestion run")
+
+    def get_document(
+        self, source_run_id: str, document_id: str
+    ) -> VersionedRecord[SourceDocumentRecord] | None:
+        item = self._read_item(self._source_documents, document_id, source_run_id)
+        return self._versioned(item, _document_from_item, "source document")
+
+    def get_chunk(self, document_key: str, chunk_id: str) -> SearchChunkRecord | None:
+        item = self._read_item(self._search_chunks, chunk_id, document_key)
+        if item is None:
+            return None
+        return _hydrate(item, _chunk_from_item, "search chunk")
+
+    def activate_run(
+        self,
+        run: IngestionRunRecord,
+        source_control: SourceControlRecord,
+    ) -> ActivatedRun:
+        current = self.get_source_control(run.source_id)
+        if current is not None:
+            source_control = replace(
+                source_control,
+                last_completed_run_id=current.record.last_completed_run_id,
+            )
+        self._validate_activation(run, source_control)
+        if current is not None and current.record.current_run_id == run.run_id:
+            return self._reconcile_activation(run, source_control)
+        if current is not None and _parse_utc(source_control.activated_at) <= _parse_utc(
+            current.record.activated_at
+        ):
+            raise RepositoryConflictError("run activation is stale")
+
+        operations: list[tuple[Any, ...]] = [("create", (run.to_cosmos_item(),))]
+        if current is None:
+            operations.append(("create", (source_control.to_cosmos_item(),)))
+        else:
+            operations.append(
+                (
+                    "replace",
+                    (source_control.id, source_control.to_cosmos_item()),
+                    {"if_match_etag": current.etag},
+                )
+            )
+        try:
+            results = self._ingestion_runs.execute_item_batch(
+                batch_operations=operations,
+                partition_key=run.source_id,
+            )
+            failure_status = _batch_failure_status(results)
+            if failure_status is not None:
+                if failure_status in (409, 412):
+                    return self._reconcile_activation(run, source_control)
+                raise RepositoryError("Cosmos run activation failed")
+        except Exception as error:
+            if _error_status(error) in (409, 412):
+                return self._reconcile_activation(run, source_control)
+            if isinstance(error, RepositoryError):
+                raise
+            raise RepositoryError("Cosmos run activation failed") from None
+        return self._read_activated_run(run.source_id, run.run_id)
+
+    def create_discovered_document(
+        self, document: SourceDocumentRecord
+    ) -> VersionedRecord[SourceDocumentRecord]:
+        if document.status is not DocumentStatus.DISCOVERED or document.stage is not DocumentStage.DISCOVERED:
+            raise ValueError("new source documents must be discovered")
+        try:
+            self._source_documents.create_item(body=document.to_cosmos_item())
+        except Exception as error:
+            if getattr(error, "status_code", None) != 409:
+                raise RepositoryError("Cosmos source-document create failed") from None
+            stored = self.get_document(document.source_run_id, document.id)
+            if stored is None or not _same_domain(stored.record, document):
+                raise RepositoryConflictError("source-document id has different content") from None
+            return stored
+        stored = self.get_document(document.source_run_id, document.id)
+        if stored is None:
+            raise RepositoryDataError("created source document could not be read")
+        return stored
+
+    def mark_document_processing(
+        self,
+        document: SourceDocumentRecord,
+        etag: str,
+    ) -> VersionedRecord[SourceDocumentRecord]:
+        return self._replace_document(
+            document,
+            etag,
+            expected_status=DocumentStatus.DISCOVERED,
+            allowed_status=DocumentStatus.PROCESSING,
+            allowed_changes={
+                "status",
+                "stage",
+                "attemptCount",
+                "processingStartedAt",
+                "updatedAt",
+            },
+        )
+
+    def update_processing_document(
+        self,
+        document: SourceDocumentRecord,
+        etag: str,
+    ) -> VersionedRecord[SourceDocumentRecord]:
+        return self._replace_document(
+            document,
+            etag,
+            expected_status=DocumentStatus.PROCESSING,
+            allowed_status=DocumentStatus.PROCESSING,
+            allowed_changes={
+                "stage",
+                "attemptCount",
+                "updatedAt",
+                "pageCount",
+                "expectedChunkCount",
+                "writtenChunkCount",
+                "contentHash",
+                "extractionMode",
+            },
+        )
+
+    def mark_document_failed(
+        self,
+        document: SourceDocumentRecord,
+        etag: str,
+    ) -> VersionedRecord[SourceDocumentRecord]:
+        if document.stage is not DocumentStage.TERMINAL or document.failed_at is None or document.error is None:
+            raise ValueError("failed documents require terminal stage, failed_at, and safe error")
+        if document.ready_at is not None:
+            raise ValueError("failed documents cannot contain ready_at")
+        return self._replace_document(
+            document,
+            etag,
+            expected_status=DocumentStatus.PROCESSING,
+            allowed_status=DocumentStatus.FAILED,
+            allowed_changes={"status", "stage", "updatedAt", "failedAt", "error"},
+        )
+
+    def write_chunks(self, chunks: Sequence[SearchChunkRecord]) -> int:
+        validated = self._validate_chunks(chunks)
+        batch: list[SearchChunkRecord] = []
+        payload_bytes = 0
+        for chunk in validated:
+            operation_bytes = (
+                serialized_size_bytes(chunk.to_cosmos_item()) + BATCH_OPERATION_OVERHEAD_BYTES
+            )
+            if operation_bytes > MAX_BATCH_PAYLOAD_BYTES:
+                raise ValueError("chunk operation exceeds the application batch payload limit")
+            if batch and (
+                len(batch) == MAX_BATCH_OPERATIONS
+                or payload_bytes + operation_bytes > MAX_BATCH_PAYLOAD_BYTES
+            ):
+                self._create_chunk_batch(tuple(batch))
+                batch = []
+                payload_bytes = 0
+            batch.append(chunk)
+            payload_bytes += operation_bytes
+        if batch:
+            self._create_chunk_batch(tuple(batch))
+        return len(validated)
+
+    def verify_and_mark_document_ready(
+        self,
+        document: SourceDocumentRecord,
+        etag: str,
+    ) -> VersionedRecord[SourceDocumentRecord]:
+        if (
+            document.status is not DocumentStatus.READY
+            or document.stage is not DocumentStage.TERMINAL
+            or document.expected_chunk_count is None
+            or document.written_chunk_count != document.expected_chunk_count
+            or document.ready_at is None
+            or document.failed_at is not None
+            or document.error is not None
+        ):
+            raise ValueError("ready document integrity fields are incomplete")
+        self._verify_exact_chunks(document)
+        return self._replace_document(
+            document,
+            etag,
+            expected_status=DocumentStatus.PROCESSING,
+            allowed_status=DocumentStatus.READY,
+            allowed_changes={
+                "status",
+                "stage",
+                "updatedAt",
+                "allowedGroupIds",
+                "aclHash",
+                "aclEvaluatedAt",
+                "expectedChunkCount",
+                "writtenChunkCount",
+                "readyAt",
+            },
+        )
+
+    def compute_run_counters(
+        self,
+        source_id: str,
+        run_id: str,
+        *,
+        retries: int,
+        items_scanned: int,
+    ) -> RunCounters:
+        if retries < 0 or items_scanned < 0:
+            raise ValueError("run counters cannot be negative")
+        source_run_id = create_source_run_id(source_id, run_id)
+        query = (
+            "SELECT c.status, c.writtenChunkCount FROM c "
+            "WHERE c.sourceRunId = @sourceRunId"
+        )
+        parameters = [{"name": "@sourceRunId", "value": source_run_id}]
+        counts = {status.value: 0 for status in DocumentStatus}
+        chunks_written = 0
+        continuation: str | None = None
+        while True:
+            page, continuation = self._query_page(
+                self._source_documents,
+                query,
+                parameters,
+                source_run_id,
+                INTERNAL_PAGE_SIZE,
+                continuation,
+            )
+            for row in page:
+                status = row.get("status")
+                if status not in counts:
+                    raise RepositoryDataError("source document has an invalid persisted status")
+                counts[status] += 1
+                if status == DocumentStatus.READY.value:
+                    written = row.get("writtenChunkCount")
+                    if not isinstance(written, int) or written < 0:
+                        raise RepositoryDataError("ready source document has an invalid chunk count")
+                    chunks_written += written
+            if continuation is None:
+                break
+        return RunCounters(
+            discovered=counts[DocumentStatus.DISCOVERED.value],
+            processing=counts[DocumentStatus.PROCESSING.value],
+            ready=counts[DocumentStatus.READY.value],
+            failed=counts[DocumentStatus.FAILED.value],
+            chunks_written=chunks_written,
+            retries=retries,
+            items_scanned=items_scanned,
+        )
+
+    def update_run(
+        self,
+        run: IngestionRunRecord,
+        etag: str,
+    ) -> VersionedRecord[IngestionRunRecord]:
+        if run.status in {
+            RunStatus.COMPLETED,
+            RunStatus.COMPLETED_WITH_ERRORS,
+            RunStatus.FAILED,
+            RunStatus.TERMINATED,
+        } or run.stage is RunStage.TERMINAL:
+            raise ValueError("terminal run changes must use finalize_run")
+        return self._replace_run(
+            run,
+            etag,
+            allowed_changes={
+                "status",
+                "stage",
+                "updatedAt",
+                "error",
+            },
+        )
+
+    def finalize_run(
+        self,
+        run: IngestionRunRecord,
+        etag: str,
+        *,
+        retries: int,
+        items_scanned: int,
+    ) -> VersionedRecord[IngestionRunRecord]:
+        terminal_statuses = {
+            RunStatus.COMPLETED,
+            RunStatus.COMPLETED_WITH_ERRORS,
+            RunStatus.FAILED,
+            RunStatus.TERMINATED,
+        }
+        if run.status not in terminal_statuses or run.stage is not RunStage.TERMINAL or run.completed_at is None:
+            raise ValueError("finalized runs require terminal status, stage, and completed_at")
+        current = self.get_run(run.source_id, run.run_id)
+        if current is None:
+            raise RepositoryConflictError("ingestion run no longer exists")
+        if current.record.stage is RunStage.TERMINAL:
+            replay_counters = replace(
+                current.record.counters,
+                retries=retries,
+                items_scanned=items_scanned,
+            )
+            if _same_domain(current.record, replace(run, counters=replay_counters)):
+                return current
+            raise RepositoryConflictError("ingestion run already has a different terminal outcome")
+        if current.etag != etag:
+            raise RepositoryConflictError("ingestion run changed concurrently")
+        exact_counters = self.compute_run_counters(
+            run.source_id,
+            run.run_id,
+            retries=retries,
+            items_scanned=items_scanned,
+        )
+        if exact_counters.discovered or exact_counters.processing:
+            raise RepositoryConflictError("run cannot finalize while documents are nonterminal")
+        finalized = replace(run, counters=exact_counters)
+        return self._commit_finalized_run(finalized, etag)
+
+    def _commit_finalized_run(
+        self,
+        finalized: IngestionRunRecord,
+        etag: str,
+    ) -> VersionedRecord[IngestionRunRecord]:
+        current_run = self.get_run(finalized.source_id, finalized.run_id)
+        if current_run is None:
+            raise RepositoryConflictError("ingestion run no longer exists")
+        if current_run.record.stage is RunStage.TERMINAL:
+            if _same_domain(current_run.record, finalized):
+                return current_run
+            raise RepositoryConflictError("ingestion run already has a different terminal outcome")
+        if current_run.etag != etag:
+            raise RepositoryConflictError("ingestion run changed concurrently")
+        _require_only_record_changes(
+            current_run.record,
+            finalized,
+            {
+                "status",
+                "stage",
+                "updatedAt",
+                "completedAt",
+                "error",
+                "counters",
+            },
+            "run finalization",
+        )
+
+        control = self.get_source_control(finalized.source_id)
+        successful = finalized.status in {
+            RunStatus.COMPLETED,
+            RunStatus.COMPLETED_WITH_ERRORS,
+        }
+        if successful and control is not None and control.record.current_run_id == finalized.run_id:
+            completed_control = replace(
+                control.record,
+                last_completed_run_id=finalized.run_id,
+                updated_at=finalized.updated_at,
+            )
+            operations = [
+                (
+                    "replace",
+                    (finalized.id, finalized.to_cosmos_item()),
+                    {"if_match_etag": current_run.etag},
+                ),
+                (
+                    "replace",
+                    (completed_control.id, completed_control.to_cosmos_item()),
+                    {"if_match_etag": control.etag},
+                ),
+            ]
+            try:
+                results = self._ingestion_runs.execute_item_batch(
+                    batch_operations=operations,
+                    partition_key=finalized.source_id,
+                )
+                failure_status = _batch_failure_status(results)
+                if failure_status is not None:
+                    if failure_status in (409, 412):
+                        return self._reconcile_finalization(finalized, update_control=True)
+                    raise RepositoryError("Cosmos run finalization failed")
+            except Exception as error:
+                if _error_status(error) in (409, 412):
+                    return self._reconcile_finalization(finalized, update_control=True)
+                if isinstance(error, RepositoryError):
+                    raise
+                raise RepositoryError("Cosmos run finalization failed") from None
+            return self._reconcile_finalization(finalized, update_control=True)
+
+        try:
+            self._ingestion_runs.replace_item(
+                item=finalized.id,
+                body=finalized.to_cosmos_item(),
+                etag=current_run.etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if _error_status(error) == 412:
+                return self._reconcile_finalization(finalized, update_control=False)
+            raise RepositoryError("Cosmos run finalization failed") from None
+        return self._reconcile_finalization(finalized, update_control=False)
+
+    def _reconcile_finalization(
+        self,
+        finalized: IngestionRunRecord,
+        *,
+        update_control: bool,
+    ) -> VersionedRecord[IngestionRunRecord]:
+        stored = self.get_run(finalized.source_id, finalized.run_id)
+        if stored is None or not _same_domain(stored.record, finalized):
+            raise RepositoryConflictError("ingestion run finalization changed concurrently")
+        if update_control:
+            control = self.get_source_control(finalized.source_id)
+            if (
+                control is None
+                or control.record.current_run_id != finalized.run_id
+                or control.record.last_completed_run_id != finalized.run_id
+                or control.record.updated_at != finalized.updated_at
+            ):
+                raise RepositoryConflictError("source control finalization changed concurrently")
+        return stored
+
+    def list_document_page(
+        self,
+        source_run_id: str,
+        *,
+        page_size: int,
+        continuation_token: str | None = None,
+        status: DocumentStatus | None = None,
+    ) -> QueryPage:
+        _validate_page_size(page_size)
+        query = (
+            "SELECT c.id, c.sourceId, c.runId, c.sourceRunId, c.documentKey, c.sourceName, "
+            "c.sourcePath, c.status, c.stage, c.discoveryOrdinal, c.attemptCount, "
+            "c.expectedChunkCount, c.writtenChunkCount, c.updatedAt, c.error.code AS errorCode "
+            "FROM c WHERE c.sourceRunId = @sourceRunId"
+        )
+        parameters: list[dict[str, Any]] = [
+            {"name": "@sourceRunId", "value": source_run_id}
+        ]
+        if status is not None:
+            query += " AND c.status = @status"
+            parameters.append({"name": "@status", "value": status.value})
+        query += " ORDER BY c.discoveryOrdinal ASC"
+        rows, token = self._query_page(
+            self._source_documents,
+            query,
+            parameters,
+            source_run_id,
+            page_size,
+            continuation_token,
+        )
+        return QueryPage(tuple(rows), token)
+
+    def list_run_page(
+        self,
+        source_id: str,
+        *,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> QueryPage:
+        _validate_page_size(page_size)
+        query = (
+            "SELECT c.id, c.runId, c.sourceId, c.status, c.stage, c.startedAt, c.activatedAt, "
+            "c.updatedAt, c.completedAt, c.counters, c.error.code AS errorCode "
+            "FROM c WHERE c.sourceId = @sourceId AND STARTSWITH(c.id, \"run:\") "
+            "ORDER BY c.startedAt DESC"
+        )
+        parameters = [
+            {"name": "@sourceId", "value": source_id},
+        ]
+        rows, token = self._query_page(
+            self._ingestion_runs,
+            query,
+            parameters,
+            source_id,
+            page_size,
+            continuation_token,
+        )
+        return QueryPage(tuple(rows), token)
+
+    def cleanup_run_page(
+        self,
+        source_id: str,
+        run_id: str,
+        *,
+        page_size: int,
+    ) -> CleanupPage:
+        _validate_page_size(page_size)
+        self._ensure_not_current(source_id, run_id)
+        source_run_id = create_source_run_id(source_id, run_id)
+        documents = self.list_document_page(source_run_id, page_size=page_size)
+        documents_deleted = 0
+        chunks_deleted = 0
+        incomplete_chunks = False
+        for row in documents.items:
+            document_id = row.get("id")
+            document_key = row.get("documentKey")
+            if not isinstance(document_id, str) or not isinstance(document_key, str):
+                raise RepositoryDataError("cleanup query returned invalid document identity")
+            chunk_query = (
+                "SELECT c.id, c.documentKey FROM c WHERE c.documentKey = @documentKey"
+            )
+            chunks, chunk_token = self._query_page(
+                self._search_chunks,
+                chunk_query,
+                [{"name": "@documentKey", "value": document_key}],
+                document_key,
+                page_size,
+                None,
+            )
+            self._ensure_not_current(source_id, run_id)
+            for chunk in chunks:
+                chunk_id = chunk.get("id")
+                if not isinstance(chunk_id, str) or chunk.get("documentKey") != document_key:
+                    raise RepositoryDataError("cleanup query returned invalid chunk identity")
+                if self._delete_item(self._search_chunks, chunk_id, document_key):
+                    chunks_deleted += 1
+            if chunk_token is None:
+                self._ensure_not_current(source_id, run_id)
+                if self._delete_item(self._source_documents, document_id, source_run_id):
+                    documents_deleted += 1
+            else:
+                incomplete_chunks = True
+        complete = documents.continuation_token is None and not incomplete_chunks
+        return CleanupPage(documents_deleted, chunks_deleted, complete)
+
+    def _replace_run(
+        self,
+        run: IngestionRunRecord,
+        etag: str,
+        *,
+        allowed_changes: set[str],
+    ) -> VersionedRecord[IngestionRunRecord]:
+        current = self.get_run(run.source_id, run.run_id)
+        if current is None:
+            raise RepositoryConflictError("ingestion run no longer exists")
+        if current.etag != etag:
+            raise RepositoryConflictError("ingestion run changed concurrently")
+        _require_only_record_changes(current.record, run, allowed_changes, "run update")
+        try:
+            self._ingestion_runs.replace_item(
+                item=run.id,
+                body=run.to_cosmos_item(),
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if getattr(error, "status_code", None) == 412:
+                raise RepositoryConflictError("ingestion run changed concurrently") from None
+            raise RepositoryError("Cosmos ingestion-run replace failed") from None
+        stored = self.get_run(run.source_id, run.run_id)
+        if stored is None:
+            raise RepositoryDataError("updated ingestion run could not be read")
+        return stored
+
+    def _ensure_not_current(self, source_id: str, run_id: str) -> None:
+        control = self.get_source_control(source_id)
+        if control is None:
+            raise RepositoryConflictError("source control is unavailable for cleanup")
+        if control.record.current_run_id == run_id:
+            raise RepositoryConflictError("current run cannot be cleaned up")
+
+    @staticmethod
+    def _delete_item(container: Any, item_id: str, partition_key: str) -> bool:
+        try:
+            container.delete_item(item=item_id, partition_key=partition_key)
+            return True
+        except Exception as error:
+            if getattr(error, "status_code", None) == 404:
+                return False
+            raise RepositoryError("Cosmos cleanup delete failed") from None
+
+    @staticmethod
+    def _validate_chunks(chunks: Sequence[SearchChunkRecord]) -> tuple[SearchChunkRecord, ...]:
+        if not chunks:
+            raise ValueError("chunk input cannot be empty")
+        validated = tuple(chunks)
+        if any(not isinstance(chunk, SearchChunkRecord) for chunk in validated):
+            raise TypeError("chunks must be SearchChunkRecord values")
+        if len(validated) > ScaleLimits().max_chunks_per_pdf:
+            raise ValueError("chunk input exceeds the schema-v1 document limit")
+        first = validated[0]
+        identity = (
+            first.document_key,
+            first.document_id,
+            first.source_id,
+            first.run_id,
+            first.source_run_id,
+        )
+        for index, chunk in enumerate(validated):
+            if (
+                chunk.document_key,
+                chunk.document_id,
+                chunk.source_id,
+                chunk.run_id,
+                chunk.source_run_id,
+            ) != identity:
+                raise ValueError("all chunks must belong to one document and run")
+            if chunk.chunk_index != index or chunk.id != create_chunk_id(index):
+                raise ValueError("chunk ids must be sorted, unique, and contiguous from zero")
+        return validated
+
+    def _create_chunk_batch(self, chunks: tuple[SearchChunkRecord, ...]) -> None:
+        remaining = chunks
+        for _ in range(MAX_CONFLICT_RETRIES):
+            self._execute_batch_with_throttle_retry(remaining)
+            missing: list[SearchChunkRecord] = []
+            for chunk in remaining:
+                stored = self.get_chunk(chunk.document_key, chunk.id)
+                if stored is None:
+                    missing.append(chunk)
+                elif not _same_domain(stored, chunk):
+                    raise RepositoryConflictError("chunk id has different content")
+            if not missing:
+                return
+            remaining = tuple(missing)
+        raise RepositoryConflictError("chunk batch conflicts did not converge")
+
+    def _execute_batch_with_throttle_retry(
+        self, chunks: tuple[SearchChunkRecord, ...]
+    ) -> None:
+        """Execute batch with retry on 429 throttling."""
+        operations = [("create", (chunk.to_cosmos_item(),)) for chunk in chunks]
+        for attempt in range(MAX_THROTTLE_RETRIES):
+            try:
+                results = self._search_chunks.execute_item_batch(
+                    batch_operations=operations,
+                    partition_key=chunks[0].document_key,
+                )
+                failure_status = _batch_failure_status(results)
+                if failure_status is None:
+                    return
+                if failure_status == 429:
+                    delay = THROTTLE_BASE_DELAY_SECONDS * (2 ** attempt)
+                    logger.warning("Cosmos batch throttled (429), retry %d after %.1fs", attempt + 1, delay)
+                    time.sleep(delay)
+                    continue
+                if failure_status == 409:
+                    return  # handled by caller's conflict resolution
+                raise RepositoryError(f"Cosmos chunk batch failed with status {failure_status}")
+            except Exception as error:
+                status = _error_status(error)
+                if status == 429:
+                    delay = THROTTLE_BASE_DELAY_SECONDS * (2 ** attempt)
+                    logger.warning("Cosmos batch throttled (429 exception), retry %d after %.1fs", attempt + 1, delay)
+                    time.sleep(delay)
+                    continue
+                if status == 409:
+                    return  # handled by caller's conflict resolution
+                if isinstance(error, RepositoryError):
+                    raise
+                raise RepositoryError(f"Cosmos chunk batch create failed: {error}") from error
+        raise RepositoryError("Cosmos batch throttled after max retries")
+
+    def _verify_exact_chunks(self, document: SourceDocumentRecord) -> None:
+        expected_count = document.expected_chunk_count or 0
+        query = (
+            "SELECT c.id, c.chunkIndex, c.documentKey, c.documentId, c.sourceId, c.runId, "
+            "c.sourceRunId "
+            "FROM c WHERE c.documentKey = @documentKey"
+        )
+        parameters = [{"name": "@documentKey", "value": document.document_key}]
+        seen_ids: set[str] = set()
+        seen_indices: set[int] = set()
+        row_count = 0
+        continuation: str | None = None
+        while True:
+            page, continuation = self._query_page(
+                self._search_chunks,
+                query,
+                parameters,
+                document.document_key,
+                INTERNAL_PAGE_SIZE,
+                continuation,
+            )
+            for row in page:
+                row_count += 1
+                chunk_id = row.get("id")
+                chunk_index = row.get("chunkIndex")
+                if not isinstance(chunk_id, str) or (
+                    not isinstance(chunk_index, int) or isinstance(chunk_index, bool)
+                ):
+                    raise RepositoryConflictError("ready verification found invalid chunk identity")
+                if chunk_id in seen_ids or chunk_index in seen_indices:
+                    raise RepositoryConflictError("ready verification found duplicate chunks")
+                if chunk_index < 0 or chunk_id != create_chunk_id(chunk_index):
+                    raise RepositoryConflictError("ready verification found invalid chunk identity")
+                if chunk_index >= expected_count:
+                    raise RepositoryConflictError("ready verification found missing or extra chunks")
+                _require_chunk_row_identity(row, document)
+                seen_ids.add(chunk_id)
+                seen_indices.add(chunk_index)
+            if continuation is None:
+                break
+        if row_count < expected_count:
+            raise RepositoryConflictError("ready verification found missing chunks")
+        if row_count > expected_count:
+            raise RepositoryConflictError("ready verification found missing or extra chunks")
+        if seen_indices != set(range(expected_count)):
+            raise RepositoryConflictError("ready verification found missing or extra chunks")
+
+    @staticmethod
+    def _query_page(
+        container: Any,
+        query: str,
+        parameters: list[dict[str, Any]],
+        partition_key: str,
+        page_size: int,
+        continuation_token: str | None,
+    ) -> tuple[list[Mapping[str, Any]], str | None]:
+        try:
+            iterator = container.query_items(
+                query=query,
+                parameters=parameters,
+                partition_key=partition_key,
+                max_item_count=page_size,
+            )
+            pager = iterator.by_page(continuation_token)
+            page = list(next(pager, []))
+            return page, pager.continuation_token
+        except Exception:
+            raise RepositoryError("Cosmos partition query failed") from None
+
+    def _replace_document(
+        self,
+        document: SourceDocumentRecord,
+        etag: str,
+        *,
+        expected_status: DocumentStatus,
+        allowed_status: DocumentStatus,
+        allowed_changes: set[str],
+    ) -> VersionedRecord[SourceDocumentRecord]:
+        if document.status is not allowed_status:
+            raise ValueError("document has an invalid target status")
+        current = self.get_document(document.source_run_id, document.id)
+        if current is None:
+            raise RepositoryConflictError("source document no longer exists")
+        if current.etag != etag:
+            raise RepositoryConflictError("source document changed concurrently")
+        if current.record.status is not expected_status:
+            raise RepositoryConflictError("source document transition is no longer legal")
+        _require_only_changes(current.record, document, allowed_changes)
+        try:
+            self._source_documents.replace_item(
+                item=document.id,
+                body=document.to_cosmos_item(),
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            status = getattr(error, "status_code", None)
+            if status == 412:
+                raise RepositoryConflictError("source document changed concurrently") from None
+            if status == 429:
+                time.sleep(THROTTLE_BASE_DELAY_SECONDS)
+                try:
+                    self._source_documents.replace_item(
+                        item=document.id,
+                        body=document.to_cosmos_item(),
+                        etag=etag,
+                        match_condition=MatchConditions.IfNotModified,
+                    )
+                except Exception:
+                    raise RepositoryError("Cosmos source-document replace failed after throttle retry") from error
+            else:
+                raise RepositoryError(f"Cosmos source-document replace failed: {error}") from error
+        stored = self.get_document(document.source_run_id, document.id)
+        if stored is None:
+            raise RepositoryDataError("updated source document could not be read")
+        return stored
+
+    @staticmethod
+    def _validate_activation(run: IngestionRunRecord, control: SourceControlRecord) -> None:
+        if run.source_id != control.source_id or run.run_id != control.current_run_id:
+            raise ValueError("run activation identifiers do not match")
+        if run.orchestration_instance_id != control.current_orchestration_instance_id:
+            raise ValueError("run activation orchestration identifiers do not match")
+        if run.activated_at != control.activated_at:
+            raise ValueError("run activation timestamps do not match")
+
+    def _reconcile_activation(
+        self,
+        run: IngestionRunRecord,
+        control: SourceControlRecord,
+    ) -> ActivatedRun:
+        current = self.get_source_control(run.source_id)
+        stored_run = self.get_run(run.source_id, run.run_id)
+        if (
+            current is None
+            or stored_run is None
+            or current.record.current_run_id != run.run_id
+            or not _same_domain(current.record, control)
+            or not _same_domain(stored_run.record, run)
+        ):
+            raise RepositoryConflictError("run activation conflicts with current source state")
+        return ActivatedRun(stored_run, current)
+
+    def _read_activated_run(self, source_id: str, run_id: str) -> ActivatedRun:
+        current = self.get_source_control(source_id)
+        run = self.get_run(source_id, run_id)
+        if current is None or run is None or current.record.current_run_id != run_id:
+            raise RepositoryDataError("activated run could not be read")
+        return ActivatedRun(run, current)
+
+    @staticmethod
+    def _read_item(container: Any, item_id: str, partition_key: str) -> Mapping[str, Any] | None:
+        try:
+            return container.read_item(item=item_id, partition_key=partition_key)
+        except Exception as error:
+            if getattr(error, "status_code", None) == 404:
+                return None
+            raise RepositoryError("Cosmos point read failed") from None
+
+    @staticmethod
+    def _versioned(
+        item: Mapping[str, Any] | None,
+        factory: Any,
+        record_name: str,
+    ) -> VersionedRecord[Any] | None:
+        if item is None:
+            return None
+        etag = item.get("_etag")
+        if not isinstance(etag, str) or not etag.strip():
+            raise RepositoryDataError(f"{record_name} is missing a valid ETag")
+        return VersionedRecord(_hydrate(item, factory, record_name), etag)
+
+
+def _hydrate(item: Mapping[str, Any], factory: Any, record_name: str) -> Any:
+    try:
+        return factory(item)
+    except (KeyError, TypeError, ValueError):
+        raise RepositoryDataError(f"{record_name} does not match schema version 1") from None
+
+
+def _source_control_from_item(item: Mapping[str, Any]) -> SourceControlRecord:
+    return SourceControlRecord(
+        source_id=item["sourceId"],
+        current_run_id=item["currentRunId"],
+        current_orchestration_instance_id=item["currentOrchestrationInstanceId"],
+        activated_at=item["activatedAt"],
+        updated_at=item["updatedAt"],
+        last_completed_run_id=item.get("lastCompletedRunId"),
+        id=item["id"],
+        schema_version=item["schemaVersion"],
+    )
+
+
+def _run_from_item(item: Mapping[str, Any]) -> IngestionRunRecord:
+    error = item.get("error")
+    profiles_data = item.get("profiles", {})
+    enrichment_data = profiles_data.get("enrichment", {})
+    enrichment_data.pop("enabledModules", None)
+    return IngestionRunRecord(
+        source_id=item["sourceId"],
+        run_id=item["runId"],
+        drive_id=item["driveId"],
+        orchestration_instance_id=item["orchestrationInstanceId"],
+        status=RunStatus(item["status"]),
+        stage=RunStage(item["stage"]),
+        started_at=item["startedAt"],
+        activated_at=item["activatedAt"],
+        updated_at=item["updatedAt"],
+        counters=RunCounters(**_snake_keys(item["counters"])),
+        profiles=ProfileSnapshot(
+            extraction=ExtractionProfile(**_snake_keys(profiles_data.get("extraction", {}))),
+            chunking=ChunkingProfile(**_snake_keys(profiles_data.get("chunking", {}))),
+            enrichment=EnrichmentProfile(**_snake_keys(enrichment_data)),
+            embedding=EmbeddingProfile(**_snake_keys(profiles_data.get("embedding", {}))),
+        ) if profiles_data else ProfileSnapshot(),
+        ingestion_mode=item.get("ingestionMode", ""),
+        completed_at=item.get("completedAt"),
+        error=SafeError(**_snake_keys(error)) if error is not None else None,
+        id=item["id"],
+        schema_version=item["schemaVersion"],
+    )
+
+
+def _document_from_item(item: Mapping[str, Any]) -> SourceDocumentRecord:
+    values = _snake_keys(_domain_item(item))
+    values["status"] = DocumentStatus(values["status"])
+    values["stage"] = DocumentStage(values["stage"])
+    values["allowed_group_ids"] = tuple(values["allowed_group_ids"])
+    for _removed in ("quality_flags", "profiles", "acl_policy_version", "verified_at", "record_type"):
+        values.pop(_removed, None)
+    if values.get("error") is not None:
+        values["error"] = SafeError(**_snake_keys(values["error"]))
+    return SourceDocumentRecord(**values)
+
+
+def _chunk_from_item(item: Mapping[str, Any]) -> SearchChunkRecord:
+    values = _snake_keys(_domain_item(item))
+    values["allowed_group_ids"] = tuple(values["allowed_group_ids"])
+    values["section_path"] = tuple(values["section_path"])
+    values["key_phrases"] = tuple(values["key_phrases"])
+    values["entities"] = tuple(Entity(**_snake_keys(entity)) for entity in values["entities"])
+    values["embedding"] = tuple(values["embedding"])
+    for _removed in (
+        "source_path", "drive_id", "item_id", "embedding_input_hash",
+        "chunking_strategy", "chunking_profile_version", "tokenizer",
+        "max_tokens", "overlap_tokens", "enrichment_profile_version",
+        "embedding_model", "embedding_deployment", "embedding_dimensions",
+        "embedding_profile_version", "quality_flags", "extraction_confidence",
+        "processing_warnings", "record_type",
+    ):
+        values.pop(_removed, None)
+    statuses = values["enrichment_status"]
+    values["enrichment_status"] = EnrichmentStatuses(
+        summary=ModuleStatus(statuses["summary"]),
+        key_phrases=ModuleStatus(statuses["keyPhrases"]),
+        entities=ModuleStatus(statuses["entities"]),
+    )
+    return SearchChunkRecord(**values)
+
+
+def _domain_item(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in item.items() if not key.startswith("_")}
+
+
+def _same_domain(stored: Any, requested: Any) -> bool:
+    return stored.to_cosmos_item() == requested.to_cosmos_item()
+
+
+def _error_status(error: Exception) -> int | None:
+    for attribute in ("status_code", "status"):
+        status = getattr(error, attribute, None)
+        if isinstance(status, int):
+            return status
+    return None
+
+
+def _batch_failure_status(results: Any) -> int | None:
+    if not isinstance(results, Sequence):
+        return None
+    for result in results:
+        if isinstance(result, Mapping):
+            status = result.get("statusCode", result.get("status_code", result.get("status")))
+        else:
+            status = getattr(result, "status_code", getattr(result, "status", None))
+        if isinstance(status, int) and not 200 <= status < 300:
+            return status
+    return None
+
+
+def _require_only_changes(
+    current: SourceDocumentRecord,
+    requested: SourceDocumentRecord,
+    allowed_changes: set[str],
+) -> None:
+    current_item = current.to_cosmos_item()
+    requested_item = requested.to_cosmos_item()
+    changed = {
+        key
+        for key in current_item.keys() | requested_item.keys()
+        if current_item.get(key) != requested_item.get(key)
+    }
+    if not changed <= allowed_changes:
+        raise ValueError("document transition changes immutable fields")
+
+
+def _require_only_record_changes(
+    current: Any,
+    requested: Any,
+    allowed_changes: set[str],
+    operation_name: str,
+) -> None:
+    current_item = current.to_cosmos_item()
+    requested_item = requested.to_cosmos_item()
+    changed = {
+        key
+        for key in current_item.keys() | requested_item.keys()
+        if current_item.get(key) != requested_item.get(key)
+    }
+    if not changed <= allowed_changes:
+        raise ValueError(f"{operation_name} changes immutable fields")
+
+
+def _require_chunk_row_identity(
+    chunk: Mapping[str, Any],
+    document: SourceDocumentRecord,
+) -> None:
+    if (
+        chunk.get("documentKey") != document.document_key
+        or chunk.get("documentId") != document.document_id
+        or chunk.get("sourceId") != document.source_id
+        or chunk.get("runId") != document.run_id
+        or chunk.get("sourceRunId") != document.source_run_id
+    ):
+        raise RepositoryConflictError("ready verification found mismatched chunk identity")
+
+
+def _parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _validate_page_size(page_size: int) -> None:
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or not 1 <= page_size <= INTERNAL_PAGE_SIZE:
+        raise ValueError(f"page_size must be between 1 and {INTERNAL_PAGE_SIZE}")
+
+
+def _snake_keys(item: Mapping[str, Any]) -> dict[str, Any]:
+    return {_camel_to_snake(key): value for key, value in item.items()}
+
+
+def _camel_to_snake(value: str) -> str:
+    characters: list[str] = []
+    for character in value:
+        if character.isupper():
+            characters.extend(("_", character.lower()))
+        else:
+            characters.append(character)
+    return "".join(characters)

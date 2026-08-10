@@ -1,0 +1,148 @@
+@description('Function App managed identity principal ID')
+param principalId string
+
+@description('Cosmos DB account resource ID')
+param cosmosAccountId string
+
+@description('Storage account resource ID')
+param storageAccountId string
+
+@description('Key Vault resource ID')
+param keyVaultId string
+
+@description('Document Intelligence resource ID')
+param documentIntelligenceId string
+
+@description('Azure AI Language resource ID')
+param languageServiceId string
+
+@description('Application Insights resource ID')
+param applicationInsightsId string
+
+@description('Skip Cosmos SQL role assignment if it already exists')
+param cosmosRoleAssignmentExists bool = false
+
+resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' existing = {
+  name: split(cosmosAccountId, '/')[8]
+}
+
+resource storageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' existing = {
+  name: split(storageAccountId, '/')[8]
+}
+
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: split(keyVaultId, '/')[8]
+}
+
+resource documentIntelligence 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
+  name: split(documentIntelligenceId, '/')[8]
+}
+
+resource languageService 'Microsoft.CognitiveServices/accounts@2024-10-01' existing = {
+  name: split(languageServiceId, '/')[8]
+}
+
+resource applicationInsights 'Microsoft.Insights/components@2020-02-02' existing = {
+  name: split(applicationInsightsId, '/')[8]
+}
+
+var roles = {
+  CosmosDBDataContributor: '00000000-0000-0000-0000-000000000002'
+  StorageBlobDataOwner: 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+  StorageQueueDataContributor: '974c5e8b-45b9-4653-ba55-5f855dd0fb88'
+  StorageTableDataContributor: '0a9a7e1f-b9d0-4cc4-a60d-0319b160aaa3'
+  KeyVaultSecretsUser: '4633458b-17de-408a-b874-0445c86b69e6'
+  CognitiveServicesUser: 'a97b65f3-24c7-4388-baec-2e87135dc908'
+  MonitoringMetricsPublisher: '3913510d-42f4-4e42-8a64-420c390055eb'
+}
+
+resource cosmosDataContributor 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = if (!cosmosRoleAssignmentExists) {
+  parent: cosmosAccount
+  name: guid(cosmosAccountId, principalId, 'CosmosDBDataContributor')
+  properties: {
+    roleDefinitionId: '${cosmosAccountId}/sqlRoleDefinitions/${roles.CosmosDBDataContributor}'
+    principalId: principalId
+    scope: cosmosAccountId
+  }
+}
+
+resource storageBlobDataOwner 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storageAccount.id, principalId, roles.StorageBlobDataOwner)
+  scope: storageAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.StorageBlobDataOwner)
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource storageQueueDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storageAccount.id, principalId, roles.StorageQueueDataContributor)
+  scope: storageAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      roles.StorageQueueDataContributor
+    )
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource storageTableDataContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(storageAccount.id, principalId, roles.StorageTableDataContributor)
+  scope: storageAccount
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      roles.StorageTableDataContributor
+    )
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource keyVaultSecretsUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(keyVault.id, principalId, roles.KeyVaultSecretsUser)
+  scope: keyVault
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.KeyVaultSecretsUser)
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource documentIntelligenceUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(documentIntelligence.id, principalId, roles.CognitiveServicesUser)
+  scope: documentIntelligence
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.CognitiveServicesUser)
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource languageServiceUser 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(languageService.id, principalId, roles.CognitiveServicesUser)
+  scope: languageService
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.CognitiveServicesUser)
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource monitoringPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(applicationInsights.id, principalId, roles.MonitoringMetricsPublisher)
+  scope: applicationInsights
+  properties: {
+    roleDefinitionId: subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      roles.MonitoringMetricsPublisher
+    )
+    principalId: principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+output roleAssignmentsCreated int = 8

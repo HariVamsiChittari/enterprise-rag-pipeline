@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bfl.example/schemas/rag/ground-truth-record.schema.json",
+  "title": "Protected RAG Ground Truth Record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "queryId",
+    "category",
+    "question",
+    "expectedContext",
+    "expectedAnswer",
+    "expectedCitations",
+    "principalCaseLabel",
+    "smeNotes"
+  ],
+  "properties": {
+    "queryId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
+    },
+    "category": {
+      "enum": ["answerable", "partial", "conflicting", "unanswerable", "acl"]
+    },
+    "question": { "type": "string", "minLength": 1, "maxLength": 4000 },
+    "expectedContext": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/context" }
+    },
+    "expectedAnswer": { "type": ["string", "null"], "maxLength": 16000 },
+    "expectedCitations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1, "maxLength": 500 }
+    },
+    "principalCaseLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100
+    },
+    "smeNotes": { "type": "string", "maxLength": 8000 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "category": {
+            "enum": ["answerable", "partial", "conflicting", "acl"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "expectedContext": { "minItems": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "category": { "const": "unanswerable" } }
+      },
+      "then": {
+        "properties": {
+          "expectedContext": { "maxItems": 0 },
+          "expectedAnswer": { "type": "null" },
+          "expectedCitations": { "maxItems": 0 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["documentItemId", "pageStart", "pageEnd", "exactText"],
+      "properties": {
+        "documentItemId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "pageStart": { "type": "integer", "minimum": 1 },
+        "pageEnd": { "type": "integer", "minimum": 1 },
+        "exactText": { "type": "string", "minLength": 1, "maxLength": 32000 }
+      }
+    }
+  }
+}

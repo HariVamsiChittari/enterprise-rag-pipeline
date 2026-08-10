@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bfl.example/schemas/rag/experiment-manifest.schema.json",
+  "title": "Protected RAG Experiment Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "experimentId",
+    "datasetHash",
+    "sourceId",
+    "runId",
+    "codeCommit",
+    "profiles",
+    "modelDeployments",
+    "environment",
+    "evaluatorVersions",
+    "repeatIndex",
+    "seed",
+    "startedAt"
+  ],
+  "properties": {
+    "experimentId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"
+    },
+    "datasetHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "sourceId": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "runId": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "codeCommit": { "type": "string", "pattern": "^[a-f0-9]{7,64}$" },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "extraction",
+        "chunking",
+        "cleaning",
+        "enrichment",
+        "embedding",
+        "retrieval",
+        "prompt"
+      ],
+      "properties": {
+        "extraction": { "$ref": "#/$defs/profile" },
+        "chunking": { "$ref": "#/$defs/profile" },
+        "cleaning": { "$ref": "#/$defs/profile" },
+        "enrichment": { "$ref": "#/$defs/profile" },
+        "embedding": { "$ref": "#/$defs/profile" },
+        "retrieval": { "$ref": "#/$defs/profile" },
+        "prompt": { "$ref": "#/$defs/profile" }
+      }
+    },
+    "modelDeployments": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["embedding", "chat", "evaluator"],
+      "properties": {
+        "embedding": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "chat": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "evaluator": { "type": "string", "minLength": 1, "maxLength": 200 }
+      }
+    },
+    "environment": { "enum": ["local", "dev", "evaluation"] },
+    "evaluatorVersions": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100
+      }
+    },
+    "repeatIndex": { "type": "integer", "minimum": 1 },
+    "seed": { "type": ["integer", "null"] },
+    "startedAt": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "parameters"],
+      "properties": {
+        "version": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "parameters": { "type": "object" }
+      }
+    }
+  }
+}

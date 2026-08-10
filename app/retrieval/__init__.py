@@ -1,0 +1,1 @@
+"""Secure retrieval components for the SharePoint RAG service."""

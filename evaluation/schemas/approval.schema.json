@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://bfl.example/schemas/rag/approval.schema.json",
+  "title": "Protected RAG Dataset Approval",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "datasetHash",
+    "approverIdentity",
+    "approvedAt",
+    "status",
+    "reviewNotes",
+    "expiresAt"
+  ],
+  "properties": {
+    "datasetHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "approverIdentity": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "approvedAt": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["approved", "rejected", "expired"] },
+    "reviewNotes": { "type": "string", "maxLength": 8000 },
+    "expiresAt": { "type": "string", "format": "date-time" }
+  }
+}
