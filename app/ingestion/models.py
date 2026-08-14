@@ -40,6 +40,12 @@ class DocumentStatus(str, Enum):
     PROCESSING = "processing"
     READY = "ready"
     FAILED = "failed"
+    RETIRED = "retired"
+
+
+# Reasons a previously-ready document can leave retrieval: permission loss (Goal 6b ACL
+# resync), a newer version superseding it, or the source item being deleted (Goal 8).
+RETIRED_REASONS = frozenset({"acl_revoked", "superseded", "deleted"})
 
 
 class DocumentStage(str, Enum):
@@ -306,6 +312,10 @@ class SourceDocumentRecord:
     ready_at: str | None = None
     failed_at: str | None = None
     error: SafeError | None = None
+    retired_at: str | None = None
+    retired_reason: str | None = None
+    retried_at: str | None = None
+    ingestion_mode: str = "full-sync"
     id: str = ""
     document_id: str = ""
     source_run_id: str = ""
@@ -327,6 +337,7 @@ class SourceDocumentRecord:
         if self.content_hash is not None:
             _require_sha256("content_hash", self.content_hash)
         _validate_optional_utc_fields(self)
+        _validate_retirement(self)
         if serialized_size_bytes(self.to_cosmos_item()) > MAX_DOCUMENT_ITEM_BYTES:
             raise ValueError("document item exceeds 128 KiB")
 
@@ -586,10 +597,23 @@ def _validate_optional_utc_fields(record: SourceDocumentRecord) -> None:
     _require_utc("acl_evaluated_at", record.acl_evaluated_at)
     _require_utc("discovered_at", record.discovered_at)
     _require_utc("updated_at", record.updated_at)
-    for field_name in ("processing_started_at", "ready_at", "failed_at"):
+    for field_name in ("processing_started_at", "ready_at", "failed_at", "retired_at"):
         value = getattr(record, field_name)
         if value is not None:
             _require_utc(field_name, value)
+
+
+def _validate_retirement(record: SourceDocumentRecord) -> None:
+    is_retired = record.status is DocumentStatus.RETIRED
+    has_retirement_fields = record.retired_at is not None and record.retired_reason is not None
+    if is_retired != has_retirement_fields:
+        raise ValueError("retired documents require retired_at and retired_reason; others must omit them")
+    if is_retired and record.ready_at is None:
+        raise ValueError("only a previously ready document can be retired")
+    if is_retired and (record.failed_at is not None or record.error is not None):
+        raise ValueError("retired documents cannot carry a failed_at or error")
+    if record.retired_reason is not None and record.retired_reason not in RETIRED_REASONS:
+        raise ValueError("retired_reason must be one of the supported values")
 
 
 def _validate_chunk_fields(record: SearchChunkRecord) -> None:

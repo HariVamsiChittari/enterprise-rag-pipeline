@@ -15,9 +15,11 @@ param sharePointCertificateSecretName = readEnvironmentVariable(
   'sharepoint-app-cert'
 )
 param adminApiClientId = readEnvironmentVariable('ADMIN_API_CLIENT_ID')
+param graphServicePrincipalId = readEnvironmentVariable('GRAPH_SERVICE_PRINCIPAL_ID')
 param cosmosDbMode = 'provisioned'
-param cosmosMetadataAutoscaleMaxRUs = 1000
-param cosmosSearchChunksAutoscaleMaxRUs = 1000
+param deployAks = true
+param cosmosMetadataAutoscaleMaxRUs = 4000
+param cosmosSearchChunksAutoscaleMaxRUs = 4000
 param storageRedundancy = 'ZRS'
 param useDocumentIntelligenceFreeTier = false
 param useLanguageFreeTier = false

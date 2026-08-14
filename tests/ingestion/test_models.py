@@ -134,6 +134,38 @@ def test_document_record_enforces_deterministic_keys_and_pdf_contract() -> None:
         SourceDocumentRecord(**values)
 
 
+def test_retired_document_requires_retirement_fields_and_prior_ready_state() -> None:
+    values = document_values()
+    values.update(
+        status=DocumentStatus.RETIRED,
+        stage=DocumentStage.TERMINAL,
+        ready_at=UTC,
+        retired_at=UTC,
+        retired_reason="superseded",
+    )
+    record = SourceDocumentRecord(**values)
+    assert record.to_cosmos_item()["retiredReason"] == "superseded"
+
+    missing_fields = dict(values, retired_at=None, retired_reason=None)
+    with pytest.raises(ValueError, match="retired documents require"):
+        SourceDocumentRecord(**missing_fields)
+
+    never_ready = dict(values, ready_at=None)
+    with pytest.raises(ValueError, match="previously ready"):
+        SourceDocumentRecord(**never_ready)
+
+    invalid_reason = dict(values, retired_reason="because_i_said_so")
+    with pytest.raises(ValueError, match="retired_reason must be"):
+        SourceDocumentRecord(**invalid_reason)
+
+    unretired_with_fields = dict(
+        document_values(), status=DocumentStatus.READY, ready_at=UTC,
+        retired_at=UTC, retired_reason="superseded",
+    )
+    with pytest.raises(ValueError, match="others must omit them"):
+        SourceDocumentRecord(**unretired_with_fields)
+
+
 def test_chunk_record_separates_original_and_embedding_text() -> None:
     record = build_chunk_record()
 

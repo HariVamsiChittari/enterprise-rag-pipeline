@@ -16,11 +16,10 @@ from ingestion.models import Page
 
 logger = logging.getLogger(__name__)
 
-MAX_PDF_PAGES = 500
 MIN_TEXT_CHARACTERS = 50
 
 
-def extract_pdf(client: Any, content: bytes) -> list[Page]:
+def extract_pdf(client: Any, content: bytes, max_pdf_pages: int = 500) -> list[Page]:
     """Extract pages from a PDF using Document Intelligence prebuilt-layout model."""
     try:
         poller = client.begin_analyze_document(
@@ -33,14 +32,16 @@ def extract_pdf(client: Any, content: bytes) -> list[Page]:
         status = getattr(error, "status_code", None) or getattr(getattr(error, "response", None), "status_code", None)
         if status == 429:
             raise TimeoutError("document_intelligence_throttled") from error
+        if isinstance(status, int) and 500 <= status < 600:
+            raise TimeoutError("document_intelligence_transient") from error
         if isinstance(status, int) and 400 <= status < 500:
             raise TerminalDocumentError("document_intelligence_rejected") from error
-        raise TerminalDocumentError("document_intelligence_failed") from error
+        raise TimeoutError("document_intelligence_transient") from error
 
     service_pages = list(result.pages or [])
     if not service_pages:
         raise TerminalDocumentError("extraction_no_pages")
-    if len(service_pages) > MAX_PDF_PAGES:
+    if len(service_pages) > max_pdf_pages:
         raise TerminalDocumentError("extraction_page_limit_exceeded")
 
     result_content = result.content or ""

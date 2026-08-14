@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: retrieval-agent
+  labels:
+    app: retrieval-agent
+spec:
+  type: ClusterIP
+  selector:
+    app: retrieval-agent
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP

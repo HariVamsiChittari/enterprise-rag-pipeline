@@ -13,6 +13,12 @@ DEFAULT_MAX_TOKENS = 800
 DEFAULT_OVERLAP_TOKENS = 100
 DEFAULT_TOKENIZER = "cl100k_base"
 MAX_CHUNKS_PER_DOCUMENT = 2_000
+MIN_MERGE_TOKENS = 50
+
+_DI_MARKER_RE = re.compile(
+    r"<!--\s*(?:PageHeader|PageFooter|PageNumber|PageBreak).*?-->",
+    re.DOTALL,
+)
 
 
 def chunk_pages(
@@ -27,7 +33,9 @@ def chunk_pages(
     step = max_tokens - overlap_tokens
 
     for page in pages:
-        for segment in _page_segments(page.text):
+        segments = _page_segments(page.text)
+        merged = _merge_small_segments(segments, encoding)
+        for segment in merged:
             tokens = encoding.encode(segment)
             for offset in range(0, len(tokens), step):
                 token_slice = tokens[offset : offset + max_tokens]
@@ -51,9 +59,31 @@ def token_count(text: str, tokenizer_name: str = DEFAULT_TOKENIZER) -> int:
     return len(encoding.encode(text))
 
 
+def _merge_small_segments(segments: list[str], encoding: tiktoken.Encoding) -> list[str]:
+    """Merge consecutive segments until each reaches MIN_MERGE_TOKENS."""
+    merged: list[str] = []
+    buffer: list[str] = []
+    buffer_tokens = 0
+    for segment in segments:
+        seg_tokens = len(encoding.encode(segment))
+        buffer.append(segment)
+        buffer_tokens += seg_tokens
+        if buffer_tokens >= MIN_MERGE_TOKENS:
+            merged.append("\n\n".join(buffer))
+            buffer = []
+            buffer_tokens = 0
+    if buffer:
+        if merged:
+            merged[-1] = merged[-1] + "\n\n" + "\n\n".join(buffer)
+        else:
+            merged.append("\n\n".join(buffer))
+    return merged
+
+
 def _page_segments(text: str) -> list[str]:
-    """Split page text into segments by headings and paragraph breaks."""
-    normalized = text.replace("\r\n", "\n").strip()
+    """Split page text into segments by headings and paragraph breaks, filtering DI markers."""
+    cleaned = _DI_MARKER_RE.sub("", text)
+    normalized = cleaned.replace("\r\n", "\n").strip()
     if not normalized:
         return []
     segments: list[str] = []
@@ -76,4 +106,4 @@ def _page_segments(text: str) -> list[str]:
         buffer.append(line)
     if buffer:
         segments.append(" ".join(buffer).strip())
-    return segments
+    return [s for s in segments if s]

@@ -1,13 +1,13 @@
-# SharePoint PDF RAG — Ingestion Pipeline
+# Enterprise RAG Pipeline
 
-Secure, ACL-trimmed RAG system that ingests PDFs from a SharePoint document library, extracts and chunks content, generates embeddings, and stores vectors in Cosmos DB. Retrieval is served by a Microsoft Agent Framework (MAF) agent on AKS that queries Cosmos directly with ACL filtering.
+Secure, ACL-trimmed RAG system that ingests PDFs from a SharePoint document library and serves grounded answers with per-document security trimming. Ingestion extracts, chunks, enriches, and embeds content into Cosmos DB. Retrieval uses a hybrid architecture: an LLM query planner routes simple queries through a fast standard RAG path (~5s) and complex queries through an Agent Framework agentic path (~8-10s), with automatic fallback.
 
 ## Architecture
 
 - **Ingestion:** Azure Functions (Flex Consumption) with Durable Functions orchestration
-- **Retrieval:** MAF agent on AKS querying Cosmos DB directly
+- **Retrieval:** Hybrid RAG (standard + agentic) on ACA (dev) / AKS (prod) with automatic routing
 - **Durable Backend:** Durable Task Scheduler (singleton instance per source)
-- **Storage:** Cosmos DB NoSQL (3 containers: ingestion-runs, source-documents, search-chunks)
+- **Storage:** Cosmos DB NoSQL (4 containers: ingestion-runs, source-documents, search-chunks, service-audit)
 - **AI Services:** Document Intelligence, Azure AI Language, Azure OpenAI
 - **Auth:** Managed Identity (Azure services) + Certificate credential (Microsoft Graph)
 - **Networking:** VNet-integrated with Private Endpoints
@@ -16,14 +16,18 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and data 
 
 ## How It Works
 
+**Ingestion (full-sync):**
 ```
 POST /api/ingestion/full-sync → HTTP 202 + status polling URL
-
-Orchestrator: activate → discover → [fan-out process in waves] → finalize
-
-Per-document activity:
-  ACL verify → Download PDF → Extract (DI) → Chunk → Clean → Enrich → Embed → Persist
+Orchestrator: activate → discover → [fan-out in waves] → finalize
+Per-document: ACL verify → Download → Extract (DI) → Chunk → Enrich → Embed → Persist
 ```
+
+**Incremental sync:** Delta-sync timer (every 15 min) processes only changed files via Graph delta query. ACL resync timer (daily) re-verifies permissions on all ready documents.
+
+**Retrieval:** `POST /api/query` → query planning → embed → ACL-filtered Cosmos search → LLM answer generation with `[S#]` citations.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed sequence diagrams.
 
 ## Configuration
 
@@ -49,21 +53,77 @@ All settings are environment variables:
 | `SUMMARY_ENABLED` | No | `false` | Enable Language AI abstractive summary |
 | `ALLOWED_FILE_EXTENSIONS` | No | `.pdf` | Comma-separated extensions |
 | `WAVE_SIZE` | No | `4` | Parallel documents per wave |
+| `WAVE_TIMEOUT_MINUTES` | No | `20` | Per-wave deadline before orchestrator moves on |
+| `CHUNK_MAX_TOKENS` | No | `800` | Max tokens per chunk |
+| `CHUNK_OVERLAP_TOKENS` | No | `100` | Token overlap between chunks |
+| `EMBEDDING_BATCH_SIZE` | No | `100` | Texts per OpenAI embedding call |
+| `MAX_PDF_PAGES` | No | `500` | Reject PDFs beyond this page count |
+| `DOWNLOAD_TIMEOUT_SECONDS` | No | `120` | HTTP timeout for file download |
+| `ACL_MAX_PAGES` | No | `10` | Max Graph paging calls for ACL check |
+| `DELTA_MAX_PAGES` | No | `200` | Max Graph delta pages per sync tick |
+| `DELTA_SYNC_SCHEDULE` | No | `0 */15 * * * *` | Delta-sync timer (NCRONTAB) |
+| `ACL_RESYNC_SCHEDULE` | No | `0 0 3 * * *` | ACL-resync timer (daily 03:00 UTC) |
 
-## Endpoints (Function App — Ingestion only)
+### Retrieval Service (ACA / AKS)
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `RETRIEVAL_SERVICE_URL` | Yes | — | Internal URL of retrieval service (Function App query proxy target) |
+| `MAX_EVIDENCE_CHUNKS` | No | `5` | Default top-K chunks retrieved when `top_k` not in request |
+| `INCLUDE_CITATIONS` | No | `true` | When `false`, response returns empty citations array |
+| `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Cosmos retrieval timeout per query |
+| `GENERATION_TIMEOUT_SECONDS` | No | `3.0` | Answer generation LLM call timeout |
+| `AGENT_TIMEOUT_SECONDS` | No | `8.0` | Agentic path timeout before fallback |
+| `QUERY_PROXY_TIMEOUT_SECONDS` | No | `30.0` | Function App → retrieval service proxy timeout |
+
+## Endpoints
 
 | Route | Method | Purpose |
 |---|---|---|
 | `/api/ingestion/full-sync` | POST | Start ingestion (returns 202, 409 if running) |
 | `/api/ingestion/status` | GET | Query orchestration status |
-| `/api/ingestion/terminate` | POST | Terminate a stuck orchestration |
+| `/api/ingestion/terminate` | POST | Terminate orchestration, force-fail stuck docs, finalize run |
+| `/api/ingestion/retry-failed` | POST | Retry only the failed docs from the current full-sync run |
 | `/api/ingestion/inspect` | GET | Read Cosmos data (container, runId, limit) |
+| `/api/query` | POST | Proxy RAG queries to the retrieval service |
 
-Retrieval is served by the MAF agent on AKS (not the Function App).
+Retrieval is served by the hybrid RAG service on ACA / AKS (Function App proxies `/api/query` via `RETRIEVAL_SERVICE_URL`).
+
+## Query API
+
+**Request:** `POST /api/query`
+
+```json
+{
+  "question": "What is the password policy?",
+  "mode": "hybrid",
+  "history": [],
+  "top_k": 5
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `question` | string | Yes | User question (1–4000 chars) |
+| `mode` | string | No | `hybrid` (default), `vector`, `full_text` |
+| `history` | array | No | Conversation history for multi-turn |
+| `top_k` | int | No | Number of chunks to retrieve (1–20, default: `MAX_EVIDENCE_CHUNKS`) |
+
+**Response:**
+
+```json
+{
+  "answer": "The policy requires MFA [S1]...",
+  "citations": [
+    { "ref": "[S1]", "source_name": "Policy.pdf", "url": "https://...sharepoint.com/.../Policy.pdf#page=3" }
+  ],
+  "request_id": "uuid"
+}
+```
 
 ## Idempotent Re-Runs
 
-Full-sync is safe to re-run. Files already `ready` with unchanged content (same eTag) are automatically skipped. Only new, modified, or previously-failed files are reprocessed. This makes recovery from transient failures fast and cheap.
+Full-sync skips unchanged files automatically (same eTag). Use `retry-failed` for failed documents instead of re-running full-sync. Delta-sync retries failures automatically on the next timer tick. See [ARCHITECTURE.md](docs/ARCHITECTURE.md#idempotent-re-runs-skip-if-ready) for details.
 
 ## Security
 
@@ -72,23 +132,28 @@ Full-sync is safe to re-run. Files already `ready` with unchanged content (same 
 - Retrieval requires caller's group membership to match document ACLs
 - All Azure access via Managed Identity (no secrets in code)
 - Graph access via certificate stored in Key Vault
+- Prompt injection defense: hardened system prompt + chunk sanitization (strips injection prefixes) + input segmentation
 
 ## Local Development
 
 ```bash
-cd src/customer-solutions/rag-project
 python -m venv .venv
-.venv/Scripts/activate
+.venv/Scripts/activate      # Windows
 pip install -r requirements-dev.txt
-pytest  # 99 tests expected
+python -m pytest tests/ --ignore=tests/infra/test_aks_contracts.py -q
 ```
 
 ## Deployment
 
 ```bash
-cd src/customer-solutions/rag-project
-azd provision   # Create/update infrastructure (Cosmos, Functions, VNet, PEs)
-azd deploy      # Deploy function app code
+# Infrastructure + Function App
+azd provision
+azd deploy
+
+# Retrieval service (ACA)
+cd app
+az acr build --registry <acr-name> --image retrieval-agent:latest --file retrieval/Dockerfile .
+az containerapp update --name <aca-name> --resource-group <rg> --image <acr>.azurecr.io/retrieval-agent:latest
 ```
 
 ## Project Structure
@@ -98,28 +163,38 @@ azd deploy      # Deploy function app code
 ├── pyproject.toml         # Python project metadata
 ├── requirements-dev.txt   # Dev dependencies (pytest, jsonschema)
 ├── app/
-│   ├── function_app.py    # DFApp: endpoints + orchestrator + activities
+│   ├── function_app.py    # DFApp: endpoints + orchestrators + activities
 │   ├── config.py          # Environment configuration
 │   ├── host.json          # Function timeout (30 min)
 │   ├── requirements.txt   # Runtime dependencies
 │   ├── ingestion/
 │   │   ├── models.py      # Domain models + schema v1 contracts
-│   │   ├── services.py    # Business logic: activate, discover, process, finalize
+│   │   ├── services.py    # Business logic: activate, discover, process, finalize, delta-sync, ACL resync
 │   │   ├── repository.py  # Cosmos persistence + retry
-│   │   ├── graph.py       # Microsoft Graph: discovery, ACL, download
+│   │   ├── lifecycle_repository.py  # Document lifecycle: retire, ACL refresh, delta cursor
+│   │   ├── source_connector.py      # SharePoint connector protocol + implementation
+│   │   ├── graph.py       # Microsoft Graph: discovery, ACL, download, delta
 │   │   ├── extraction.py  # Document Intelligence
 │   │   ├── chunking.py    # Token-based page-aware chunking
 │   │   ├── enrichment.py  # Language AI: key phrases, entities, summary
 │   │   ├── embedding.py   # OpenAI embedding
+│   │   ├── telemetry.py   # Ingestion audit to Cosmos
 │   │   └── errors.py      # TerminalDocumentError, StaleFenceError
 │   └── retrieval/
+│       ├── agent.py       # Agent Framework agent factory
 │       ├── auth.py        # EasyAuth + GraphGroupResolver
+│       ├── config.py      # Retrieval configuration
 │       ├── cosmos.py      # SecureCosmosRetriever (ACL-filtered queries)
-│       ├── service.py     # RagService (embed → retrieve → chat)
-│       └── kubernetes/    # AKS deployment manifests
+│       ├── cosmos_registry.py # Multi-instance Cosmos fan-out
+│       ├── main.py        # FastAPI app with hybrid routing
+│       ├── service.py     # RagService (plan → sanitize → retrieve → generate)
+│       ├── tools.py       # Agent Framework search tool (multi-instance)
+│       ├── telemetry.py   # LLM audit to Cosmos
+│       ├── Dockerfile     # Retrieval container image
+│       └── kubernetes/    # AKS/ACA deployment manifests
 ├── infra/                 # Bicep modules (Cosmos, Functions, VNet, PEs)
-├── scripts/               # Operational scripts (preflight, ACL sync, validation)
+├── evaluation/            # Evaluation schemas (ground-truth, experiments)
 ├── tests/                 # Unit tests (ingestion, retrieval, infra)
-├── docs/                  # ARCHITECTURE.md, PRODUCTION_READINESS.md
+├── docs/                  # ARCHITECTURE.md, PRODUCTION_READINESS.md, COST_ESTIMATION.md
 └── data/                  # Sample Cosmos data exports
 ```

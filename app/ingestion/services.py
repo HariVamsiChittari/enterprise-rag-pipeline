@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import logging
 import re
-import unicodedata
-from dataclasses import replace
+import time
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
-
-import httpx
 
 from config import IngestionConfig
 from ingestion.chunking import chunk_pages, token_count
@@ -20,9 +18,12 @@ from ingestion.extraction import extract_pdf
 from ingestion.graph import (
     DiscoveryState,
     DiscoveryStep,
-    discover_next_page,
-    download_content_sync,
-    read_verified_acl,
+    discovered_pdf_from_item,
+)
+from ingestion.lifecycle_repository import (
+    DocumentLifecycleRepository,
+    LifecycleConflictError,
+    ReadyDocumentRef,
 )
 from ingestion.models import (
     ActivityOutcome,
@@ -58,11 +59,10 @@ from ingestion.repository import (
     RepositoryConflictError,
     VersionedRecord,
 )
+from ingestion.source_connector import SourceConnector
+from ingestion.telemetry import write_audit_record
 
 logger = logging.getLogger(__name__)
-
-ACL_MAX_PAGES = 10
-DOWNLOAD_TIMEOUT_SECONDS = 120.0
 
 
 def activate(config: IngestionConfig, repository: IngestionRepository) -> ActivatedRun:
@@ -105,9 +105,9 @@ def discover_all(
     config: IngestionConfig,
     run_id: str,
     repository: IngestionRepository,
-    graph_client: httpx.Client,
+    connector: SourceConnector,
 ) -> tuple[list[SourceDocumentRecord], int]:
-    """Discover all eligible files from SharePoint and persist as documents."""
+    """Discover all eligible files from the source and persist as documents."""
     settings = Settings(source_id=config.source_id, drive_id=config.drive_id, code_version="durable-sync")
     state = DiscoveryState.initial()
     documents: list[SourceDocumentRecord] = []
@@ -119,9 +119,8 @@ def discover_all(
     prev_source_run_id = create_source_run_id(config.source_id, prev_run_id) if prev_run_id else None
 
     while not state.complete:
-        step = discover_next_page(
-            graph_client, config.drive_id, state, settings.limits,
-            allowed_extensions=config.allowed_extensions,
+        step = connector.discover_next_page(
+            state, settings.limits, allowed_extensions=config.allowed_extensions,
         )
         state = step.state
         for pdf in step.pdfs:
@@ -148,10 +147,11 @@ def process_document(
     document: SourceDocumentRecord,
     document_etag: str,
     repository: IngestionRepository,
-    graph_client: httpx.Client,
+    connector: SourceConnector,
     di_client: Any | None,
     language_client: Any | None,
     openai_client: Any,
+    audit_container: Any | None = None,
 ) -> ActivityOutcome:
     """Process a single document through the full pipeline."""
     try:
@@ -172,12 +172,21 @@ def process_document(
     current_doc = processing.record
     current_etag = processing.etag
     try:
-        acl = read_verified_acl(graph_client, config.drive_id, current_doc.item_id, ACL_MAX_PAGES)
+        acl = connector.read_verified_acl(current_doc.item_id, config.acl_max_pages)
 
-        content = download_content_sync(graph_client, config.drive_id, current_doc.item_id, ScaleLimits().max_pdf_bytes, DOWNLOAD_TIMEOUT_SECONDS)
+        content = connector.download_content_sync(current_doc.item_id, ScaleLimits().max_pdf_bytes, config.download_timeout_seconds)
 
         if config.extraction_enabled and di_client is not None:
-            pages = extract_pdf(di_client, content)
+            extraction_start = time.perf_counter()
+            pages = extract_pdf(di_client, content, max_pdf_pages=config.max_pdf_pages)
+            if audit_container is not None:
+                total_chars = sum(len(p.text) for p in pages)
+                write_audit_record(audit_container, config.source_id, current_doc.source_run_id, {
+                    "operation": "document_extraction", "model": "prebuilt-layout",
+                    "pages": len(pages), "characters": total_chars,
+                    "latency_ms": int((time.perf_counter() - extraction_start) * 1000),
+                    "documentId": current_doc.document_id, "sourceName": current_doc.source_name,
+                })
         else:
             raise TerminalDocumentError("extraction_disabled_no_alternative")
 
@@ -185,16 +194,32 @@ def process_document(
         cleaned_texts = [_clean_text(chunk.content) for chunk in chunks]
 
         if config.enrichment_enabled and language_client is not None:
+            enrichment_start = time.perf_counter()
             enrichments = enrich_chunks(
                 language_client, [chunk.content for chunk in chunks],
                 summary_enabled=config.summary_enabled,
                 key_phrases_enabled=config.key_phrases_enabled,
                 entities_enabled=config.entities_enabled,
             )
+            if audit_container is not None:
+                statuses = [e["status"] for e in enrichments]
+                write_audit_record(audit_container, config.source_id, current_doc.source_run_id, {
+                    "operation": "enrichment", "chunks": len(chunks),
+                    "key_phrases": "succeeded" if any(s.key_phrases.value == "succeeded" for s in statuses) else "failed",
+                    "entities": "succeeded" if any(s.entities.value == "succeeded" for s in statuses) else "failed",
+                    "summary": "succeeded" if config.summary_enabled and any(s.summary.value == "succeeded" for s in statuses) else "not_requested",
+                    "latency_ms": int((time.perf_counter() - enrichment_start) * 1000),
+                })
         else:
             enrichments = enrich_chunks(None, [chunk.content for chunk in chunks])
 
-        embeddings = embed_texts(openai_client, cleaned_texts)
+        embeddings = embed_texts(
+            openai_client, cleaned_texts,
+            audit_container=audit_container,
+            source_id=config.source_id,
+            run_id=current_doc.source_run_id,
+            batch_size=config.embedding_batch_size,
+        )
 
         now = _fmt(_utc_now())
         chunk_records = _build_chunk_records(current_doc, acl, chunks, cleaned_texts, enrichments, embeddings, now)
@@ -245,14 +270,269 @@ def finalize(
     current = repository.get_run(config.source_id, control.record.current_run_id)
     if current is None:
         raise RepositoryConflictError("run no longer exists")
+    counters = repository.compute_run_counters(
+        config.source_id, current.record.run_id, retries=0, items_scanned=items_scanned,
+    )
+    status = RunStatus.COMPLETED_WITH_ERRORS if counters.failed else RunStatus.COMPLETED
     terminal_run = replace(
         current.record,
-        status=RunStatus.COMPLETED,
+        status=status,
         stage=RunStage.TERMINAL,
         completed_at=_fmt(_utc_now()),
         updated_at=_fmt(_utc_now()),
     )
     return repository.finalize_run(terminal_run, run_etag, retries=0, items_scanned=items_scanned)
+
+
+def terminate_run(
+    config: IngestionConfig,
+    repository: IngestionRepository,
+) -> dict[str, Any]:
+    """Fail all non-terminal docs and finalize the run as TERMINATED."""
+    control = repository.get_source_control(config.source_id)
+    if control is None:
+        return {"status": "no_active_run"}
+    current = repository.get_run(config.source_id, control.record.current_run_id)
+    if current is None:
+        return {"status": "no_active_run"}
+    if current.record.stage is RunStage.TERMINAL:
+        return {"status": "already_terminal", "runStatus": current.record.status.value}
+
+    failed_count = repository.fail_nonterminal_documents(
+        config.source_id, current.record.run_id, "orchestration_terminated",
+    )
+    terminal_run = replace(
+        current.record,
+        status=RunStatus.TERMINATED,
+        stage=RunStage.TERMINAL,
+        completed_at=_fmt(_utc_now()),
+        updated_at=_fmt(_utc_now()),
+    )
+    finalized = repository.finalize_run(terminal_run, current.etag, retries=0, items_scanned=0)
+    return {
+        "status": "terminated",
+        "runId": current.record.run_id,
+        "docsForceFailed": failed_count,
+        "counters": finalized.record.counters.__dict__ if hasattr(finalized.record.counters, '__dict__') else {},
+    }
+
+
+def get_retry_candidates(
+    config: IngestionConfig,
+    repository: IngestionRepository,
+) -> list[dict[str, Any]]:
+    """Return failed documents from the current run that can be retried."""
+    control = repository.get_source_control(config.source_id)
+    if control is None:
+        return []
+    run_id = control.record.current_run_id
+    if not run_id:
+        return []
+    return repository.get_failed_documents(config.source_id, run_id)
+
+
+# --- Goal 8: delta-sync (incremental add/update/delete, separate from full-sync) ---
+
+@dataclass(frozen=True)
+class DeltaSyncOutcome:
+    bootstrapped: bool = False
+    created_or_updated: int = 0
+    deleted: int = 0
+    failed: int = 0
+    items_seen: int = 0
+
+
+def run_delta_sync(
+    config: IngestionConfig,
+    repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
+    connector: SourceConnector,
+    di_client: Any | None,
+    language_client: Any | None,
+    openai_client: Any,
+    audit_container: Any | None = None,
+) -> DeltaSyncOutcome:
+    """One delta-sync tick: process adds/updates/deletes for source_id since the last
+    cursor. Uses its own run_id per tick purely as a schema-compliant namespacing device
+    (sourceRunId/documentKey); it does not touch full-sync's source-control singleton."""
+    cursor = lifecycle_repository.get_delta_cursor(config.source_id)
+    if cursor is None:
+        bootstrap_link = connector.bootstrap_delta_cursor()
+        lifecycle_repository.save_delta_cursor(config.source_id, bootstrap_link)
+        return DeltaSyncOutcome(bootstrapped=True)
+
+    delta = connector.read_drive_delta(config.delta_max_pages, delta_link=cursor)
+    run_id = create_run_id(_utc_now(), f"{config.source_id}:delta")
+
+    created_or_updated = 0
+    deleted = 0
+    failed = 0
+    for ordinal, item in enumerate(delta.items):
+        item_id = item.get("id")
+        if not isinstance(item_id, str) or not item_id:
+            failed += 1
+            continue
+        document_id = create_document_id(config.source_id, config.drive_id, item_id)
+
+        if item.get("deleted") is not None:
+            try:
+                ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
+                if ref is not None:
+                    lifecycle_repository.delete_document_and_chunks(
+                        source_run_id=ref.source_run_id,
+                        document_id=document_id,
+                        document_key=ref.document_key,
+                    )
+                    deleted += 1
+                    if audit_container is not None:
+                        write_audit_record(audit_container, config.source_id, run_id, {
+                            "operation": "document_deleted", "documentId": document_id,
+                            "sourceName": getattr(ref, "source_name", ""),
+                            "sourceUrl": getattr(ref, "source_url", ""),
+                            "method": "delta_sync",
+                        })
+            except Exception:
+                logger.error("delta_sync delete failed for item %s", item_id, exc_info=True)
+                failed += 1
+            continue
+
+        try:
+            document = _delta_item_to_document(item, config, run_id, ordinal)
+            if document is None:
+                continue
+            prev_ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
+            stored = repository.create_discovered_document(document)
+            outcome = process_document(
+                config, stored.record, stored.etag, repository,
+                connector, di_client, language_client, openai_client,
+                audit_container=audit_container,
+            )
+        except Exception:
+            logger.error("delta_sync item %s failed", item_id, exc_info=True)
+            failed += 1
+            continue
+
+        if outcome.status is not ActivityStatus.SUCCEEDED:
+            failed += 1
+            continue
+        created_or_updated += 1
+        if audit_container is not None:
+            write_audit_record(audit_container, config.source_id, run_id, {
+                "operation": "document_ingested", "documentId": document_id,
+                "sourceName": document.source_name, "sourceUrl": document.source_url,
+                "method": "delta_sync", "action": "updated" if prev_ref else "created",
+                "chunks": outcome.chunks_written,
+            })
+        if prev_ref is not None and prev_ref.document_key != document.document_key:
+            try:
+                lifecycle_repository.retire_document(
+                    source_run_id=prev_ref.source_run_id,
+                    document_id=document_id,
+                    etag=prev_ref.etag,
+                    reason="superseded",
+                )
+            except LifecycleConflictError:
+                pass  # already retired concurrently (e.g. ACL resync) -- acceptable no-op
+
+    lifecycle_repository.save_delta_cursor(config.source_id, delta.delta_link)
+    return DeltaSyncOutcome(
+        created_or_updated=created_or_updated,
+        deleted=deleted,
+        failed=failed,
+        items_seen=len(delta.items),
+    )
+
+
+def _delta_item_to_document(
+    item: dict[str, Any], config: IngestionConfig, run_id: str, ordinal: int
+) -> SourceDocumentRecord | None:
+    """Adapt one Graph delta driveItem into a DISCOVERED document shell, or None if the
+    item is a folder/package or doesn't match the configured file extensions."""
+    if item.get("folder") is not None or item.get("package") is not None:
+        return None
+    if item.get("file") is None:
+        return None
+    name = item.get("name")
+    if not isinstance(name, str) or not any(
+        name.lower().endswith(ext) for ext in config.allowed_extensions
+    ):
+        return None
+    pdf = discovered_pdf_from_item(item, ordinal)
+    return _pdf_to_document(pdf, config, run_id, ingestion_mode="delta-sync")
+
+
+# --- Goal 6b: ACL resync (timer-driven, re-verifies already-ingested documents) ---
+
+@dataclass(frozen=True)
+class AclResyncOutcome:
+    checked: int = 0
+    unchanged: int = 0
+    updated: int = 0
+    retired: int = 0
+
+
+def resync_document_acl(
+    config: IngestionConfig,
+    ref: ReadyDocumentRef,
+    lifecycle_repository: DocumentLifecycleRepository,
+    connector: SourceConnector,
+) -> str:
+    """Re-verify one ready document's ACL. Returns 'unchanged' | 'updated' | 'retired'."""
+    try:
+        acl = connector.read_verified_acl(ref.item_id, config.acl_max_pages)
+    except TerminalDocumentError:
+        try:
+            lifecycle_repository.retire_document(
+                source_run_id=ref.source_run_id,
+                document_id=ref.document_id,
+                etag=ref.etag,
+                reason="acl_revoked",
+            )
+        except LifecycleConflictError:
+            pass
+        return "retired"
+
+    if acl.acl_hash == ref.acl_hash:
+        return "unchanged"
+    try:
+        lifecycle_repository.refresh_document_acl(
+            source_run_id=ref.source_run_id,
+            document_id=ref.document_id,
+            document_key=ref.document_key,
+            etag=ref.etag,
+            allowed_group_ids=acl.allowed_group_ids,
+            acl_hash=acl.acl_hash,
+        )
+    except LifecycleConflictError:
+        return "unchanged"
+    return "updated"
+
+
+def run_acl_resync_page(
+    config: IngestionConfig,
+    lifecycle_repository: DocumentLifecycleRepository,
+    connector: SourceConnector,
+    *,
+    page_size: int,
+    continuation_token: str | None,
+) -> tuple[AclResyncOutcome, str | None]:
+    """Re-verify ACLs for one bounded page of ready documents (Durable-activity-sized)."""
+    page = lifecycle_repository.list_ready_documents_page(
+        page_size=page_size, continuation_token=continuation_token
+    )
+    unchanged = updated = retired = 0
+    for ref in page.items:
+        result = resync_document_acl(config, ref, lifecycle_repository, connector)
+        if result == "unchanged":
+            unchanged += 1
+        elif result == "updated":
+            updated += 1
+        else:
+            retired += 1
+    outcome = AclResyncOutcome(
+        checked=len(page.items), unchanged=unchanged, updated=updated, retired=retired
+    )
+    return outcome, page.continuation_token
 
 
 # --- Private helpers ---
@@ -276,7 +556,7 @@ def _clean_text(text: str) -> str:
     return cleaned.strip()
 
 
-def _pdf_to_document(pdf: Any, config: IngestionConfig, run_id: str) -> SourceDocumentRecord:
+def _pdf_to_document(pdf: Any, config: IngestionConfig, run_id: str, ingestion_mode: str = "full-sync") -> SourceDocumentRecord:
     document_id = create_document_id(config.source_id, config.drive_id, pdf.item_id)
     now = _fmt(_utc_now())
     return SourceDocumentRecord(
@@ -290,6 +570,7 @@ def _pdf_to_document(pdf: Any, config: IngestionConfig, run_id: str) -> SourceDo
         acl_evaluated_at=now,
         status=DocumentStatus.DISCOVERED, stage=DocumentStage.DISCOVERED,
         attempt_count=0, discovered_at=now, updated_at=now,
+        ingestion_mode=ingestion_mode,
         id=document_id, document_id=document_id,
         source_run_id=create_source_run_id(config.source_id, run_id),
         document_key=create_document_key(config.source_id, run_id, document_id),

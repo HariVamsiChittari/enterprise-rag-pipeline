@@ -18,13 +18,13 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.0' = {
     name: virtualNetworkName
     location: location
     addressPrefixes: [
-      '10.20.0.0/24'
+      '10.20.0.0/22'
     ]
     subnets: [
       {
         name: integrationSubnetName
         addressPrefix: '10.20.0.0/27'
-        delegation: 'Microsoft.App/environments'
+        delegation: 'Microsoft.Web/serverFarms'
       }
       {
         name: privateEndpointSubnetName

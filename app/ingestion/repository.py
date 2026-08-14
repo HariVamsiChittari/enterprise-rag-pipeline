@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Generic, Mapping, Sequence, TypeVar
 
 from azure.core import MatchConditions
@@ -246,6 +246,95 @@ class IngestionRepository:
             allowed_status=DocumentStatus.FAILED,
             allowed_changes={"status", "stage", "updatedAt", "failedAt", "error"},
         )
+
+    def fail_nonterminal_documents(self, source_id: str, run_id: str, error_message: str) -> int:
+        """Mark all discovered/processing docs as failed for orchestration termination."""
+        source_run_id = create_source_run_id(source_id, run_id)
+        query = (
+            "SELECT * FROM c "
+            "WHERE c.sourceRunId = @sourceRunId "
+            "AND c.status IN ('discovered', 'processing')"
+        )
+        parameters = [{"name": "@sourceRunId", "value": source_run_id}]
+        failed_count = 0
+        continuation: str | None = None
+        now = datetime.now(tz=__import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        while True:
+            page, continuation = self._query_page(
+                self._source_documents, query, parameters,
+                source_run_id, INTERNAL_PAGE_SIZE, continuation,
+            )
+            for row in page:
+                doc_id = row["id"]
+                etag = row.get("_etag")
+                original_status = row.get("status", "unknown")
+                row["status"] = DocumentStatus.FAILED.value
+                row["stage"] = DocumentStage.TERMINAL.value
+                row["failedAt"] = now
+                row["updatedAt"] = now
+                row["error"] = {"message": error_message, "stage": original_status, "retryable": False}
+                try:
+                    self._source_documents.replace_item(
+                        item=doc_id,
+                        body=row,
+                        etag=etag,
+                        match_condition=MatchConditions.IfNotModified,
+                    )
+                    failed_count += 1
+                except Exception:
+                    logger.warning("Could not fail doc %s during termination", doc_id, exc_info=True)
+            if continuation is None:
+                break
+        return failed_count
+
+    def get_failed_documents(self, source_id: str, run_id: str) -> list[dict[str, Any]]:
+        """Return all failed documents for a given run."""
+        source_run_id = create_source_run_id(source_id, run_id)
+        query = "SELECT * FROM c WHERE c.sourceRunId = @sourceRunId AND c.status = 'failed'"
+        parameters = [{"name": "@sourceRunId", "value": source_run_id}]
+        results: list[dict[str, Any]] = []
+        continuation: str | None = None
+        while True:
+            page, continuation = self._query_page(
+                self._source_documents, query, parameters,
+                source_run_id, INTERNAL_PAGE_SIZE, continuation,
+            )
+            results.extend(page)
+            if continuation is None:
+                break
+        return results
+
+    def reset_failed_to_discovered(self, doc: dict[str, Any]) -> dict[str, Any] | None:
+        """Reset a failed document back to discovered so it can be reprocessed."""
+        doc_id = doc["id"]
+        etag = doc.get("_etag")
+        source_run_id = doc.get("sourceRunId")
+        now = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        doc["status"] = DocumentStatus.DISCOVERED.value
+        doc["stage"] = DocumentStage.DISCOVERED.value
+        doc["attemptCount"] = 0
+        doc["updatedAt"] = now
+        doc["retriedAt"] = now
+        doc["processingStartedAt"] = None
+        doc["failedAt"] = None
+        doc["error"] = None
+        doc["pageCount"] = None
+        doc["expectedChunkCount"] = None
+        doc["writtenChunkCount"] = None
+        doc["contentHash"] = None
+        doc["extractionMode"] = None
+        doc["readyAt"] = None
+        try:
+            self._source_documents.replace_item(
+                item=doc_id,
+                body=doc,
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+            return doc
+        except Exception:
+            logger.warning("Could not reset doc %s for retry", doc_id, exc_info=True)
+            return None
 
     def write_chunks(self, chunks: Sequence[SearchChunkRecord]) -> int:
         validated = self._validate_chunks(chunks)

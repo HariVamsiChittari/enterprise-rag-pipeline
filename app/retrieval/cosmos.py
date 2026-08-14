@@ -21,24 +21,25 @@ class RetrievedChunk:
     document_id: str
     content: str
     source_name: str
+    source_url: str
     page_number: int
 
 
 _PROJECTION = (
-    "c.id, c.documentId, c.publicationVersion, c.content, "
-    "c.sourceName, c.pageNumber"
+    "c.id, c.documentId, c.sourceRunId, c.content, "
+    "c.sourceName, c.sourceUrl, c.pageStart"
 )
 _ACL_FILTER = (
-    "EXISTS(SELECT VALUE principalId FROM principalId IN c.aclPrincipalIds "
-    "WHERE ARRAY_CONTAINS(@principalIds, principalId))"
+    "EXISTS(SELECT VALUE gid FROM gid IN c.allowedGroupIds "
+    "WHERE ARRAY_CONTAINS(@principalIds, gid))"
 )
-_RANKING = {
+_ORDER_BY = {
     RetrievalMode.HYBRID: (
-        "RRF(VectorDistance(c.embedding, @embedding), "
+        "ORDER BY RANK RRF(VectorDistance(c.embedding, @embedding), "
         "FullTextScore(c.content, @searchText))"
     ),
-    RetrievalMode.VECTOR: "VectorDistance(c.embedding, @embedding)",
-    RetrievalMode.FULL_TEXT: "FullTextScore(c.content, @searchText)",
+    RetrievalMode.VECTOR: "ORDER BY VectorDistance(c.embedding, @embedding)",
+    RetrievalMode.FULL_TEXT: "ORDER BY RANK FullTextScore(c.content, @searchText)",
 }
 
 
@@ -67,7 +68,7 @@ class SecureCosmosRetriever:
 
         query = (
             f"SELECT TOP @topK {_PROJECTION} FROM c WHERE {_ACL_FILTER} "
-            f"ORDER BY RANK {_RANKING[mode]}"
+            f"{_ORDER_BY[mode]}"
         )
         parameters = [
             {"name": "@topK", "value": top_k},
@@ -98,20 +99,17 @@ class SecureCosmosRetriever:
 
     def _active_manifest(self, candidate: dict[str, Any]) -> dict[str, Any] | None:
         document_id = candidate.get("documentId")
-        publication = candidate.get("publicationVersion")
-        if not isinstance(document_id, str) or not isinstance(publication, str):
+        source_run_id = candidate.get("sourceRunId")
+        if not isinstance(document_id, str) or not isinstance(source_run_id, str):
             return None
         try:
             manifest = self._manifests.read_item(
                 item=document_id,
-                partition_key=document_id,
+                partition_key=source_run_id,
             )
         except CosmosResourceNotFoundError:
             return None
-        if not (
-            manifest.get("state") == "queryable"
-            and manifest.get("publicationVersion") == publication
-        ):
+        if manifest.get("status") != "ready":
             return None
         return manifest
 
@@ -120,15 +118,17 @@ def _to_chunk(
     candidate: dict[str, Any],
     manifest_source_name: str | None = None,
 ) -> RetrievedChunk:
+    source_url = candidate.get("sourceUrl") or ""
     values = {
         "chunk_id": candidate.get("id"),
         "document_id": candidate.get("documentId"),
         "content": candidate.get("content"),
         "source_name": manifest_source_name or candidate.get("sourceName"),
-        "page_number": candidate.get("pageNumber"),
+        "source_url": source_url,
+        "page_number": candidate.get("pageStart"),
     }
     if (
-        not all(isinstance(values[name], str) and values[name] for name in values if name != "page_number")
+        not all(isinstance(values[name], str) and values[name] for name in values if name not in ("page_number", "source_url"))
         or not isinstance(values["page_number"], int)
         or values["page_number"] < 1
     ):

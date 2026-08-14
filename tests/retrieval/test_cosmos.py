@@ -7,14 +7,15 @@ import pytest
 from retrieval.cosmos import RetrievalMode, SecureCosmosRetriever
 
 
-def candidate(publication: str = "active") -> dict[str, object]:
+def candidate() -> dict[str, object]:
     return {
         "id": "chunk",
         "documentId": "document",
-        "publicationVersion": publication,
+        "sourceRunId": "sharepoint-drive:run1",
         "content": "authorized content",
         "sourceName": "document.pdf",
-        "pageNumber": 2,
+        "sourceUrl": "https://example.sharepoint.com/sites/docs/document.pdf",
+        "pageStart": 2,
     }
 
 
@@ -24,8 +25,7 @@ def test_every_ranked_query_filters_acl_before_ranking(mode: RetrievalMode) -> N
     chunks.query_items.return_value = [candidate()]
     manifests = Mock()
     manifests.read_item.return_value = {
-        "state": "queryable",
-        "publicationVersion": "active",
+        "status": "ready",
     }
     retriever = SecureCosmosRetriever(chunks, manifests)
 
@@ -39,22 +39,24 @@ def test_every_ranked_query_filters_acl_before_ranking(mode: RetrievalMode) -> N
     assert [result.content for result in results] == ["authorized content"]
     query = chunks.query_items.call_args.kwargs["query"]
     assert "WHERE EXISTS" in query
-    assert "ARRAY_CONTAINS(@principalIds, principalId)" in query
-    assert query.index("WHERE") < query.index("ORDER BY RANK")
+    assert "ARRAY_CONTAINS(@principalIds, gid)" in query
+    assert query.index("WHERE") < query.index("ORDER BY")
     parameters = {
         parameter["name"]: parameter["value"]
         for parameter in chunks.query_items.call_args.kwargs["parameters"]
     }
     assert parameters["@principalIds"] == ["group-1", "group-2"]
+    manifests.read_item.assert_called_once_with(
+        item="document", partition_key="sharepoint-drive:run1",
+    )
 
 
-def test_stale_publication_is_not_returned() -> None:
+def test_non_ready_document_is_not_returned() -> None:
     chunks = Mock()
-    chunks.query_items.return_value = [candidate("stale")]
+    chunks.query_items.return_value = [candidate()]
     manifests = Mock()
     manifests.read_item.return_value = {
-        "state": "queryable",
-        "publicationVersion": "active",
+        "status": "failed",
     }
 
     assert SecureCosmosRetriever(chunks, manifests).retrieve(
@@ -68,11 +70,10 @@ def test_citation_uses_active_manifest_source_name_with_legacy_fallback() -> Non
     manifests = Mock()
     manifests.read_item.side_effect = [
         {
-            "state": "queryable",
-            "publicationVersion": "active",
+            "status": "ready",
             "sourceName": "renamed.pdf",
         },
-        {"state": "queryable", "publicationVersion": "active"},
+        {"status": "ready"},
     ]
     retriever = SecureCosmosRetriever(chunks, manifests)
 

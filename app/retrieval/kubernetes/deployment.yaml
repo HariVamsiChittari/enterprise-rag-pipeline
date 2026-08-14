@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retrieval-agent
+  labels:
+    app: retrieval-agent
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: retrieval-agent
+  template:
+    metadata:
+      labels:
+        app: retrieval-agent
+        azure.workload.identity/use: "true"
+    spec:
+      serviceAccountName: retrieval-agent-sa
+      # Let in-flight /api/query requests (bounded by retrieval+generation timeout
+      # budgets) finish before the pod is killed during rollouts/scale-down.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: retrieval-agent
+          image: REGISTRY/retrieval-agent:latest
+          ports:
+            - containerPort: 8080
+              protocol: TCP
+          lifecycle:
+            preStop:
+              exec:
+                # Give the Service time to stop routing new traffic here before the
+                # process receives SIGTERM (standard rolling-update drain pattern).
+                command: ["/bin/sh", "-c", "sleep 5"]
+          envFrom:
+            - configMapRef:
+                name: retrieval-config
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3

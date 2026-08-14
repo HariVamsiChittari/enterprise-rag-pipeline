@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: retrieval-config
+data:
+  COSMOS_ENDPOINT: "https://PLACEHOLDER.documents.azure.com:443/"
+  COSMOS_DATABASE: "rag-db"
+  COSMOS_CHUNKS_CONTAINER: "search-chunks"
+  COSMOS_MANIFESTS_CONTAINER: "source-documents"
+  COSMOS_AUDIT_CONTAINER: "service-audit"
+  AZURE_OPENAI_ENDPOINT: "https://PLACEHOLDER.openai.azure.com/"
+  EMBEDDING_DEPLOYMENT: "text-embedding-3-large"
+  CHAT_DEPLOYMENT: "PLACEHOLDER"
+  TENANT_ID: "PLACEHOLDER"
+  MANAGED_IDENTITY_CLIENT_ID: "PLACEHOLDER"
+  RETRIEVAL_TIMEOUT_SECONDS: "5.0"
+  GENERATION_TIMEOUT_SECONDS: "3.0"
+  AGENT_TIMEOUT_SECONDS: "8.0"
+  AGENT_MAX_ITERATIONS: "5"
+  AGENT_OPENAI_API_VERSION: "2025-04-01-preview"
+  MAX_EVIDENCE_CHUNKS: "5"
+  MAX_PLANNED_QUERIES: "3"
+  GRAPH_GROUP_TIMEOUT_SECONDS: "10.0"
+  OPENAI_API_VERSION: "2024-10-21"
+  INCLUDE_CITATIONS: "true"
+  # Optional: GenAI OpenTelemetry tracing to Application Insights (see monitoring.bicep
+  # outputs.connectionString). Leave empty to skip tracing entirely (default).
+  APPLICATIONINSIGHTS_CONNECTION_STRING: ""

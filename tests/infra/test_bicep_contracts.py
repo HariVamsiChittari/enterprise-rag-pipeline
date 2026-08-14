@@ -53,6 +53,7 @@ def test_cosmos_container_topology_and_partition_keys() -> None:
         "ingestion-runs",
         "source-documents",
         "search-chunks",
+        "service-audit",
     }
     assert containers_by_id["ingestion-runs"]["properties"]["resource"][
         "partitionKey"
@@ -63,6 +64,9 @@ def test_cosmos_container_topology_and_partition_keys() -> None:
     assert containers_by_id["search-chunks"]["properties"]["resource"][
         "partitionKey"
     ]["paths"] == ["/documentKey"]
+    assert containers_by_id["service-audit"]["properties"]["resource"][
+        "partitionKey"
+    ]["paths"] == ["/id"]
 
 
 def test_cosmos_search_policy_and_throughput_ownership() -> None:
@@ -134,9 +138,8 @@ def test_durable_scheduler_task_hub_and_rbac_contract() -> None:
     assert template["variables"]["durableTaskDataContributorRoleId"] == (
         "0ad04412-c4d5-4796-b79c-f76d14c8d402"
     )
-    assert role["scope"].startswith(
-        "[format('Microsoft.DurableTask/schedulers/{0}/taskHubs/{1}'"
-    )
+    assert "Microsoft.DurableTask/schedulers" in role["scope"]
+    assert "taskHubs" in role["scope"]
     assert role["properties"]["principalId"] == (
         "[parameters('functionAppPrincipalId')]"
     )

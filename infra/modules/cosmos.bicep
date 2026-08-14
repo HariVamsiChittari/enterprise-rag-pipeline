@@ -224,6 +224,31 @@ resource searchChunksContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabas
   }
 }
 
+resource serviceAuditContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2025-05-01-preview' = {
+  parent: database
+  name: 'service-audit'
+  properties: {
+    resource: {
+      id: 'service-audit'
+      // Item ID as partition key: write-heavy, unique-per-record audit log (Cosmos DB partitioning best practice)
+      partitionKey: {
+        paths: ['/id']
+        kind: 'Hash'
+        version: 2
+      }
+      indexingPolicy: {
+        indexingMode: 'consistent'
+        automatic: true
+        includedPaths: [
+          { path: '/*' }
+        ]
+        excludedPaths: []
+      }
+    }
+    options: {}
+  }
+}
+
 @description('Cosmos DB account ID')
 output cosmosAccountId string = cosmosAccount.id
 
@@ -244,3 +269,6 @@ output sourceDocumentsContainerName string = sourceDocumentsContainer.name
 
 @description('Search chunks container name')
 output searchChunksContainerName string = searchChunksContainer.name
+
+@description('Service audit container name')
+output serviceAuditContainerName string = serviceAuditContainer.name

@@ -970,6 +970,58 @@ def test_stale_run_writes_never_change_source_control() -> None:
     assert current.record.last_completed_run_id is None
 
 
+def test_services_finalize_marks_completed_with_errors_when_documents_failed() -> None:
+    from config import IngestionConfig
+    from ingestion.services import finalize
+
+    runs = StatefulContainer("sourceId")
+    documents = StatefulContainer("sourceRunId")
+    repository = IngestionRepository(runs, documents, StatefulContainer("documentKey"))
+    activated = repository.activate_run(build_run("run-a", UTC), build_control("run-a", UTC))
+
+    discovered = repository.create_discovered_document(build_document())
+    processing = repository.mark_document_processing(
+        replace(
+            discovered.record,
+            status=DocumentStatus.PROCESSING,
+            stage=DocumentStage.ACL,
+            attempt_count=1,
+            processing_started_at=UTC,
+        ),
+        discovered.etag,
+    )
+    failed = replace(
+        processing.record,
+        status=DocumentStatus.FAILED,
+        stage=DocumentStage.TERMINAL,
+        failed_at=UTC,
+        error=SafeError("processing_failed", "embedding", False),
+    )
+    repository.mark_document_failed(failed, processing.etag)
+
+    config = IngestionConfig(
+        extraction_enabled=True, enrichment_enabled=True, summary_enabled=False,
+        key_phrases_enabled=True, entities_enabled=True, allowed_extensions=(".pdf",),
+        source_id="source", drive_id="drive", tenant_id="tenant", app_client_id="app",
+        certificate_secret_name="cert", key_vault_uri="https://kv.example",
+        cosmos_endpoint="https://cosmos.example", cosmos_database="db",
+        cosmos_ingestion_runs_container="ingestion-runs",
+        cosmos_source_documents_container="source-documents",
+        cosmos_search_chunks_container="search-chunks",
+        document_intelligence_endpoint="https://di.example",
+        language_endpoint="https://lang.example", openai_endpoint="https://openai.example",
+        managed_identity_client_id="mi",
+        chunk_max_tokens=800, chunk_overlap_tokens=100, acl_max_pages=10,
+        download_timeout_seconds=120.0, delta_max_pages=200, embedding_batch_size=100,
+        max_pdf_pages=500, query_proxy_timeout_seconds=30.0,
+    )
+
+    finalized = finalize(config, activated.run.etag, repository, items_scanned=1)
+
+    assert finalized.record.status is RunStatus.COMPLETED_WITH_ERRORS
+    assert finalized.record.counters.failed == 1
+
+
 def test_repository_exposes_no_forbidden_api_or_terminology() -> None:
     source = inspect.getsource(repository_module).lower()
 

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from ingestion.errors import TerminalDocumentError
+from ingestion.telemetry import usage_record, write_audit_record
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_BATCH_SIZE = 100
 EMBEDDING_DIMENSIONS = 3_072
 EMBEDDING_MODEL = "text-embedding-3-large"
 
@@ -18,12 +19,17 @@ def embed_texts(
     client: Any,
     texts: list[str],
     deployment: str = EMBEDDING_MODEL,
+    audit_container: Any | None = None,
+    source_id: str = "",
+    run_id: str = "",
+    batch_size: int = 100,
 ) -> list[tuple[float, ...]]:
     """Generate embeddings for a list of texts in batches."""
     embeddings: list[tuple[float, ...]] = []
-    for offset in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch = texts[offset : offset + EMBEDDING_BATCH_SIZE]
+    for offset in range(0, len(texts), batch_size):
+        batch = texts[offset : offset + batch_size]
         try:
+            start = time.perf_counter()
             response = client.embeddings.create(
                 model=deployment,
                 input=batch,
@@ -38,6 +44,11 @@ def embed_texts(
             if "APIConnectionError" in error_type or "InternalServerError" in error_type:
                 raise TimeoutError(f"openai_transient:{error_type}") from error
             raise TerminalDocumentError(f"openai_failed:{error_type}") from error
+        if audit_container is not None:
+            write_audit_record(
+                audit_container, source_id, run_id,
+                usage_record("ingestion_embedding", deployment, response, start),
+            )
         ordered = sorted(response.data, key=lambda item: item.index)
         if len(ordered) != len(batch):
             raise TerminalDocumentError("embedding_count_mismatch")

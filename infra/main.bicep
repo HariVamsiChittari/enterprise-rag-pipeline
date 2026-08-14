@@ -40,6 +40,9 @@ param sharePointCertificateSecretName string = 'sharepoint-app-cert'
 @description('Microsoft Entra application client ID protecting operator and query endpoints')
 param adminApiClientId string
 
+@description('Microsoft Graph service principal object ID (tenant-specific, from az ad sp show --id 00000003-0000-0000-c000-000000000000 --query id)')
+param graphServicePrincipalId string
+
 @description('Cosmos DB mode')
 @allowed(['serverless', 'provisioned'])
 param cosmosDbMode string = 'serverless'
@@ -67,6 +70,9 @@ param openAiRoleAssignmentExists bool = false
 
 @description('Use Azure AI Language F0 for development')
 param useLanguageFreeTier bool = false
+
+@description('Deploy AKS cluster (true for prod, false for dev/ACA)')
+param deployAks bool = false
 
 @description('Application Insights daily cap in GB; -1 means unlimited')
 param applicationInsightsDailyCapGb int = -1
@@ -139,7 +145,10 @@ module durableTask './modules/durable-task.bicep' = {
     schedulerName: take('${prefix}-dts-${suffix}', 45)
     location: location
     functionAppPrincipalId: identity.outputs.identityPrincipalId
-    taskHubName: 'full-sync'
+    // Goal 7: independent scaling per source -- each source's azd deployment provisions
+    // its own scheduler (per confirmed answer), so the task hub is named from the
+    // source rather than the misleading hardcoded 'full-sync' literal.
+    taskHubName: take('${ingestionSourceId}-sync', 45)
     tags: tags
   }
 }
@@ -241,6 +250,7 @@ module functions './modules/functions.bicep' = {
     sharePointDriveId: sharePointDriveId
     sharePointCertificateSecretName: sharePointCertificateSecretName
     adminApiClientId: adminApiClientId
+    retrievalServiceUrl: deployAks ? '' : aca.outputs.internalUrl
     tags: tags
   }
 }
@@ -269,6 +279,68 @@ module openAiRbac './modules/openai-rbac.bicep' = {
   }
 }
 
+// --- AKS Retrieval Agent (prod only) ---
+
+module aks './modules/aks.bicep' = if (deployAks) {
+  name: 'aks'
+  params: {
+    clusterName: '${prefix}-aks-${suffix}'
+    location: location
+    vnetId: networking.outputs.virtualNetworkId
+    logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsId
+    tags: tags
+  }
+}
+
+module acr './modules/acr.bicep' = {
+  name: 'acr'
+  params: {
+    registryName: take('${replace(prefix, '-', '')}acr${suffix}', 50)
+    location: location
+    kubeletPrincipalId: deployAks ? aks.outputs.kubeletIdentityObjectId : ''
+    tags: tags
+  }
+}
+
+module aksIdentity './modules/aks-identity.bicep' = if (deployAks) {
+  name: 'aks-identity'
+  params: {
+    identityName: '${prefix}-aks-retrieval-mi'
+    location: location
+    oidcIssuerUrl: aks.outputs.oidcIssuerUrl
+    cosmosAccountId: cosmos.outputs.cosmosAccountId
+    cosmosDatabaseName: cosmos.outputs.databaseName
+    serviceAuditContainerName: cosmos.outputs.serviceAuditContainerName
+    openAiAccountName: openAiAccountName
+    openAiResourceGroupName: openAiResourceGroupName
+    graphServicePrincipalId: graphServicePrincipalId
+    tags: tags
+  }
+}
+
+// --- ACA Retrieval Agent (dev, when AKS not deployed) ---
+
+module aca './modules/aca.bicep' = if (!deployAks) {
+  name: 'aca'
+  params: {
+    containerAppName: '${prefix}-retrieval-${suffix}'
+    location: location
+    acrLoginServer: acr.outputs.loginServer
+    managedIdentityId: identity.outputs.identityId
+    managedIdentityClientId: identity.outputs.identityClientId
+    infrastructureSubnetId: networking.outputs.integrationSubnetId
+    logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsId
+    cosmosEndpoint: cosmos.outputs.endpoint
+    cosmosDatabaseName: cosmos.outputs.databaseName
+    openAiEndpoint: openAiEndpoint
+    chatDeploymentName: chatDeploymentName
+    embeddingDeploymentName: embeddingDeploymentName
+    tenantId: sharePointTenantId
+    appInsightsConnectionString: monitoring.outputs.connectionString
+    tags: tags
+  }
+}
+
 output functionAppName string = functions.outputs.functionAppName
 output functionAppUrl string = functions.outputs.functionAppUrl
 output managedIdentityClientId string = identity.outputs.identityClientId
@@ -277,3 +349,7 @@ output cosmosDbEndpoint string = cosmos.outputs.endpoint
 output cosmosDbDatabaseName string = cosmos.outputs.databaseName
 output documentIntelligenceEndpoint string = documentIntelligence.outputs.documentIntelligenceEndpoint
 output openAiEndpoint string = openAiEndpoint
+output acrLoginServer string = acr.outputs.loginServer
+output aksClusterName string = deployAks ? aks.outputs.clusterName : ''
+output aksRetrievalIdentityClientId string = deployAks ? aksIdentity.outputs.identityClientId : ''
+output retrievalServiceUrl string = deployAks ? '' : aca.outputs.internalUrl

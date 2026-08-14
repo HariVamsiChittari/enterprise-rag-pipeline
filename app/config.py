@@ -54,6 +54,16 @@ class IngestionConfig:
     openai_endpoint: str
     managed_identity_client_id: str
 
+    # Tuning (operator-adjustable per environment)
+    chunk_max_tokens: int
+    chunk_overlap_tokens: int
+    acl_max_pages: int
+    download_timeout_seconds: float
+    delta_max_pages: int
+    embedding_batch_size: int
+    max_pdf_pages: int
+    query_proxy_timeout_seconds: float
+
 
 def load_config() -> IngestionConfig:
     extensions_raw = os.getenv("ALLOWED_FILE_EXTENSIONS", ".pdf")
@@ -86,4 +96,12 @@ def load_config() -> IngestionConfig:
         language_endpoint=_required("AZURE_LANGUAGE_ENDPOINT") if any_enrichment else "",
         openai_endpoint=_required("OPENAI_ENDPOINT"),
         managed_identity_client_id=os.getenv("AZURE_CLIENT_ID", ""),
+        chunk_max_tokens=_int("CHUNK_MAX_TOKENS", 800),
+        chunk_overlap_tokens=_int("CHUNK_OVERLAP_TOKENS", 100),
+        acl_max_pages=_int("ACL_MAX_PAGES", 10),
+        download_timeout_seconds=float(os.getenv("DOWNLOAD_TIMEOUT_SECONDS", "120.0")),
+        delta_max_pages=_int("DELTA_MAX_PAGES", 200),
+        embedding_batch_size=_int("EMBEDDING_BATCH_SIZE", 100),
+        max_pdf_pages=_int("MAX_PDF_PAGES", 500),
+        query_proxy_timeout_seconds=float(os.getenv("QUERY_PROXY_TIMEOUT_SECONDS", "30.0")),
     )

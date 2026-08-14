@@ -15,7 +15,9 @@ param sharePointCertificateSecretName = readEnvironmentVariable(
   'sharepoint-app-cert'
 )
 param adminApiClientId = readEnvironmentVariable('ADMIN_API_CLIENT_ID')
+param graphServicePrincipalId = readEnvironmentVariable('GRAPH_SERVICE_PRINCIPAL_ID')
 param cosmosDbMode = 'serverless'
+param deployAks = false
 param cosmosRoleAssignmentExists = true
 param openAiRoleAssignmentExists = true
 param storageRedundancy = 'LRS'

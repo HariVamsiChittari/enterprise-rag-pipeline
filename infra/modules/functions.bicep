@@ -88,6 +88,20 @@ param sharePointCertificateSecretName string
 @description('Microsoft Entra application client ID protecting operator endpoints')
 param adminApiClientId string
 
+@description('NCRONTAB schedule for the delta-sync timer (Goal 8 incremental add/update/delete)')
+param deltaSyncSchedule string = '0 */15 * * * *'
+
+@description('NCRONTAB schedule for the ACL-resync timer (Goal 6b)')
+param aclResyncSchedule string = '0 0 3 * * *'
+
+@description('Page size for each ACL-resync activity call')
+@minValue(1)
+@maxValue(100)
+param aclResyncPageSize int = 50
+
+@description('Internal URL of the retrieval service for query proxy')
+param retrievalServiceUrl string = ''
+
 @description('Resource tags')
 param tags object = {}
 
@@ -245,6 +259,54 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         {
           name: 'FULL_SYNC_APP_ROLE'
           value: 'Rag.FullSync'
+        }
+        {
+          name: 'DELTA_SYNC_SCHEDULE'
+          value: deltaSyncSchedule
+        }
+        {
+          name: 'ACL_RESYNC_SCHEDULE'
+          value: aclResyncSchedule
+        }
+        {
+          name: 'ACL_RESYNC_PAGE_SIZE'
+          value: string(aclResyncPageSize)
+        }
+        {
+          name: 'CHUNK_MAX_TOKENS'
+          value: '800'
+        }
+        {
+          name: 'CHUNK_OVERLAP_TOKENS'
+          value: '100'
+        }
+        {
+          name: 'ACL_MAX_PAGES'
+          value: '10'
+        }
+        {
+          name: 'DOWNLOAD_TIMEOUT_SECONDS'
+          value: '120'
+        }
+        {
+          name: 'DELTA_MAX_PAGES'
+          value: '200'
+        }
+        {
+          name: 'EMBEDDING_BATCH_SIZE'
+          value: '100'
+        }
+        {
+          name: 'MAX_PDF_PAGES'
+          value: '500'
+        }
+        {
+          name: 'QUERY_PROXY_TIMEOUT_SECONDS'
+          value: '30'
+        }
+        {
+          name: 'RETRIEVAL_SERVICE_URL'
+          value: retrievalServiceUrl
         }
         {
           name: 'INSTANCE_MEMORY_MB'

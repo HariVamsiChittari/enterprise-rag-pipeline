@@ -269,7 +269,7 @@ def _require_item_text(item: dict[str, Any], field_name: str) -> str:
     return value
 
 
-def _discovered_pdf(item: dict[str, Any], ordinal: int) -> DiscoveredPdf:
+def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPdf:
     item_id = _require_item_text(item, "id")
     name = _require_item_text(item, "name")
     size_bytes = item.get("size")
@@ -346,7 +346,7 @@ def advance_discovery(
             continue
         if pdfs_discovered >= limits.max_eligible_pdfs:
             raise GraphDiscoveryLimitExceeded("max_eligible_pdfs_exceeded")
-        discovered = _discovered_pdf(item, pdfs_discovered)
+        discovered = discovered_pdf_from_item(item, pdfs_discovered)
         if discovered.size_bytes > limits.max_pdf_bytes:
             raise GraphDiscoveryLimitExceeded("max_pdf_bytes_exceeded")
         pdfs.append(discovered)
@@ -500,6 +500,25 @@ def read_drive_delta(
     )
 
 
+def bootstrap_delta_cursor(client: httpx.Client, drive_id: str) -> str:
+    """Fetch the current deltaLink without enumerating existing items (token=latest).
+
+    Used for delta-sync's first tick, since full-sync already established the initial
+    corpus via its own tree walk; delta-sync only needs a starting cursor, not a replay.
+    """
+    url = f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/root/delta?token=latest"
+    response = client.get(url)
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise ValueError("Graph delta bootstrap response is invalid") from error
+    delta_link = payload.get("@odata.deltaLink") if isinstance(payload, dict) else None
+    if not isinstance(delta_link, str) or not delta_link:
+        raise ValueError("Graph delta bootstrap response is missing a deltaLink")
+    return validate_graph_paging_url(delta_link)
+
+
 def read_drive_item(
     client: httpx.Client,
     drive_id: str,
@@ -554,8 +573,8 @@ def read_security_enabled_group_ids(
             security_group_ids.add(group_id)
             continue
         if response.status_code == 429:
-            raise TerminalDocumentError(
-                f"unsafe_acl:graph_throttled_group_{group_id[:8]}"
+            raise TimeoutError(
+                f"graph_throttled_group_{group_id[:8]}"
             )
         response.raise_for_status()
         try:
