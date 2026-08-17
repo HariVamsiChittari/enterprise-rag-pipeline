@@ -133,6 +133,29 @@ Full-sync skips unchanged files automatically (same eTag). Use `retry-failed` fo
 - All Azure access via Managed Identity (no secrets in code)
 - Graph access via certificate stored in Key Vault
 - Prompt injection defense: hardened system prompt + chunk sanitization (strips injection prefixes) + input segmentation
+- Per-user rate limiting (default 30 RPM, configurable via `RATE_LIMIT_RPM`)
+- Thread-safe concurrent retrieval with `threading.Lock` on shared state
+- EasyAuth with Entra ID: tenant-locked, audience-validated; production should set `allowedApplications` to restrict calling clients
+- AKS pods: Pod Security Standards (Restricted) — `runAsNonRoot`, `readOnlyRootFilesystem`, `drop ALL` capabilities
+- OpenAI clients: `max_retries=2` for transient 429/5xx resilience
+
+## Initial Deployment (Bootstrap)
+
+On first deploy to an empty environment, the ACA uses `mcr.microsoft.com/k8se/quickstart:latest` as a placeholder image (ACR is empty). After infra provisioning, build and push the real image:
+
+```bash
+# 1. Deploy infrastructure (ACA starts with MCR placeholder)
+az deployment group create --resource-group <rg> --template-file infra/main.bicep --parameters infra/main.parameters.dev.bicepparam
+
+# 2. Build and push real image
+az acr build --registry <acr-name> --image retrieval-agent:v1 --file retrieval/Dockerfile app/
+
+# 3. Update ACA to real image
+az containerapp update --name <aca-name> --resource-group <rg> --image <acr>.azurecr.io/retrieval-agent:v1
+
+# 4. Deploy Function App code
+func azure functionapp publish <func-app-name> --python
+```
 
 ## Local Development
 

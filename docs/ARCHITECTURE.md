@@ -470,3 +470,34 @@ flowchart TB
 - **Retrieval service network** — ACA/AKS runs inside the VNet, connects to Cosmos DB via MI, Azure OpenAI via MI RBAC, and Microsoft Graph via MI token for ACL group resolution at query time
 - **Cross-RG access** — Azure OpenAI in a separate resource group, accessed via MI RBAC role (`Cognitive Services OpenAI User`) by both the Function App and the retrieval service
 - **Graph egress over public internet** — Microsoft Graph does not support Private Endpoints (multi-tenant global service). Calls from both the Function App (certificate auth) and retrieval service (MI token) egress via VNet's internet gateway over TLS 1.2
+
+## EasyAuth Authorization Policy
+
+The Function App uses App Service Authentication (EasyAuth) with Microsoft Entra ID:
+
+| Setting | Dev | Production |
+|---|---|---|
+| `openIdIssuer` | `https://login.microsoftonline.com/{tenantId}/v2.0` | Same |
+| `allowedAudiences` | `["api://{clientId}"]` | Same |
+| `allowedApplications` | Not set (any tenant app) | `["<frontend-client-id>"]` |
+
+**Dev**: Any authenticated user in the tenant can call the API. Fine-grained authorization is handled at the data layer (ACL filter on Cosmos queries).
+
+**Production**: Restrict `allowedApplications` to the specific front-end client ID. This ensures only the approved application can call the API, even if other apps in the tenant request tokens for this audience. Per [MS Learn](https://learn.microsoft.com/azure/app-service/configure-authentication-provider-aad#authorize-requests): *"When `allowedApplications` is configured as a nonempty array, only tokens obtained by an application specified in the list are accepted."*
+
+## Infrastructure Bootstrap
+
+On initial deployment to a new environment, the ACA module uses `mcr.microsoft.com/k8se/quickstart:latest` as a placeholder image (the ACR is empty). After infra deployment, CI/CD builds and pushes the real image, then updates the ACA revision. This pattern is used by 32+ Microsoft GitHub repositories and the AVM `azd/acr-container-app` pattern module.
+
+## Pod Security (AKS Production)
+
+The retrieval deployment enforces Kubernetes Pod Security Standards (Restricted profile):
+
+- `runAsNonRoot: true` — pod-level enforcement
+- `readOnlyRootFilesystem: true` — immutable container filesystem
+- `allowPrivilegeEscalation: false` — prevents privilege escalation
+- `capabilities: { drop: ["ALL"] }` — drops all Linux capabilities
+- `seccompProfile: { type: RuntimeDefault }` — default syscall filter
+- Writable `/tmp` via `emptyDir` volume (64Mi limit) for Python runtime needs
+
+Per [MS Learn - AKS Pod Security Best Practices](https://learn.microsoft.com/azure/aks/developer-best-practices-pod-security): *"Design your applications so `allowPrivilegeEscalation` is always set to false."*
