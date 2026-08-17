@@ -13,6 +13,9 @@ param tags object = {}
 var integrationSubnetName = 'function-integration'
 var privateEndpointSubnetName = 'private-endpoints'
 
+// Deduplicate DNS zone names — multiple PE targets can share one zone (e.g. cognitiveservices)
+var uniqueDnsZoneNames = union(map(privateEndpointTargets, target => target.dnsZoneName), [])
+
 module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.0' = {
   params: {
     name: virtualNetworkName
@@ -24,7 +27,7 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.0' = {
       {
         name: integrationSubnetName
         addressPrefix: '10.20.0.0/27'
-        delegation: 'Microsoft.Web/serverFarms'
+        delegation: 'Microsoft.App/environments'
       }
       {
         name: privateEndpointSubnetName
@@ -34,6 +37,7 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.0' = {
       {
         name: 'aca-environment'
         addressPrefix: '10.20.2.0/23'
+        delegation: 'Microsoft.App/environments'
       }
     ]
     tags: tags
@@ -42,9 +46,10 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.0' = {
 }
 
 module privateDnsZones 'br/public:avm/res/network/private-dns-zone:0.8.0' = [
-  for target in privateEndpointTargets: {
+  for zoneName in uniqueDnsZoneNames: {
+    name: 'dnsZone-${replace(zoneName, '.', '-')}'
     params: {
-      name: target.dnsZoneName
+      name: zoneName
       virtualNetworkLinks: [
         {
           name: '${virtualNetworkName}-link'
@@ -60,6 +65,7 @@ module privateDnsZones 'br/public:avm/res/network/private-dns-zone:0.8.0' = [
 
 module privateEndpoints 'br/public:avm/res/network/private-endpoint:0.12.0' = [
   for (target, index) in privateEndpointTargets: {
+    name: 'pe-${target.name}'
     params: {
       name: '${virtualNetworkName}-${target.name}-pe'
       location: location
@@ -84,7 +90,7 @@ module privateEndpoints 'br/public:avm/res/network/private-endpoint:0.12.0' = [
         privateDnsZoneGroupConfigs: [
           {
             name: target.name
-            privateDnsZoneResourceId: privateDnsZones[index].outputs.resourceId
+            privateDnsZoneResourceId: privateDnsZones[indexOf(uniqueDnsZoneNames, target.dnsZoneName)].outputs.resourceId
           }
         ]
       }

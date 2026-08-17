@@ -7,8 +7,8 @@ param location string = resourceGroup().location
 @description('ACR login server (e.g. myacr.azurecr.io)')
 param acrLoginServer string
 
-@description('Container image name and tag')
-param imageName string = 'retrieval-agent:latest'
+@description('Container image name and tag (MCR placeholder for initial deploy; CI/CD overrides)')
+param imageName string = 'mcr.microsoft.com/k8se/quickstart:latest'
 
 @description('User-assigned managed identity resource ID for the container app')
 param managedIdentityId string
@@ -97,7 +97,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'retrieval-agent'
-          image: '${acrLoginServer}/${imageName}'
+          image: startsWith(imageName, 'mcr.microsoft.com/') ? imageName : '${acrLoginServer}/${imageName}'
           resources: {
             cpu: json('0.5')
             memory: '1Gi'

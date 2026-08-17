@@ -371,6 +371,9 @@ resource authSettings 'Microsoft.Web/sites/config@2025-03-01' = {
           allowedAudiences: [
             'api://${adminApiClientId}'
           ]
+          defaultAuthorizationPolicy: {
+            allowedPrincipals: {}
+          }
         }
       }
     }

@@ -298,6 +298,7 @@ module acr './modules/acr.bicep' = {
     registryName: take('${replace(prefix, '-', '')}acr${suffix}', 50)
     location: location
     kubeletPrincipalId: deployAks ? aks.outputs.kubeletIdentityObjectId : ''
+    appIdentityPrincipalId: identity.outputs.identityPrincipalId
     tags: tags
   }
 }
