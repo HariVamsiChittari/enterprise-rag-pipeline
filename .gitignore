@@ -78,7 +78,6 @@ data/*.json
 
 # Draft docs (not ready for commit)
 docs/COST_ESTIMATION.md
-docs/PRODUCTION_READINESS.md
 
 # Local configuration
 local.settings.json
