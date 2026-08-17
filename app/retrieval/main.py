@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import os
 import time
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict
@@ -118,7 +120,7 @@ async def _lifespan(app: FastAPI):
         azure_endpoint=config.openai_endpoint,
         azure_ad_token_provider=_openai_token_provider,
         api_version=config.openai_api_version,
-        max_retries=0,
+        max_retries=2,
     )
 
     if _AGENT_AVAILABLE:
@@ -130,7 +132,7 @@ async def _lifespan(app: FastAPI):
                 azure_endpoint=config.openai_endpoint,
                 azure_ad_token_provider=_openai_token_provider,
                 api_version=config.agent_api_version,
-                max_retries=0,
+                max_retries=2,
             )
             _state.agent_chat_client = OpenAIChatClient(
                 config.chat_deployment, async_client=async_openai,
@@ -167,6 +169,38 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="RAG Retrieval Agent", lifespan=_lifespan)
 
+_RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))
+_RATE_LIMIT_WINDOW = 60.0
+
+
+class _SlidingWindowLimiter:
+    """Per-user sliding window rate limiter (in-memory, per-instance)."""
+
+    def __init__(self, max_requests: int, window_seconds: float) -> None:
+        self._max = max_requests
+        self._window = window_seconds
+        self._lock = threading.Lock()
+        self._requests: dict[str, collections.deque] = {}
+
+    def is_allowed(self, user_id: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            window = self._requests.setdefault(user_id, collections.deque())
+            while window and window[0] <= now - self._window:
+                window.popleft()
+            if len(window) >= self._max:
+                return False
+            window.append(now)
+            # Evict users with no recent requests to bound memory
+            if len(self._requests) > 10_000:
+                stale = [k for k, v in self._requests.items() if not v]
+                for k in stale:
+                    del self._requests[k]
+            return True
+
+
+_rate_limiter = _SlidingWindowLimiter(_RATE_LIMIT_RPM, _RATE_LIMIT_WINDOW)
+
 
 class QueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=4000)
@@ -194,6 +228,10 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
     log = logger.bind(request_id=request_id)
 
     principal = _resolve_principal(request)
+
+    if not _rate_limiter.is_allowed(principal.user_id):
+        raise HTTPException(status_code=429, detail="rate_limit_exceeded")
+
     mode = RetrievalMode(body.mode)
 
     queries, planning_usage = await asyncio.to_thread(
@@ -270,7 +308,9 @@ def _write_query_summary(
     write_audit_records(container, request_id, user_id, tenant_id, mode, [{
         "operation": "query_request",
         "question": question[:2000],
+        "question_truncated": len(question) > 2000,
         "answer_preview": answer[:500],
+        "answer_truncated": len(answer) > 500,
         "citations_count": citations_count,
         "path": path,
         "planned_queries": planned_queries,
@@ -338,7 +378,12 @@ async def health_live():
 async def health_ready():
     try:
         _source_id, retriever = _state.registry.items()[0]
-        await asyncio.to_thread(retriever._chunks.read)
+        items = retriever._chunks.query_items(
+            query="SELECT TOP 1 c.id FROM c",
+            enable_cross_partition_query=True,
+            max_item_count=1,
+        )
+        await asyncio.to_thread(lambda: list(items))
         return {"status": "ready"}
     except Exception:
         raise HTTPException(status_code=503, detail="cosmos_unavailable")

@@ -31,6 +31,10 @@ module virtualNetwork 'br/public:avm/res/network/virtual-network:0.10.0' = {
         addressPrefix: '10.20.0.32/27'
         privateEndpointNetworkPolicies: 'Disabled'
       }
+      {
+        name: 'aca-environment'
+        addressPrefix: '10.20.2.0/23'
+      }
     ]
     tags: tags
     enableTelemetry: false
@@ -103,3 +107,9 @@ output privateEndpointSubnetId string = resourceId(
 )
 
 output virtualNetworkId string = virtualNetwork.outputs.resourceId
+
+output acaSubnetId string = resourceId(
+  'Microsoft.Network/virtualNetworks/subnets',
+  virtualNetworkName,
+  'aca-environment'
+)

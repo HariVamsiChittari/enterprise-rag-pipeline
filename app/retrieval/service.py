@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from typing import Any
@@ -159,12 +160,10 @@ class RagService:
         effective_max = max_k or self._max_evidence
         planned = queries[:self._max_planned_queries]
         instances = self._registry.items()
-        # One task per (query, instance) pair. Each task embeds independently -- with
-        # exactly 1 registered instance (today's default) this is identical to before
-        # Goal 2; with N>1 instances the embedding is recomputed per instance, a known,
-        # accepted trade-off to avoid cross-task blocking/deadlock risk in the shared pool.
+        # Thread-safe collector for usage records from concurrent retrieval tasks
+        usage_lock = threading.Lock()
         futures: list[Future[list[RetrievedChunk]]] = [
-            self._executor.submit(self._retrieve_for_query, query, retriever, principal, mode, usage)
+            self._executor.submit(self._retrieve_for_query, query, retriever, principal, mode, usage, usage_lock)
             for query in planned
             for _source_id, retriever in instances
         ]
@@ -202,8 +201,9 @@ class RagService:
         principal: Principal,
         mode: RetrievalMode,
         usage: list[dict[str, Any]],
+        usage_lock: threading.Lock,
     ) -> list[RetrievedChunk]:
-        embedding = [] if mode is RetrievalMode.FULL_TEXT else self._embed(query, usage)
+        embedding = [] if mode is RetrievalMode.FULL_TEXT else self._embed(query, usage, usage_lock)
         return retriever.retrieve(
             query,
             embedding,
@@ -212,7 +212,7 @@ class RagService:
             top_k=self._max_evidence,
         )
 
-    def _embed(self, query: str, usage: list[dict[str, Any]]) -> list[float]:
+    def _embed(self, query: str, usage: list[dict[str, Any]], usage_lock: threading.Lock) -> list[float]:
         start = time.perf_counter()
         response = self._openai.embeddings.create(
             model=self._embedding_deployment,
@@ -221,7 +221,8 @@ class RagService:
             encoding_format="float",
             timeout=self._retrieval_timeout_seconds,
         )
-        usage.append(_usage_record("embedding", self._embedding_deployment, response, start))
+        with usage_lock:
+            usage.append(_usage_record("embedding", self._embedding_deployment, response, start))
         embedding = list(response.data[0].embedding)
         if len(embedding) != 3072:
             raise ValueError("embedding_dimension_mismatch")

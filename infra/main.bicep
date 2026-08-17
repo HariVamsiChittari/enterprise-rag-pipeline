@@ -328,7 +328,7 @@ module aca './modules/aca.bicep' = if (!deployAks) {
     acrLoginServer: acr.outputs.loginServer
     managedIdentityId: identity.outputs.identityId
     managedIdentityClientId: identity.outputs.identityClientId
-    infrastructureSubnetId: networking.outputs.integrationSubnetId
+    infrastructureSubnetId: networking.outputs.acaSubnetId
     logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsId
     cosmosEndpoint: cosmos.outputs.endpoint
     cosmosDatabaseName: cosmos.outputs.databaseName
