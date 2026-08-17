@@ -18,6 +18,7 @@ from ingestion.extraction import extract_pdf
 from ingestion.graph import (
     DiscoveryState,
     DiscoveryStep,
+    VerifiedAcl,
     discovered_pdf_from_item,
 )
 from ingestion.lifecycle_repository import (
@@ -338,6 +339,7 @@ class DeltaSyncOutcome:
     bootstrapped: bool = False
     created_or_updated: int = 0
     deleted: int = 0
+    acl_resynced: int = 0
     failed: int = 0
     items_seen: int = 0
 
@@ -366,6 +368,7 @@ def run_delta_sync(
 
     created_or_updated = 0
     deleted = 0
+    acl_resynced = 0
     failed = 0
     for ordinal, item in enumerate(delta.items):
         item_id = item.get("id")
@@ -378,15 +381,17 @@ def run_delta_sync(
             try:
                 ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
                 if ref is not None:
-                    lifecycle_repository.delete_document_and_chunks(
+                    lifecycle_repository.retire_document(
                         source_run_id=ref.source_run_id,
                         document_id=document_id,
-                        document_key=ref.document_key,
+                        etag=ref.etag,
+                        reason="deleted",
                     )
                     deleted += 1
                     if audit_container is not None:
                         write_audit_record(audit_container, config.source_id, run_id, {
-                            "operation": "document_deleted", "documentId": document_id,
+                            "operation": "document_retired", "documentId": document_id,
+                            "retiredReason": "deleted",
                             "sourceName": getattr(ref, "source_name", ""),
                             "sourceUrl": getattr(ref, "source_url", ""),
                             "method": "delta_sync",
@@ -394,6 +399,23 @@ def run_delta_sync(
             except Exception:
                 logger.error("delta_sync delete failed for item %s", item_id, exc_info=True)
                 failed += 1
+            continue
+
+        # Permission-only change: resync ACL without full reprocessing
+        if item.get("@microsoft.graph.sharedChanged") is True:
+            ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
+            if ref is not None:
+                try:
+                    result = resync_document_acl(config, ref, lifecycle_repository, connector)
+                    acl_resynced += 1
+                    if audit_container is not None:
+                        write_audit_record(audit_container, config.source_id, run_id, {
+                            "operation": "acl_resynced", "documentId": document_id,
+                            "result": result, "method": "delta_sync",
+                        })
+                except Exception:
+                    logger.error("delta_sync acl_resync failed for item %s", item_id, exc_info=True)
+                    failed += 1
             continue
 
         try:
@@ -438,6 +460,7 @@ def run_delta_sync(
     return DeltaSyncOutcome(
         created_or_updated=created_or_updated,
         deleted=deleted,
+        acl_resynced=acl_resynced,
         failed=failed,
         items_seen=len(delta.items),
     )

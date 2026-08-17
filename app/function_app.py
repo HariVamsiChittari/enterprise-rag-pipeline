@@ -5,10 +5,13 @@ Endpoints:
   GET  /api/ingestion/status       Query orchestration instance status
   GET  /api/ingestion/inspect      Read Cosmos data for debugging
   POST /api/query                  RAG query endpoint
+  POST /api/webhook/sharepoint     Microsoft Graph change notification receiver
+  POST /api/webhook/lifecycle      Microsoft Graph lifecycle notification receiver
 
 Timers:
-  delta_sync_timer   Incremental add/update/delete sync (Goal 8), via Graph delta query
-  acl_resync_timer   Re-verify ACLs on already-ingested documents (Goal 6b)
+  reconciliation_timer     Daily safety-net delta query (replaces 15-min polling)
+  acl_resync_timer         Re-verify ACLs on already-ingested documents (Goal 6b)
+  subscription_renew_timer Renew Microsoft Graph webhook subscription daily
 """
 
 from __future__ import annotations
@@ -26,9 +29,11 @@ logger = logging.getLogger("rag-ingestion")
 
 WAVE_SIZE = int(os.getenv("WAVE_SIZE", "4"))
 WAVE_TIMEOUT_MINUTES = int(os.getenv("WAVE_TIMEOUT_MINUTES", "20"))
-DELTA_SYNC_SCHEDULE = os.getenv("DELTA_SYNC_SCHEDULE", "0 */15 * * * *")  # every 15 min
-ACL_RESYNC_SCHEDULE = os.getenv("ACL_RESYNC_SCHEDULE", "0 0 3 * * *")  # daily 03:00 UTC
+RECONCILIATION_SCHEDULE = os.getenv("DELTA_SYNC_SCHEDULE", "0 0 4 * * *")  # daily 04:00 UTC
+ACL_RESYNC_SCHEDULE = os.getenv("ACL_RESYNC_SCHEDULE", "0 0 3 * * 0")  # weekly Sunday 03:00 UTC (safety net)
 ACL_RESYNC_PAGE_SIZE = int(os.getenv("ACL_RESYNC_PAGE_SIZE", "50"))
+SUBSCRIPTION_RENEW_SCHEDULE = os.getenv("SUBSCRIPTION_RENEW_SCHEDULE", "0 0 2 * * *")
+WEBHOOK_CLIENT_STATE = os.getenv("WEBHOOK_CLIENT_STATE", "")
 
 
 
@@ -209,17 +214,16 @@ async def _full_sync_is_running(client, source_id: str) -> bool:
     ))
 
 
-@app.timer_trigger(schedule=DELTA_SYNC_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
+@app.timer_trigger(schedule=RECONCILIATION_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
 @app.durable_client_input(client_name="client")
-async def delta_sync_timer(timer: func.TimerRequest, client) -> None:
-    """Kick off one delta-sync tick (Goal 8) unless the previous tick, or a
-    full-sync, is still running."""
+async def reconciliation_timer(timer: func.TimerRequest, client) -> None:
+    """Daily safety-net delta-sync — catches changes missed by webhooks."""
     source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
     if not source_id:
-        logger.warning("delta_sync_timer skipped: missing INGESTION_SOURCE_ID")
+        logger.warning("reconciliation_timer skipped: missing INGESTION_SOURCE_ID")
         return
     if await _full_sync_is_running(client, source_id):
-        logger.info("delta_sync_timer skipped: full-sync is running")
+        logger.info("reconciliation_timer skipped: full-sync is running")
         return
     instance_id = f"delta-sync-{source_id}"
     existing = await client.get_status(instance_id)
@@ -227,7 +231,7 @@ async def delta_sync_timer(timer: func.TimerRequest, client) -> None:
         df.OrchestrationRuntimeStatus.Running,
         df.OrchestrationRuntimeStatus.Pending,
     ):
-        logger.info("delta_sync_timer skipped: previous tick still running")
+        logger.info("reconciliation_timer skipped: previous tick still running")
         return
     await client.start_new("delta_sync_orchestrator", instance_id=instance_id)
 
@@ -254,6 +258,110 @@ async def acl_resync_timer(timer: func.TimerRequest, client) -> None:
         return
     await client.start_new("acl_resync_orchestrator", instance_id=instance_id)
 
+
+# --- Webhook endpoints (unauthenticated — secured by clientState + auth exclusion) ---
+
+@app.route(route="webhook/sharepoint", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+@app.durable_client_input(client_name="client")
+async def webhook_sharepoint(req: func.HttpRequest, client) -> func.HttpResponse:
+    """Receive Microsoft Graph change notifications for the subscribed drive."""
+    # Graph subscription validation handshake
+    validation_token = req.params.get("validationToken")
+    if validation_token:
+        return func.HttpResponse(validation_token, status_code=200, mimetype="text/plain")
+
+    if not WEBHOOK_CLIENT_STATE:
+        logger.error("webhook_sharepoint: WEBHOOK_CLIENT_STATE not configured")
+        return func.HttpResponse(status_code=500)
+
+    try:
+        payload = req.get_json()
+    except ValueError:
+        return func.HttpResponse(status_code=400)
+
+    from ingestion.subscription import validate_webhook_notification
+    if not validate_webhook_notification(payload, WEBHOOK_CLIENT_STATE):
+        return func.HttpResponse(status_code=403)
+
+    source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
+    if not source_id:
+        return func.HttpResponse(status_code=200)
+
+    if await _full_sync_is_running(client, source_id):
+        logger.info("webhook_sharepoint: full-sync running, skipping delta trigger")
+        return func.HttpResponse(status_code=200)
+
+    instance_id = f"delta-sync-{source_id}"
+    existing = await client.get_status(instance_id)
+    if existing and existing.runtime_status in (
+        df.OrchestrationRuntimeStatus.Running,
+        df.OrchestrationRuntimeStatus.Pending,
+    ):
+        logger.info("webhook_sharepoint: delta-sync already running")
+        return func.HttpResponse(status_code=200)
+
+    await client.start_new("delta_sync_orchestrator", instance_id=instance_id)
+    logger.info("webhook_sharepoint: started delta_sync_orchestrator")
+    return func.HttpResponse(status_code=200)
+
+
+@app.route(route="webhook/lifecycle", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
+async def webhook_lifecycle(req: func.HttpRequest) -> func.HttpResponse:
+    """Handle Graph subscription lifecycle events (missed, removed, reauthorizationRequired)."""
+    validation_token = req.params.get("validationToken")
+    if validation_token:
+        return func.HttpResponse(validation_token, status_code=200, mimetype="text/plain")
+
+    try:
+        payload = req.get_json()
+    except ValueError:
+        return func.HttpResponse(status_code=400)
+
+    notifications = payload.get("value", [])
+    for notification in notifications:
+        event = notification.get("lifecycleEvent", "")
+        logger.warning("webhook_lifecycle: %s for subscription %s", event, notification.get("subscriptionId"))
+    return func.HttpResponse(status_code=200)
+
+
+@app.timer_trigger(schedule=SUBSCRIPTION_RENEW_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
+async def subscription_renew_timer(timer: func.TimerRequest) -> None:
+    """Create or renew the Microsoft Graph webhook subscription for drive changes."""
+    from config import load_config
+    from ingestion.subscription import create_subscription, renew_subscription, SubscriptionNotFoundError
+
+    source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
+    if not source_id or not WEBHOOK_CLIENT_STATE:
+        logger.warning("subscription_renew_timer skipped: missing config")
+        return
+
+    config = load_config()
+    graph_client = _build_graph_client(config)
+    base_url = os.getenv("FUNCTION_PUBLIC_BASE_URL", "").strip()
+    if not base_url:
+        logger.warning("subscription_renew_timer skipped: FUNCTION_PUBLIC_BASE_URL not set")
+        return
+
+    notification_url = f"{base_url}/api/webhook/sharepoint"
+    lifecycle_url = f"{base_url}/api/webhook/lifecycle"
+
+    lifecycle_repository = _build_lifecycle_repository(config)
+    existing_id = lifecycle_repository.get_webhook_subscription_id(source_id)
+
+    with graph_client:
+        if existing_id:
+            try:
+                info = renew_subscription(graph_client, existing_id)
+                logger.info("subscription_renewed: %s expires %s", info.subscription_id, info.expiration)
+                return
+            except SubscriptionNotFoundError:
+                logger.info("subscription_expired, creating new one")
+
+        info = create_subscription(
+            graph_client, config.drive_id, notification_url, lifecycle_url, WEBHOOK_CLIENT_STATE,
+        )
+        lifecycle_repository.save_webhook_subscription_id(source_id, info.subscription_id)
+        logger.info("subscription_created: %s expires %s", info.subscription_id, info.expiration)
 
 
 @app.orchestration_trigger(context_name="context")
@@ -487,13 +595,14 @@ def delta_sync_activity(payload: Any) -> dict:
                 audit_container=audit_container,
             )
         logger.info(
-            "delta_sync_completed bootstrapped=%s created_or_updated=%d deleted=%d failed=%d items_seen=%d",
-            outcome.bootstrapped, outcome.created_or_updated, outcome.deleted, outcome.failed, outcome.items_seen,
+            "delta_sync_completed bootstrapped=%s created_or_updated=%d deleted=%d acl_resynced=%d failed=%d items_seen=%d",
+            outcome.bootstrapped, outcome.created_or_updated, outcome.deleted, outcome.acl_resynced, outcome.failed, outcome.items_seen,
         )
         return {
             "bootstrapped": outcome.bootstrapped,
             "createdOrUpdated": outcome.created_or_updated,
             "deleted": outcome.deleted,
+            "aclResynced": outcome.acl_resynced,
             "failed": outcome.failed,
             "itemsSeen": outcome.items_seen,
         }

@@ -159,3 +159,47 @@ async def test_search_tool_sanitizes_injection_markers():
     result = await tool(query="policy", mode="hybrid")
     assert "system:" not in result.lower().split("[source")[1]
     assert "Actual policy content here." in result
+
+
+@pytest.mark.asyncio
+async def test_search_tool_appends_usage_record(sample_chunks):
+    async def embed_fn(text):
+        return [0.1] * 3072
+
+    captured: list = []
+    usage: list = []
+    tool = make_search_tool(
+        registry=_registry(FakeRetriever(sample_chunks)),
+        embed_fn=embed_fn,
+        acl_ids=["group-1"],
+        retrieved_chunks=captured,
+        usage=usage,
+    )
+    await tool(query="Azure Functions", mode="hybrid")
+
+    assert len(usage) == 1
+    record = usage[0]
+    assert record["operation"] == "tool_invocation"
+    assert record["tool"] == "search_knowledge_base"
+    assert record["chunks_returned"] == 2
+    assert record["latency_ms"] >= 0
+    assert record["prompt_tokens"] == 0
+    assert record["completion_tokens"] == 0
+    assert "query" in record
+
+
+@pytest.mark.asyncio
+async def test_search_tool_usage_none_no_error(sample_chunks):
+    async def embed_fn(text):
+        return [0.1] * 3072
+
+    captured: list = []
+    tool = make_search_tool(
+        registry=_registry(FakeRetriever(sample_chunks)),
+        embed_fn=embed_fn,
+        acl_ids=["group-1"],
+        retrieved_chunks=captured,
+        usage=None,
+    )
+    result = await tool(query="test", mode="hybrid")
+    assert "[Source 1]" in result

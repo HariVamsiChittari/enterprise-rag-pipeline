@@ -16,7 +16,7 @@ from ingestion.models import ScaleLimits
 
 GRAPH_ROOT = "https://graph.microsoft.com/v1.0"
 GRAPH_ORIGIN = httpx.URL(GRAPH_ROOT)
-DELTA_PREFER = "deltashowremovedasdeleted, deltatraversepermissiongaps"
+DELTA_PREFER = "deltashowremovedasdeleted, deltatraversepermissiongaps, deltashowsharingchanges"
 DOWNLOAD_HOST_SUFFIXES = (
     "files.1drv.com",
     "livefilestore.com",
@@ -389,6 +389,8 @@ def read_json_pages(
     client: httpx.Client,
     initial_url: str,
     max_pages: int,
+    *,
+    headers: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     if max_pages < 1:
         raise ValueError("max_pages must be positive")
@@ -402,7 +404,7 @@ def read_json_pages(
             raise GraphPageLimitExceeded(
                 "Graph page guard reached before traversal completed"
             )
-        response = client.get(validate_graph_paging_url(url))
+        response = client.get(validate_graph_paging_url(url), headers=headers or {})
         if response.status_code == 410:
             location = response.headers.get("location")
             if not location:
@@ -442,13 +444,14 @@ def _read_delta_pages(
     *,
     allow_reset: bool,
 ) -> tuple[list[dict[str, Any]], str, bool]:
+    delta_headers = {"Prefer": DELTA_PREFER}
     try:
-        values, final_delta_link = read_json_pages(client, initial_url, max_pages)
+        values, final_delta_link = read_json_pages(client, initial_url, max_pages, headers=delta_headers)
         is_reset = False
     except DeltaResetRequired as reset:
         if not allow_reset:
             raise
-        values, final_delta_link = read_json_pages(client, reset.location, max_pages)
+        values, final_delta_link = read_json_pages(client, reset.location, max_pages, headers=delta_headers)
         is_reset = True
     if not final_delta_link:
         raise ValueError("Graph delta traversal completed without a deltaLink")

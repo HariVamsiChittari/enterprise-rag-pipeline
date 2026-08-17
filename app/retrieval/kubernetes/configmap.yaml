@@ -23,6 +23,7 @@ data:
   GRAPH_GROUP_TIMEOUT_SECONDS: "10.0"
   OPENAI_API_VERSION: "2024-10-21"
   INCLUDE_CITATIONS: "true"
+  ACL_ENABLED: "true"
   # Optional: GenAI OpenTelemetry tracing to Application Insights (see monitoring.bicep
   # outputs.connectionString). Leave empty to skip tracing entirely (default).
   APPLICATIONINSIGHTS_CONNECTION_STRING: ""

@@ -52,6 +52,8 @@ class RagService:
         generation_timeout_seconds: float = 3.0,
         max_evidence: int = 5,
         max_planned_queries: int = 3,
+        *,
+        acl_enabled: bool = True,
     ) -> None:
         self._openai = openai_client
         self._registry = registry
@@ -61,6 +63,7 @@ class RagService:
         self._generation_timeout_seconds = generation_timeout_seconds
         self._max_evidence = max_evidence
         self._max_planned_queries = max_planned_queries
+        self._acl_enabled = acl_enabled
         max_workers = _CONCURRENT_REQUESTS_FACTOR * max_planned_queries * max(1, len(registry))
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
 
@@ -207,7 +210,7 @@ class RagService:
         return retriever.retrieve(
             query,
             embedding,
-            principal.acl_ids,
+            principal.acl_ids if self._acl_enabled else [],
             mode=mode,
             top_k=self._max_evidence,
         )

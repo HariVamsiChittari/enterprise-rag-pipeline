@@ -22,6 +22,7 @@ from ingestion.models import DocumentStatus, RETIRED_REASONS
 logger = logging.getLogger(__name__)
 
 DELTA_CONTROL_ID = "delta-control"
+WEBHOOK_CONTROL_ID = "webhook-subscription"
 MAX_PATCH_BATCH_OPERATIONS = 100
 INTERNAL_PAGE_SIZE = 100
 
@@ -283,6 +284,34 @@ class DocumentLifecycleRepository:
             self._ingestion_runs.upsert_item(body=item)
         except Exception:
             raise LifecycleRepositoryError("Cosmos delta cursor save failed") from None
+
+    # ---- webhook subscription ID (per source_id singleton, ingestion-runs container) ----
+
+    def get_webhook_subscription_id(self, source_id: str) -> str | None:
+        try:
+            item = self._ingestion_runs.read_item(item=WEBHOOK_CONTROL_ID, partition_key=source_id)
+        except Exception as error:
+            if _error_status(error) == 404:
+                return None
+            raise LifecycleRepositoryError("Cosmos webhook subscription read failed") from None
+        sub_id = item.get("subscriptionId")
+        if sub_id is not None and not isinstance(sub_id, str):
+            raise LifecycleRepositoryError("Cosmos webhook subscription ID is malformed")
+        return sub_id
+
+    def save_webhook_subscription_id(self, source_id: str, subscription_id: str) -> None:
+        if not subscription_id:
+            raise ValueError("subscription_id is required")
+        item = {
+            "id": WEBHOOK_CONTROL_ID,
+            "sourceId": source_id,
+            "subscriptionId": subscription_id,
+            "updatedAt": _now_iso(),
+        }
+        try:
+            self._ingestion_runs.upsert_item(body=item)
+        except Exception:
+            raise LifecycleRepositoryError("Cosmos webhook subscription save failed") from None
 
 
 def _ready_ref_from_row(row: Mapping[str, Any]) -> ReadyDocumentRef:

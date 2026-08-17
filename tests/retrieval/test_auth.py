@@ -99,3 +99,37 @@ def test_easy_auth_uri_claim_names_are_normalized() -> None:
 def test_principal_fails_closed(encoded: str | None, tenant: str) -> None:
     with pytest.raises(AuthorizationError):
         principal_from_easy_auth(encoded, tenant)
+
+
+def test_principal_skips_group_resolution_when_acl_disabled() -> None:
+    resolver = Mock()
+    principal = principal_from_easy_auth(
+        encode(
+            [
+                {"typ": "oid", "val": "user"},
+                {"typ": "tid", "val": "tenant"},
+            ]
+        ),
+        "tenant",
+        resolver,
+        acl_enabled=False,
+    )
+    assert principal.user_id == "user"
+    assert principal.tenant_id == "tenant"
+    assert principal.security_group_ids == frozenset()
+    resolver.resolve_transitive_security_groups.assert_not_called()
+
+
+def test_principal_still_validates_tenant_when_acl_disabled() -> None:
+    with pytest.raises(AuthorizationError, match="unexpected_tenant"):
+        principal_from_easy_auth(
+            encode(
+                [
+                    {"typ": "oid", "val": "user"},
+                    {"typ": "tid", "val": "wrong-tenant"},
+                ]
+            ),
+            "tenant",
+            None,
+            acl_enabled=False,
+        )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Annotated, Any, Callable, Awaitable
 
 from retrieval.cosmos import RetrievalMode, RetrievedChunk, SecureCosmosRetriever
@@ -15,6 +16,9 @@ def make_search_tool(
     embed_fn: Callable[[str], Awaitable[list[float]]],
     acl_ids: list[str],
     retrieved_chunks: list[RetrievedChunk],
+    *,
+    acl_enabled: bool = True,
+    usage: list[dict[str, Any]] | None = None,
 ):
     """Create a search tool closure bound to the caller's ACL.
 
@@ -37,12 +41,15 @@ def make_search_tool(
         if retrieval_mode in {RetrievalMode.HYBRID, RetrievalMode.VECTOR}:
             embedding = await embed_fn(query)
 
+        # Timing excludes embed (tracked separately in caller)
+        tool_start = time.perf_counter()
+
         async def _retrieve_from(retriever: SecureCosmosRetriever) -> list[RetrievedChunk]:
             return await asyncio.to_thread(
                 retriever.retrieve,
                 query_text=query,
                 embedding=embedding,
-                principal_ids=acl_ids,
+                principal_ids=acl_ids if acl_enabled else [],
                 mode=retrieval_mode,
                 top_k=5,
             )
@@ -67,6 +74,18 @@ def make_search_tool(
                 break
 
         retrieved_chunks.extend(chunks)
+
+        if usage is not None:
+            usage.append({
+                "operation": "tool_invocation",
+                "tool": "search_knowledge_base",
+                "model": None,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "query": query[:200],
+                "chunks_returned": len(chunks),
+                "latency_ms": int((time.perf_counter() - tool_start) * 1000),
+            })
 
         if not chunks:
             return "No authorized documents found matching this query."

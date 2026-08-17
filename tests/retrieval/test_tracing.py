@@ -39,6 +39,7 @@ def _config(**overrides: object) -> RetrievalConfig:
         openai_api_version="2024-10-21",
         app_insights_connection_string=None,
         include_citations=True,
+        acl_enabled=True,
     )
     values.update(overrides)
     return RetrievalConfig(**values)

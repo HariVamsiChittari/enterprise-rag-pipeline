@@ -44,9 +44,10 @@ _ORDER_BY = {
 
 
 class SecureCosmosRetriever:
-    def __init__(self, chunks: Any, manifests: Any) -> None:
+    def __init__(self, chunks: Any, manifests: Any, *, acl_enabled: bool = True) -> None:
         self._chunks = chunks
         self._manifests = manifests
+        self._acl_enabled = acl_enabled
 
     def retrieve(
         self,
@@ -59,23 +60,33 @@ class SecureCosmosRetriever:
     ) -> list[RetrievedChunk]:
         if not query_text.strip():
             raise ValueError("query_text_required")
-        if not principal_ids:
+        if self._acl_enabled and not principal_ids:
             raise ValueError("principal_ids_required")
         if top_k < 1 or top_k > 50:
             raise ValueError("top_k_out_of_range")
         if mode in {RetrievalMode.HYBRID, RetrievalMode.VECTOR} and not embedding:
             raise ValueError("embedding_required")
 
+        if self._acl_enabled:
+            acl_clause = f"WHERE {_ACL_FILTER} "
+            parameters = [
+                {"name": "@topK", "value": top_k},
+                {"name": "@principalIds", "value": sorted(set(principal_ids))},
+                {"name": "@searchText", "value": query_text},
+                {"name": "@embedding", "value": embedding},
+            ]
+        else:
+            acl_clause = ""
+            parameters = [
+                {"name": "@topK", "value": top_k},
+                {"name": "@searchText", "value": query_text},
+                {"name": "@embedding", "value": embedding},
+            ]
+
         query = (
-            f"SELECT TOP @topK {_PROJECTION} FROM c WHERE {_ACL_FILTER} "
+            f"SELECT TOP @topK {_PROJECTION} FROM c {acl_clause}"
             f"{_ORDER_BY[mode]}"
         )
-        parameters = [
-            {"name": "@topK", "value": top_k},
-            {"name": "@principalIds", "value": sorted(set(principal_ids))},
-            {"name": "@searchText", "value": query_text},
-            {"name": "@embedding", "value": embedding},
-        ]
         candidates = self._chunks.query_items(
             query=query,
             parameters=parameters,

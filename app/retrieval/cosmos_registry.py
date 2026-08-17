@@ -90,6 +90,8 @@ def load_cosmos_instance_configs(
 def build_cosmos_registry(
     instance_configs: tuple[CosmosInstanceConfig, ...],
     credential: ManagedIdentityCredential,
+    *,
+    acl_enabled: bool = True,
 ) -> CosmosRegistry:
     retrievers: dict[str, SecureCosmosRetriever] = {}
     for instance in instance_configs:
@@ -98,6 +100,7 @@ def build_cosmos_registry(
         retrievers[instance.source_id] = SecureCosmosRetriever(
             db.get_container_client(instance.chunks_container),
             db.get_container_client(instance.manifests_container),
+            acl_enabled=acl_enabled,
         )
     return CosmosRegistry(retrievers)
 

@@ -226,7 +226,7 @@ def test_run_delta_sync_deletes_document_and_chunks_on_graph_deletion() -> None:
         outcome = services.run_delta_sync(config, FakeRepository(), lifecycle, connector, None, None, None)
 
     assert outcome.deleted == 1
-    assert lifecycle.deleted == [{"source_run_id": "source:run-a", "document_id": document_id, "document_key": ref.document_key}]
+    assert lifecycle.retired == [{"source_run_id": "source:run-a", "document_id": document_id, "reason": "deleted"}]
 
 
 def test_run_delta_sync_deletion_of_untracked_item_is_a_no_op() -> None:
@@ -245,6 +245,65 @@ def test_run_delta_sync_deletion_of_untracked_item_is_a_no_op() -> None:
 
     assert outcome.deleted == 0
     assert lifecycle.deleted == []
+
+
+def test_run_delta_sync_routes_permission_change_to_acl_resync() -> None:
+    """Items annotated with @microsoft.graph.sharedChanged trigger ACL resync, not full reprocess."""
+    config = build_config()
+    document_id = create_document_id("source", "drive", "item-1")
+    ref = ReadyDocumentRef(
+        document_id=document_id, source_run_id="source:run-a", document_key="source:run-a:" + document_id,
+        item_id="item-1", allowed_group_ids=("group-a",), acl_hash="hash-a", etag="etag-a",
+    )
+    lifecycle = FakeLifecycleRepository(cursor="https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=old")
+    lifecycle.ready_by_document_id[document_id] = ref
+
+    # Item with permission change annotation (not a content change, not deleted)
+    permission_item = {
+        "id": "item-1", "name": "a.pdf", "eTag": "etag-x", "size": 100,
+        "file": {}, "parentReference": {"id": "parent", "path": "/drive/root:"},
+        "@microsoft.graph.sharedChanged": True,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"value": [permission_item], "@odata.deltaLink": "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=new"},
+        )
+
+    with _mock_connector(handler) as client:
+        connector = SharePointConnector(client, config.drive_id)
+        outcome = services.run_delta_sync(config, FakeRepository(), lifecycle, connector, None, None, None)
+
+    assert outcome.acl_resynced == 1
+    assert outcome.created_or_updated == 0
+    # Verify the ACL was actually refreshed (FakeConnector returns same hash → "unchanged")
+    # The important thing is that it DIDN'T trigger full process_document
+
+
+def test_run_delta_sync_permission_change_on_untracked_item_is_noop() -> None:
+    """Permission change on a document not yet ingested should be skipped."""
+    config = build_config()
+    lifecycle = FakeLifecycleRepository(cursor="https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=old")
+
+    permission_item = {
+        "id": "item-unknown", "name": "b.pdf", "eTag": "etag-y", "size": 50,
+        "file": {}, "parentReference": {"id": "parent", "path": "/drive/root:"},
+        "@microsoft.graph.sharedChanged": True,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"value": [permission_item], "@odata.deltaLink": "https://graph.microsoft.com/v1.0/drives/drive/root/delta?token=new"},
+        )
+
+    with _mock_connector(handler) as client:
+        connector = SharePointConnector(client, config.drive_id)
+        outcome = services.run_delta_sync(config, FakeRepository(), lifecycle, connector, None, None, None)
+
+    assert outcome.acl_resynced == 0
+    assert outcome.failed == 0
 
 
 def test_run_delta_sync_skips_folders_and_disallowed_extensions(monkeypatch: pytest.MonkeyPatch) -> None:

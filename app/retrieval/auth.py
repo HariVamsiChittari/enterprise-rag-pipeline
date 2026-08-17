@@ -86,12 +86,17 @@ def principal_from_easy_auth(
     encoded_principal: str | None,
     expected_tenant_id: str,
     group_resolver: GroupResolver | None = None,
+    *,
+    acl_enabled: bool = True,
 ) -> Principal:
     by_type = _claims_by_type(encoded_principal)
     user_id = _single_claim(by_type, "oid")
     tenant_id = _single_claim(by_type, "tid")
     if tenant_id != expected_tenant_id:
         raise AuthorizationError("unexpected_tenant")
+
+    if not acl_enabled:
+        return Principal(user_id, tenant_id, frozenset())
 
     if group_resolver is None:
         raise AuthorizationError("security_groups_unresolved")

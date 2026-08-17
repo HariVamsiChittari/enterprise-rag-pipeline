@@ -36,6 +36,7 @@ class RetrievalConfig:
     openai_api_version: str
     app_insights_connection_string: str | None
     include_citations: bool
+    acl_enabled: bool
 
 
 def load_retrieval_config() -> RetrievalConfig:
@@ -61,4 +62,5 @@ def load_retrieval_config() -> RetrievalConfig:
         openai_api_version=os.getenv("OPENAI_API_VERSION", "2024-10-21"),
         app_insights_connection_string=os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING", "").strip() or None,
         include_citations=os.getenv("INCLUDE_CITATIONS", "true").strip().lower() != "false",
+        acl_enabled=os.getenv("ACL_ENABLED", "true").strip().lower() not in ("false", "0", "no"),
     )

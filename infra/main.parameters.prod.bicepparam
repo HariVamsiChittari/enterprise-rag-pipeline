@@ -15,6 +15,7 @@ param sharePointCertificateSecretName = readEnvironmentVariable(
   'sharepoint-app-cert'
 )
 param adminApiClientId = readEnvironmentVariable('ADMIN_API_CLIENT_ID')
+param webhookClientState = readEnvironmentVariable('WEBHOOK_CLIENT_STATE')
 param graphServicePrincipalId = readEnvironmentVariable('GRAPH_SERVICE_PRINCIPAL_ID')
 param cosmosDbMode = 'provisioned'
 param deployAks = true

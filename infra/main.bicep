@@ -40,6 +40,10 @@ param sharePointCertificateSecretName string = 'sharepoint-app-cert'
 @description('Microsoft Entra application client ID protecting operator and query endpoints')
 param adminApiClientId string
 
+@secure()
+@description('Shared secret for Microsoft Graph webhook clientState validation')
+param webhookClientState string
+
 @description('Microsoft Graph service principal object ID (tenant-specific, from az ad sp show --id 00000003-0000-0000-c000-000000000000 --query id)')
 param graphServicePrincipalId string
 
@@ -250,6 +254,7 @@ module functions './modules/functions.bicep' = {
     sharePointDriveId: sharePointDriveId
     sharePointCertificateSecretName: sharePointCertificateSecretName
     adminApiClientId: adminApiClientId
+    webhookClientState: webhookClientState
     retrievalServiceUrl: deployAks ? '' : aca.outputs.internalUrl
     tags: tags
   }

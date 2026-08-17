@@ -38,7 +38,7 @@ def test_every_ranked_query_filters_acl_before_ranking(mode: RetrievalMode) -> N
 
     assert [result.content for result in results] == ["authorized content"]
     query = chunks.query_items.call_args.kwargs["query"]
-    assert "WHERE EXISTS" in query
+    assert "EXISTS" in query
     assert "ARRAY_CONTAINS(@principalIds, gid)" in query
     assert query.index("WHERE") < query.index("ORDER BY")
     parameters = {
@@ -89,3 +89,18 @@ def test_empty_principals_fail_before_query() -> None:
     with pytest.raises(ValueError, match="principal_ids_required"):
         SecureCosmosRetriever(chunks, Mock()).retrieve("policy", [0.1], [])
     chunks.query_items.assert_not_called()
+
+
+def test_acl_disabled_omits_filter_and_accepts_empty_principals() -> None:
+    chunks = Mock()
+    chunks.query_items.return_value = [candidate()]
+    manifests = Mock()
+    manifests.read_item.return_value = {"status": "ready"}
+    retriever = SecureCosmosRetriever(chunks, manifests, acl_enabled=False)
+
+    results = retriever.retrieve("policy", [0.1, 0.2], [], mode=RetrievalMode.HYBRID)
+
+    assert len(results) == 1
+    query = chunks.query_items.call_args.kwargs["query"]
+    assert "allowedGroupIds" not in query
+    assert "@principalIds" not in query

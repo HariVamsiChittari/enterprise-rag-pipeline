@@ -102,6 +102,13 @@ param aclResyncPageSize int = 50
 @description('Internal URL of the retrieval service for query proxy')
 param retrievalServiceUrl string = ''
 
+@secure()
+@description('Shared secret for Microsoft Graph webhook clientState validation')
+param webhookClientState string
+
+@description('NCRONTAB schedule for Graph subscription renewal')
+param subscriptionRenewSchedule string = '0 0 2 * * *'
+
 @description('Resource tags')
 param tags object = {}
 
@@ -309,6 +316,14 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
           value: retrievalServiceUrl
         }
         {
+          name: 'WEBHOOK_CLIENT_STATE'
+          value: webhookClientState
+        }
+        {
+          name: 'SUBSCRIPTION_RENEW_SCHEDULE'
+          value: subscriptionRenewSchedule
+        }
+        {
           name: 'INSTANCE_MEMORY_MB'
           value: string(instanceMemoryMB)
         }
@@ -338,6 +353,12 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
       scaleAndConcurrency: {
         maximumInstanceCount: maximumInstanceCount
         instanceMemoryMB: instanceMemoryMB
+        alwaysReady: [
+          {
+            name: 'http'
+            instanceCount: 1
+          }
+        ]
       }
     }
     httpsOnly: true
@@ -359,6 +380,9 @@ resource authSettings 'Microsoft.Web/sites/config@2025-03-01' = {
     globalValidation: {
       requireAuthentication: true
       unauthenticatedClientAction: 'Return401'
+      excludedPaths: [
+        '/api/webhook/*'
+      ]
     }
     identityProviders: {
       azureActiveDirectory: {

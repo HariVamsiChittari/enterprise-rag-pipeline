@@ -102,7 +102,7 @@ async def _lifespan(app: FastAPI):
         default_chunks_container=config.cosmos_chunks_container,
         default_manifests_container=config.cosmos_manifests_container,
     )
-    registry = build_cosmos_registry(instance_configs, credential)
+    registry = build_cosmos_registry(instance_configs, credential, acl_enabled=config.acl_enabled)
 
     cosmos = CosmosClient(url=config.cosmos_endpoint, credential=credential)
     db = cosmos.get_database_client(config.cosmos_database)
@@ -152,6 +152,7 @@ async def _lifespan(app: FastAPI):
         generation_timeout_seconds=config.generation_timeout_seconds,
         max_evidence=config.max_evidence_chunks,
         max_planned_queries=config.max_planned_queries,
+        acl_enabled=config.acl_enabled,
     )
     _state.group_resolver = GraphGroupResolver(
         httpx.Client(auth=_TokenRefreshAuth(credential), timeout=config.graph_group_timeout_seconds)
@@ -161,6 +162,7 @@ async def _lifespan(app: FastAPI):
         "retrieval_service_started",
         cosmos_endpoint=config.cosmos_endpoint,
         cosmos_instances=len(registry),
+        acl_enabled=config.acl_enabled,
     )
     yield
     _state.rag_service.close()
@@ -328,6 +330,7 @@ async def _run_agentic_path(
     """Run the Agent Framework agent. Returns None on timeout/error (caller falls back)."""
     try:
         async def _embed(text: str) -> list[float]:
+            start = time.perf_counter()
             resp = await asyncio.to_thread(
                 _state.openai_client.embeddings.create,
                 model=_state.config.embedding_deployment,
@@ -335,31 +338,55 @@ async def _run_agentic_path(
                 dimensions=3072,
                 encoding_format="float",
             )
+            embed_usage = getattr(resp, "usage", None)
+            agentic_usage.append({
+                "operation": "retrieval_embedding",
+                "model": _state.config.embedding_deployment,
+                "prompt_tokens": getattr(embed_usage, "prompt_tokens", 0) if embed_usage else 0,
+                "completion_tokens": 0,
+                "latency_ms": int((time.perf_counter() - start) * 1000),
+            })
             return list(resp.data[0].embedding)
 
         retrieved_chunks: list[RetrievedChunk] = []
+        agentic_usage: list[dict[str, Any]] = []
         search_tool = make_search_tool(
             registry=_state.registry,
             embed_fn=_embed,
             acl_ids=list(principal.acl_ids),
             retrieved_chunks=retrieved_chunks,
+            acl_enabled=_state.config.acl_enabled,
+            usage=agentic_usage,
         )
         agent = create_rag_agent(
             _state.agent_chat_client, search_tool, model=_state.config.chat_deployment,
         )
+        agent_start = time.perf_counter()
         response = await asyncio.wait_for(
             agent.run(question),
             timeout=_state.config.agent_timeout_seconds,
         )
+        agent_latency_ms = int((time.perf_counter() - agent_start) * 1000)
         answer_text = str(response)
         if not answer_text.strip():
             log.warning("agent_empty_response")
             return None
 
+        # Opportunistically capture agent LLM token usage
+        agent_usage = getattr(response, "usage", None)
+        if agent_usage:
+            agentic_usage.append({
+                "operation": "agent_generation",
+                "model": _state.config.chat_deployment,
+                "prompt_tokens": getattr(agent_usage, "prompt_tokens", 0),
+                "completion_tokens": getattr(agent_usage, "completion_tokens", 0),
+                "latency_ms": agent_latency_ms,
+            })
+
         return {
             "answer": answer_text.strip(),
             "citations": [asdict(c) for c in retrieved_chunks],
-            "usage": planning_usage,
+            "usage": planning_usage + agentic_usage,
         }
     except asyncio.TimeoutError:
         log.warning("agent_timeout", timeout=_state.config.agent_timeout_seconds)
@@ -398,6 +425,7 @@ def _resolve_principal(request: Request) -> Principal:
             encoded,
             expected_tenant_id=_state.config.tenant_id,
             group_resolver=_state.group_resolver,
+            acl_enabled=_state.config.acl_enabled,
         )
     except AuthorizationError as e:
         raise HTTPException(status_code=401, detail=str(e))
