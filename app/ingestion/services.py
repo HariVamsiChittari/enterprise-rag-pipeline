@@ -406,12 +406,14 @@ def run_delta_sync(
             ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
             if ref is not None:
                 try:
+                    old_groups = list(ref.allowed_group_ids)
                     result = resync_document_acl(config, ref, lifecycle_repository, connector)
                     acl_resynced += 1
                     if audit_container is not None:
                         write_audit_record(audit_container, config.source_id, run_id, {
                             "operation": "acl_resynced", "documentId": document_id,
                             "result": result, "method": "delta_sync",
+                            "previousGroupIds": old_groups,
                         })
                 except Exception:
                     logger.error("delta_sync acl_resync failed for item %s", item_id, exc_info=True)

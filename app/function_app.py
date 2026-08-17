@@ -302,6 +302,7 @@ async def webhook_sharepoint(req: func.HttpRequest, client) -> func.HttpResponse
 
     await client.start_new("delta_sync_orchestrator", instance_id=instance_id)
     logger.info("webhook_sharepoint: started delta_sync_orchestrator")
+    _write_webhook_audit(source_id, "webhook_received", {"action": "delta_sync_triggered"})
     return func.HttpResponse(status_code=200)
 
 
@@ -689,6 +690,18 @@ def _build_lifecycle_repository(config):
         db.get_container_client(config.cosmos_source_documents_container),
         db.get_container_client(config.cosmos_search_chunks_container),
     )
+
+
+def _write_webhook_audit(source_id: str, operation: str, extra: dict) -> None:
+    """Best-effort audit record for webhook events."""
+    try:
+        from config import load_config
+        config = load_config()
+        container = _build_audit_container(config)
+        from ingestion.telemetry import write_audit_record
+        write_audit_record(container, source_id, "webhook", {"operation": operation, **extra})
+    except Exception:
+        logger.warning("webhook_audit_write_failed", exc_info=True)
 
 
 def _build_graph_client(config):

@@ -236,6 +236,7 @@ resource serviceAuditContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabas
         kind: 'Hash'
         version: 2
       }
+      defaultTtl: 7776000 // 90 days in seconds
       indexingPolicy: {
         indexingMode: 'consistent'
         automatic: true
