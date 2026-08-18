@@ -19,9 +19,6 @@ param languageServiceId string
 @description('Application Insights resource ID')
 param applicationInsightsId string
 
-@description('Skip Cosmos SQL role assignment if it already exists')
-param cosmosRoleAssignmentExists bool = false
-
 resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' existing = {
   name: split(cosmosAccountId, '/')[8]
 }
@@ -56,7 +53,7 @@ var roles = {
   MonitoringMetricsPublisher: '3913510d-42f4-4e42-8a64-420c390055eb'
 }
 
-resource cosmosDataContributor 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = if (!cosmosRoleAssignmentExists) {
+resource cosmosDataContributor 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = {
   parent: cosmosAccount
   name: guid(cosmosAccountId, principalId, 'CosmosDBDataContributor')
   properties: {

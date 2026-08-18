@@ -66,12 +66,6 @@ param storageRedundancy string = 'ZRS'
 @description('Use Document Intelligence F0 for development')
 param useDocumentIntelligenceFreeTier bool = false
 
-@description('Skip Cosmos SQL role assignment if it already exists (avoids 409 on redeploy)')
-param cosmosRoleAssignmentExists bool = false
-
-@description('Skip OpenAI role assignment if it already exists (avoids 409 on redeploy)')
-param openAiRoleAssignmentExists bool = false
-
 @description('Use Azure AI Language F0 for development')
 param useLanguageFreeTier bool = false
 
@@ -270,7 +264,6 @@ module rbac './modules/rbac.bicep' = {
     documentIntelligenceId: documentIntelligence.outputs.documentIntelligenceId
     languageServiceId: documentIntelligence.outputs.languageServiceId
     applicationInsightsId: monitoring.outputs.applicationInsightsId
-    cosmosRoleAssignmentExists: cosmosRoleAssignmentExists
   }
 }
 
@@ -280,7 +273,6 @@ module openAiRbac './modules/openai-rbac.bicep' = {
   params: {
     principalId: identity.outputs.identityPrincipalId
     openAiAccountName: openAiAccountName
-    roleAssignmentExists: openAiRoleAssignmentExists
   }
 }
 
