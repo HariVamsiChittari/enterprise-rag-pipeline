@@ -265,6 +265,7 @@ def chunk_values() -> dict[str, object]:
         "content": content,
         "content_hash": content_sha256(content),
         "embedding_text": embedding_text,
+        "searchable_text": embedding_text,
         "token_count": 3,
         "enrichment_status": EnrichmentStatuses(
             ModuleStatus.SUCCEEDED,

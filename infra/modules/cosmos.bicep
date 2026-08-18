@@ -186,6 +186,7 @@ resource searchChunksContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabas
         #disable-next-line BCP037
         fullTextIndexes: [
           { path: '/content' }
+          { path: '/searchableText' }
         ]
         vectorIndexes: [
           {
@@ -199,6 +200,10 @@ resource searchChunksContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabas
         fullTextPaths: [
           {
             path: '/content'
+            language: 'en-US'
+          }
+          {
+            path: '/searchableText'
             language: 'en-US'
           }
         ]

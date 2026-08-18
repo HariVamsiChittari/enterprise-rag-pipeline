@@ -36,10 +36,10 @@ _ACL_FILTER = (
 _ORDER_BY = {
     RetrievalMode.HYBRID: (
         "ORDER BY RANK RRF(VectorDistance(c.embedding, @embedding), "
-        "FullTextScore(c.content, @searchText))"
+        "FullTextScore(c.searchableText, @searchText))"
     ),
     RetrievalMode.VECTOR: "ORDER BY VectorDistance(c.embedding, @embedding)",
-    RetrievalMode.FULL_TEXT: "ORDER BY RANK FullTextScore(c.content, @searchText)",
+    RetrievalMode.FULL_TEXT: "ORDER BY RANK FullTextScore(c.searchableText, @searchText)",
 }
 
 

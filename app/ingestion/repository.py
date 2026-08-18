@@ -1084,6 +1084,9 @@ def _chunk_from_item(item: Mapping[str, Any]) -> SearchChunkRecord:
     values["key_phrases"] = tuple(values["key_phrases"])
     values["entities"] = tuple(Entity(**_snake_keys(entity)) for entity in values["entities"])
     values["embedding"] = tuple(values["embedding"])
+    # Backward compat: old chunks may not have searchable_text
+    if "searchable_text" not in values:
+        values["searchable_text"] = values.get("content", "")
     for _removed in (
         "source_path", "drive_id", "item_id", "embedding_input_hash",
         "chunking_strategy", "chunking_profile_version", "tokenizer",

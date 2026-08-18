@@ -1152,6 +1152,7 @@ def build_chunks(count: int, *, document: SourceDocumentRecord | None = None) ->
                 content=content,
                 content_hash=content_sha256(content),
                 embedding_text=content,
+                searchable_text=content,
                 token_count=3,
                 enrichment_status=EnrichmentStatuses(
                     ModuleStatus.SUCCEEDED,

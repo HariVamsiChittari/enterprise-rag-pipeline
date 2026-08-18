@@ -214,8 +214,14 @@ def process_document(
         else:
             enrichments = enrich_chunks(None, [chunk.content for chunk in chunks])
 
+        # Build searchable text (content + enrichments) for embedding and full-text search
+        searchable_texts = [
+            _build_searchable_text(chunk.content, enrichments[i]["key_phrases"], enrichments[i]["summary"])
+            for i, chunk in enumerate(chunks)
+        ]
+
         embeddings = embed_texts(
-            openai_client, cleaned_texts,
+            openai_client, searchable_texts,
             audit_container=audit_container,
             source_id=config.source_id,
             run_id=current_doc.source_run_id,
@@ -223,7 +229,7 @@ def process_document(
         )
 
         now = _fmt(_utc_now())
-        chunk_records = _build_chunk_records(current_doc, acl, chunks, cleaned_texts, enrichments, embeddings, now)
+        chunk_records = _build_chunk_records(current_doc, acl, chunks, searchable_texts, enrichments, embeddings, now)
 
         current_doc = replace(current_doc, stage=DocumentStage.PERSISTING, page_count=len(pages), expected_chunk_count=len(chunk_records), content_hash=content_sha256("\n".join(p.text for p in pages)), extraction_mode="prebuilt-layout", updated_at=_fmt(_utc_now()))
         updated = repository.update_processing_document(current_doc, current_etag)
@@ -581,6 +587,16 @@ def _clean_text(text: str) -> str:
     return cleaned.strip()
 
 
+def _build_searchable_text(content: str, key_phrases: tuple[str, ...], summary: str | None) -> str:
+    """Concatenate content with enrichment data for embedding and full-text search."""
+    parts = [content]
+    if key_phrases:
+        parts.append("Key terms: " + ", ".join(key_phrases))
+    if summary:
+        parts.append("Summary: " + summary)
+    return "\n\n".join(parts)
+
+
 def _pdf_to_document(pdf: Any, config: IngestionConfig, run_id: str, ingestion_mode: str = "full-sync") -> SourceDocumentRecord:
     document_id = create_document_id(config.source_id, config.drive_id, pdf.item_id)
     now = _fmt(_utc_now())
@@ -610,6 +626,7 @@ def _build_chunk_records(
     records: list[SearchChunkRecord] = []
     for i, chunk in enumerate(chunks):
         enrichment = enrichments[i]
+        searchable = _build_searchable_text(chunk.content, enrichment["key_phrases"], enrichment["summary"])
         records.append(SearchChunkRecord(
             source_id=document.source_id, run_id=document.run_id,
             document_id=document.document_id, document_key=document.document_key,
@@ -620,7 +637,8 @@ def _build_chunk_records(
             section_path=_section_path(chunk.content), chunk_index=chunk.ordinal,
             created_at=now, content=chunk.content,
             content_hash=content_sha256(chunk.content),
-            embedding_text=cleaned_texts[i],
+            embedding_text=searchable,
+            searchable_text=searchable,
             token_count=token_count(chunk.content),
             enrichment_status=enrichment["status"],
             summary=enrichment["summary"],

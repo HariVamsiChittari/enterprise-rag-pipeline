@@ -385,6 +385,7 @@ class SearchChunkRecord:
     content: str
     content_hash: str
     embedding_text: str
+    searchable_text: str
     token_count: int
     enrichment_status: EnrichmentStatuses
     summary: str | None
