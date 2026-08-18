@@ -192,7 +192,6 @@ def process_document(
             raise TerminalDocumentError("extraction_disabled_no_alternative")
 
         chunks = chunk_pages(pages)
-        cleaned_texts = [_clean_text(chunk.content) for chunk in chunks]
 
         if config.enrichment_enabled and language_client is not None:
             enrichment_start = time.perf_counter()
@@ -580,13 +579,6 @@ def _fail_document(doc: SourceDocumentRecord, etag: str, error: BaseException, r
         logger.warning("Failed to mark document as failed", exc_info=True)
 
 
-def _clean_text(text: str) -> str:
-    cleaned = text.replace("\r\n", "\n")
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
-
-
 def _build_searchable_text(content: str, key_phrases: tuple[str, ...], summary: str | None) -> str:
     """Concatenate content with enrichment data for embedding and full-text search."""
     parts = [content]
@@ -620,7 +612,7 @@ def _pdf_to_document(pdf: Any, config: IngestionConfig, run_id: str, ingestion_m
 
 def _build_chunk_records(
     document: SourceDocumentRecord, acl: Any, chunks: list[Chunk],
-    cleaned_texts: list[str], enrichments: list[dict], embeddings: list[tuple[float, ...]],
+    searchable_texts: list[str], enrichments: list[dict], embeddings: list[tuple[float, ...]],
     now: str,
 ) -> tuple[SearchChunkRecord, ...]:
     records: list[SearchChunkRecord] = []
