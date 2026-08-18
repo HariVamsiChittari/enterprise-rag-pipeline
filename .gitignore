@@ -43,6 +43,7 @@ Thumbs.db
 # Secrets
 *.pfx
 *.pem
+*.cer
 *.key
 *.crt
 certs/
