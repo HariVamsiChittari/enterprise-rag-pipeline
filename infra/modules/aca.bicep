@@ -19,6 +19,9 @@ param managedIdentityClientId string
 @description('VNet integration subnet resource ID')
 param infrastructureSubnetId string
 
+@description('Virtual network resource ID (for private DNS zone link)')
+param virtualNetworkId string
+
 @description('Log Analytics workspace resource ID')
 param logAnalyticsWorkspaceId string
 
@@ -64,6 +67,41 @@ resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
       }
     }
     zoneRedundant: false
+  }
+}
+
+// Private DNS zone for internal ACA environment — required for VNet-integrated consumers to resolve the FQDN
+resource acaDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
+  name: environment.properties.defaultDomain
+  location: 'global'
+  tags: tags
+}
+
+resource acaDnsWildcard 'Microsoft.Network/privateDnsZones/A@2024-06-01' = {
+  parent: acaDnsZone
+  name: '*'
+  properties: {
+    ttl: 300
+    aRecords: [{ ipv4Address: environment.properties.staticIp }]
+  }
+}
+
+resource acaDnsApex 'Microsoft.Network/privateDnsZones/A@2024-06-01' = {
+  parent: acaDnsZone
+  name: '@'
+  properties: {
+    ttl: 300
+    aRecords: [{ ipv4Address: environment.properties.staticIp }]
+  }
+}
+
+resource acaDnsVnetLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
+  parent: acaDnsZone
+  name: 'aca-vnet-link'
+  location: 'global'
+  properties: {
+    virtualNetwork: { id: virtualNetworkId }
+    registrationEnabled: false
   }
 }
 
