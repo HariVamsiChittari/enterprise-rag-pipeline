@@ -150,41 +150,52 @@ az ad app credential reset --id $app.appId --cert @sharepoint-graph-cert.cer --a
 
 ### 1.6 Upload Certificate to Key Vault
 
-After infrastructure is deployed (Step 2.2), upload the certificate:
+After infrastructure is deployed (Step 2.2), the Key Vault has a private endpoint and an Azure Policy forcing `publicNetworkAccess: Disabled`. To upload the cert, you must temporarily bypass this.
+
+**Important:** The PFX must be exported WITHOUT a password — `CertificateCredential` cannot deserialize password-protected PFX.
 
 ```powershell
-$kvName = "<your-keyvault-name>"  # Created by Bicep deployment
+$kvName = "<your-keyvault-name>"  # From Bicep deployment output
 
-# Temporarily enable access (KV is behind VNet)
+# Step 1: Delete the private endpoint (PE locks out public access permanently)
+az network private-endpoint delete `
+  --name "rag-dev-vnet-key-vault-pe" `
+  --resource-group rg-rag-project
+
+# Step 2: Add policy bypass tag + enable public access
+$kvId = "/subscriptions/<sub-id>/resourceGroups/rg-rag-project/providers/Microsoft.KeyVault/vaults/$kvName"
+az resource tag --ids $kvId --tags SecurityControl=Ignore --is-incremental
+Start-Sleep 15  # Wait for policy re-evaluation
 az keyvault update --name $kvName --resource-group rg-rag-project `
-  --public-network-access Enabled
-$myIp = (Invoke-RestMethod -Uri "https://api.ipify.org")
-az keyvault network-rule add --name $kvName `
-  --resource-group rg-rag-project --ip-address "$myIp/32"
+  --public-network-access Enabled --default-action Allow
+Start-Sleep 10
 
-# Grant yourself secret write access
+# Step 3: Grant yourself write access
 $userId = (az ad signed-in-user show --query id -o tsv)
-$kvScope = "/subscriptions/<sub-id>/resourceGroups/rg-rag-project/providers/Microsoft.KeyVault/vaults/$kvName"
 az role assignment create --role "Key Vault Secrets Officer" `
-  --assignee $userId --scope $kvScope
-Start-Sleep 30  # Wait for RBAC propagation
+  --assignee $userId --scope $kvId
+Start-Sleep 20  # Wait for RBAC propagation
 
-# Upload PFX as base64 secret (no password)
+# Step 4: Export passwordless PFX and upload
 $pfxBytes = $cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pfx)
 $base64 = [System.Convert]::ToBase64String($pfxBytes)
 az keyvault secret set --vault-name $kvName `
-  --name "sharepoint-app-cert" --value $base64
+  --name "sharepoint-app-cert" --value $base64 `
+  --content-type "application/x-pkcs12"
 
-# Restore firewall
-az keyvault network-rule remove --name $kvName `
-  --resource-group rg-rag-project --ip-address "$myIp/32"
+# Step 5: Re-lock (remove tag + disable access)
+az resource tag --ids $kvId `
+  --tags Environment=dev Project=RAG-SharePoint CostCenter=Engineering ManagedBy=azd
 az keyvault update --name $kvName --resource-group rg-rag-project `
-  --public-network-access Disabled
+  --public-network-access Disabled --default-action Deny
 
-# Clean up local files
-Remove-Item ./sharepoint-graph-cert.cer
-Remove-Item "Cert:\CurrentUser\My\$($cert.Thumbprint)"
+# Step 6: Redeploy Bicep to re-create the private endpoint
+az deployment group create --resource-group rg-rag-project `
+  --template-file infra/main.bicep `
+  --parameters infra/main.parameters.dev.bicepparam
 ```
+
+> **Why this works:** The subscription has an Azure Policy that forces KV `publicNetworkAccess: Disabled`. The `SecurityControl=Ignore` tag is the documented bypass mechanism. After upload, the tag is removed and Bicep restores the private endpoint permanently.
 
 ### 1.7 Create Admin API App Registration (Easy Auth)
 
@@ -368,13 +379,17 @@ Requires `local.settings.json` with valid Azure endpoints (uses real cloud servi
 
 | Error | Cause | Fix |
 |---|---|---|
+| `FlagMustBeSetForRestore` on Cognitive Services | Soft-deleted resource from previous deployment | `az cognitiveservices account list-deleted -o table` then `az cognitiveservices account purge --name <name> --resource-group <rg> --location eastus2` |
 | `403 Forbidden: readMetadata` on Cosmos | RBAC role assignment missing or not propagated | Re-deploy Bicep (RBAC is always-create now) or wait 5 min |
+| `Failed to deserialize certificate in PEM or PKCS12 format` | PFX was exported with a password | Re-export using `.Export([X509ContentType]::Pfx)` (no password) and re-upload |
 | `ResourceNotFoundError` for Key Vault secret | Certificate not uploaded to Key Vault | Follow Step 1.6 |
+| `ForbiddenByConnection` on Key Vault | Private endpoint exists — blocks CLI/REST access | Must delete PE, add SecurityControl=Ignore tag, then enable access (Step 1.6) |
 | `400 Bad Request` on Graph drive API | Drive ID has `\!` instead of `!` | Fix in `.env` file: remove the backslash |
 | `401 Unauthorized` on ingestion endpoints | Token expired or wrong audience | Re-run `az account get-access-token --resource "api://<CLIENT_ID>"` |
 | `429 Too Many Requests` from Graph | Rate limited during ingestion | Wait and retry; reduce `WAVE_SIZE` |
 | Webhook returns `403` | Wrong `WEBHOOK_CLIENT_STATE` in request vs app setting | Verify the secret matches in both places |
-| Key Vault `ForbiddenByFirewall` | Public access disabled + IP not allowed | Temporarily add your IP (Step 1.6) |
+| `404 Azure Container App - Unavailable` | ACA ingress set to `external: false` or DNS missing | Ensure `external: true` in aca.bicep and aca-dns.bicep creates the private DNS zone |
+| ACR build `UnicodeEncodeError` on Windows | Azure CLI colorama encoding bug | Use `--no-logs` flag: `az acr build --no-logs` |
 
 ---
 

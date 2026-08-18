@@ -1,3 +1,6 @@
+## Generated from infra/modules/retrieval-config.bicep output.
+## Run: scripts/generate-k8s-configmap.ps1 to regenerate from deployment outputs.
+## Do NOT edit individual values here — update retrieval-config.bicep instead.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,17 +16,15 @@ data:
   CHAT_DEPLOYMENT: "PLACEHOLDER"
   TENANT_ID: "PLACEHOLDER"
   MANAGED_IDENTITY_CLIENT_ID: "PLACEHOLDER"
-  RETRIEVAL_TIMEOUT_SECONDS: "5.0"
-  GENERATION_TIMEOUT_SECONDS: "3.0"
-  AGENT_TIMEOUT_SECONDS: "8.0"
-  AGENT_MAX_ITERATIONS: "5"
-  AGENT_OPENAI_API_VERSION: "2025-04-01-preview"
+  ACL_ENABLED: "true"
+  INCLUDE_CITATIONS: "true"
   MAX_EVIDENCE_CHUNKS: "5"
   MAX_PLANNED_QUERIES: "3"
+  RETRIEVAL_TIMEOUT_SECONDS: "5.0"
+  GENERATION_TIMEOUT_SECONDS: "15.0"
+  AGENT_TIMEOUT_SECONDS: "20.0"
+  AGENT_MAX_ITERATIONS: "5"
+  AGENT_OPENAI_API_VERSION: "2025-04-01-preview"
   GRAPH_GROUP_TIMEOUT_SECONDS: "10.0"
   OPENAI_API_VERSION: "2024-10-21"
-  INCLUDE_CITATIONS: "true"
-  ACL_ENABLED: "true"
-  # Optional: GenAI OpenTelemetry tracing to Application Insights (see monitoring.bicep
-  # outputs.connectionString). Leave empty to skip tracing entirely (default).
   APPLICATIONINSIGHTS_CONNECTION_STRING: ""

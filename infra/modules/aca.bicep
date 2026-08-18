@@ -13,39 +13,14 @@ param imageName string = 'mcr.microsoft.com/k8se/quickstart:latest'
 @description('User-assigned managed identity resource ID for the container app')
 param managedIdentityId string
 
-@description('User-assigned managed identity client ID')
-param managedIdentityClientId string
-
 @description('VNet integration subnet resource ID')
 param infrastructureSubnetId string
-
-@description('Virtual network resource ID (for private DNS zone link)')
-param virtualNetworkId string
 
 @description('Log Analytics workspace resource ID')
 param logAnalyticsWorkspaceId string
 
-@description('Cosmos DB endpoint')
-param cosmosEndpoint string
-
-@description('Cosmos DB database name')
-param cosmosDatabaseName string
-
-@description('Azure OpenAI endpoint')
-param openAiEndpoint string
-
-@description('Chat deployment name')
-param chatDeploymentName string
-
-@description('Embedding deployment name')
-param embeddingDeploymentName string
-
-@description('Entra tenant ID')
-param tenantId string
-
-@description('Application Insights connection string')
-@secure()
-param appInsightsConnectionString string = ''
+@description('Retrieval service env vars (from retrieval-config module)')
+param retrievalEnvVars array
 
 @description('Resource tags')
 param tags object = {}
@@ -70,41 +45,6 @@ resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   }
 }
 
-// Private DNS zone for internal ACA environment — required for VNet-integrated consumers to resolve the FQDN
-resource acaDnsZone 'Microsoft.Network/privateDnsZones@2024-06-01' = {
-  name: environment.properties.defaultDomain
-  location: 'global'
-  tags: tags
-}
-
-resource acaDnsWildcard 'Microsoft.Network/privateDnsZones/A@2024-06-01' = {
-  parent: acaDnsZone
-  name: '*'
-  properties: {
-    ttl: 300
-    aRecords: [{ ipv4Address: environment.properties.staticIp }]
-  }
-}
-
-resource acaDnsApex 'Microsoft.Network/privateDnsZones/A@2024-06-01' = {
-  parent: acaDnsZone
-  name: '@'
-  properties: {
-    ttl: 300
-    aRecords: [{ ipv4Address: environment.properties.staticIp }]
-  }
-}
-
-resource acaDnsVnetLink 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = {
-  parent: acaDnsZone
-  name: 'aca-vnet-link'
-  location: 'global'
-  properties: {
-    virtualNetwork: { id: virtualNetworkId }
-    registrationEnabled: false
-  }
-}
-
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: containerAppName
   location: location
@@ -119,9 +59,9 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
     managedEnvironmentId: environment.id
     configuration: {
       ingress: {
-        external: false
+        external: true
         targetPort: 8080
-        transport: 'http'
+        transport: 'auto'
       }
       registries: [
         {
@@ -140,18 +80,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.5')
             memory: '1Gi'
           }
-          env: [
-            { name: 'COSMOS_ENDPOINT', value: cosmosEndpoint }
-            { name: 'COSMOS_DATABASE', value: cosmosDatabaseName }
-            { name: 'AZURE_OPENAI_ENDPOINT', value: openAiEndpoint }
-            { name: 'CHAT_DEPLOYMENT', value: chatDeploymentName }
-            { name: 'EMBEDDING_DEPLOYMENT', value: embeddingDeploymentName }
-            { name: 'TENANT_ID', value: tenantId }
-            { name: 'MANAGED_IDENTITY_CLIENT_ID', value: managedIdentityClientId }
-            { name: 'INCLUDE_CITATIONS', value: 'true' }
-            { name: 'MAX_EVIDENCE_CHUNKS', value: '5' }
-            { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsightsConnectionString }
-          ]
+          env: retrievalEnvVars
           probes: [
             {
               type: 'Liveness'
@@ -181,3 +110,9 @@ output fqdn string = containerApp.properties.configuration.ingress.fqdn
 
 @description('Container App internal URL')
 output internalUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
+
+@description('ACA environment default domain (for private DNS zone)')
+output environmentDefaultDomain string = environment.properties.defaultDomain
+
+@description('ACA environment static IP (for private DNS A records)')
+output environmentStaticIp string = environment.properties.staticIp

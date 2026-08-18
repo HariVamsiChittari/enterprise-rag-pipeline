@@ -75,6 +75,9 @@ param deployAks bool = false
 @description('Application Insights daily cap in GB; -1 means unlimited')
 param applicationInsightsDailyCapGb int = -1
 
+@description('Enable ACL filtering in the retrieval service')
+param aclEnabled bool = true
+
 @description('Resource tags')
 param tags object = {
   Environment: environmentName
@@ -111,8 +114,9 @@ module storage './modules/storage.bicep' = {
 module keyVault './modules/keyvault.bicep' = {
   name: 'key-vault'
   params: {
-    keyVaultName: take('${prefix}-kv-${suffix}', 24)
+    keyVaultName: take('${prefix}-kv2-${suffix}', 24)
     location: location
+    enablePurgeProtection: false
     tags: tags
   }
 }
@@ -276,6 +280,14 @@ module openAiRbac './modules/openai-rbac.bicep' = {
   }
 }
 
+module graphRbac './modules/graph-rbac.bicep' = {
+  name: 'graph-rbac'
+  params: {
+    principalId: identity.outputs.identityPrincipalId
+    graphServicePrincipalId: graphServicePrincipalId
+  }
+}
+
 // --- AKS Retrieval Agent (prod only) ---
 
 module aks './modules/aks.bicep' = if (deployAks) {
@@ -318,6 +330,21 @@ module aksIdentity './modules/aks-identity.bicep' = if (deployAks) {
 
 // --- ACA Retrieval Agent (dev, when AKS not deployed) ---
 
+module retrievalConfig './modules/retrieval-config.bicep' = {
+  name: 'retrieval-config'
+  params: {
+    cosmosEndpoint: cosmos.outputs.endpoint
+    cosmosDatabaseName: cosmos.outputs.databaseName
+    openAiEndpoint: openAiEndpoint
+    chatDeploymentName: chatDeploymentName
+    embeddingDeploymentName: embeddingDeploymentName
+    tenantId: sharePointTenantId
+    managedIdentityClientId: deployAks ? aksIdentity.outputs.identityClientId : identity.outputs.identityClientId
+    aclEnabled: aclEnabled
+    appInsightsConnectionString: monitoring.outputs.connectionString
+  }
+}
+
 module aca './modules/aca.bicep' = if (!deployAks) {
   name: 'aca'
   params: {
@@ -325,17 +352,19 @@ module aca './modules/aca.bicep' = if (!deployAks) {
     location: location
     acrLoginServer: acr.outputs.loginServer
     managedIdentityId: identity.outputs.identityId
-    managedIdentityClientId: identity.outputs.identityClientId
     infrastructureSubnetId: networking.outputs.acaSubnetId
-    virtualNetworkId: networking.outputs.virtualNetworkId
     logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsId
-    cosmosEndpoint: cosmos.outputs.endpoint
-    cosmosDatabaseName: cosmos.outputs.databaseName
-    openAiEndpoint: openAiEndpoint
-    chatDeploymentName: chatDeploymentName
-    embeddingDeploymentName: embeddingDeploymentName
-    tenantId: sharePointTenantId
-    appInsightsConnectionString: monitoring.outputs.connectionString
+    retrievalEnvVars: retrievalConfig.outputs.envVars
+    tags: tags
+  }
+}
+
+module acaDns './modules/aca-dns.bicep' = if (!deployAks) {
+  name: 'aca-dns'
+  params: {
+    domainName: aca.outputs.environmentDefaultDomain
+    staticIp: aca.outputs.environmentStaticIp
+    virtualNetworkId: networking.outputs.virtualNetworkId
     tags: tags
   }
 }
@@ -352,3 +381,4 @@ output acrLoginServer string = acr.outputs.loginServer
 output aksClusterName string = deployAks ? aks.outputs.clusterName : ''
 output aksRetrievalIdentityClientId string = deployAks ? aksIdentity.outputs.identityClientId : ''
 output retrievalServiceUrl string = deployAks ? '' : aca.outputs.internalUrl
+output retrievalConfigMap object = retrievalConfig.outputs.configMap

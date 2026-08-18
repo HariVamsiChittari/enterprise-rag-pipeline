@@ -15,8 +15,6 @@ COPY retrieval/ retrieval/
 USER agent
 EXPOSE 8080
 
-CMD ["python", "-m", "uvicorn", "retrieval.main:app", "--host", "0.0.0.0", "--port", "8080"]
-
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/health/live')" || exit 1
 

@@ -94,13 +94,17 @@ def test_cosmos_search_policy_and_throughput_ownership() -> None:
     }
     assert search_resource["fullTextPolicy"] == {
         "defaultLanguage": "en-US",
-        "fullTextPaths": [{"path": "/content", "language": "en-US"}],
+        "fullTextPaths": [
+            {"path": "/content", "language": "en-US"},
+            {"path": "/searchableText", "language": "en-US"},
+        ],
     }
     assert search_resource["indexingPolicy"]["vectorIndexes"] == [
         {"path": "/embedding", "type": "diskANN"}
     ]
     assert search_resource["indexingPolicy"]["fullTextIndexes"] == [
-        {"path": "/content"}
+        {"path": "/content"},
+        {"path": "/searchableText"},
     ]
     assert containers_by_id["source-documents"]["properties"]["resource"][
         "indexingPolicy"

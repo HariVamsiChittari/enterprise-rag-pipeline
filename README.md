@@ -23,7 +23,7 @@ Orchestrator: activate → discover → [fan-out in waves] → finalize
 Per-document: ACL verify → Download → Extract (DI) → Chunk → Enrich → Embed → Persist
 ```
 
-**Incremental sync:** Delta-sync timer (every 15 min) processes only changed files via Graph delta query. ACL resync timer (daily) re-verifies permissions on all ready documents.
+**Incremental sync:** Microsoft Graph webhooks push change notifications in real-time. A daily reconciliation timer (04:00 UTC) runs delta queries as a safety net. Weekly ACL resync (Sunday 03:00 UTC) re-verifies permissions on all indexed documents.
 
 **Retrieval:** `POST /api/query` → query planning → embed → ACL-filtered Cosmos search → LLM answer generation with `[S#]` citations.
 
@@ -61,8 +61,10 @@ All settings are environment variables:
 | `DOWNLOAD_TIMEOUT_SECONDS` | No | `120` | HTTP timeout for file download |
 | `ACL_MAX_PAGES` | No | `10` | Max Graph paging calls for ACL check |
 | `DELTA_MAX_PAGES` | No | `200` | Max Graph delta pages per sync tick |
-| `DELTA_SYNC_SCHEDULE` | No | `0 */15 * * * *` | Delta-sync timer (NCRONTAB) |
-| `ACL_RESYNC_SCHEDULE` | No | `0 0 3 * * *` | ACL-resync timer (daily 03:00 UTC) |
+| `DELTA_SYNC_SCHEDULE` | No | `0 0 4 * * *` | Daily reconciliation safety-net (NCRONTAB) |
+| `ACL_RESYNC_SCHEDULE` | No | `0 0 3 * * 0` | ACL-resync timer (weekly Sunday 03:00 UTC) |
+| `WEBHOOK_CLIENT_STATE` | Yes | — | Shared secret for Graph webhook clientState validation |
+| `SUBSCRIPTION_RENEW_SCHEDULE` | No | `0 0 2 * * *` | Graph webhook subscription renewal (daily 02:00 UTC) |
 
 ### Retrieval Service (ACA / AKS)
 
@@ -72,9 +74,9 @@ All settings are environment variables:
 | `MAX_EVIDENCE_CHUNKS` | No | `5` | Default top-K chunks retrieved when `top_k` not in request |
 | `INCLUDE_CITATIONS` | No | `true` | When `false`, response returns empty citations array |
 | `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Cosmos retrieval timeout per query |
-| `GENERATION_TIMEOUT_SECONDS` | No | `3.0` | Answer generation LLM call timeout |
+| `GENERATION_TIMEOUT_SECONDS` | No | `15.0` | Answer generation LLM call timeout |
 | `AGENT_TIMEOUT_SECONDS` | No | `8.0` | Agentic path timeout before fallback |
-| `QUERY_PROXY_TIMEOUT_SECONDS` | No | `30.0` | Function App → retrieval service proxy timeout |
+| `QUERY_PROXY_TIMEOUT_SECONDS` | No | `60` | Function App → retrieval service proxy timeout |
 
 ## Endpoints
 
@@ -86,6 +88,8 @@ All settings are environment variables:
 | `/api/ingestion/retry-failed` | POST | Retry only the failed docs from the current full-sync run |
 | `/api/ingestion/inspect` | GET | Read Cosmos data (container, runId, limit) |
 | `/api/query` | POST | Proxy RAG queries to the retrieval service |
+| `/api/webhook/sharepoint` | POST | Microsoft Graph change notifications (no auth required) |
+| `/api/webhook/lifecycle` | POST | Graph subscription lifecycle events |
 
 Retrieval is served by the hybrid RAG service on ACA / AKS (Function App proxies `/api/query` via `RETRIEVAL_SERVICE_URL`).
 

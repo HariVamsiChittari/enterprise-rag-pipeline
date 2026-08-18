@@ -309,7 +309,7 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         }
         {
           name: 'QUERY_PROXY_TIMEOUT_SECONDS'
-          value: '30'
+          value: '60'
         }
         {
           name: 'RETRIEVAL_SERVICE_URL'
