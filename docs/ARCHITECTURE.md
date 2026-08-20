@@ -443,7 +443,7 @@ All services classify errors into two categories that drive retry behavior:
 | SharePoint Site URL | `SHAREPOINT_SITE_URL` | (none) | Site URL for SharePoint REST API site group resolution |
 | Max Evidence Chunks | `MAX_EVIDENCE_CHUNKS` | `5` | Default top-K chunks retrieved per query (caller can override via `top_k` 1–20) |
 | Retrieval Timeout | `RETRIEVAL_TIMEOUT_SECONDS` | `5.0` | Per-query Cosmos retrieval timeout |
-| Generation Timeout | `GENERATION_TIMEOUT_SECONDS` | `3.0` | Answer generation LLM call timeout |
+| Generation Timeout | `GENERATION_TIMEOUT_SECONDS` | `15.0` | Answer generation LLM call timeout |
 | Agent Timeout | `AGENT_TIMEOUT_SECONDS` | `8.0` | Agentic path timeout before fallback |
 
 ## Scale Limits (hardcoded in `ScaleLimits`)

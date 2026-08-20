@@ -52,7 +52,7 @@ def load_retrieval_config() -> RetrievalConfig:
         tenant_id=_required("TENANT_ID"),
         managed_identity_client_id=_required("MANAGED_IDENTITY_CLIENT_ID"),
         retrieval_timeout_seconds=float(os.getenv("RETRIEVAL_TIMEOUT_SECONDS", "5.0")),
-        generation_timeout_seconds=float(os.getenv("GENERATION_TIMEOUT_SECONDS", "3.0")),
+        generation_timeout_seconds=float(os.getenv("GENERATION_TIMEOUT_SECONDS", "15.0")),
         agent_timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "8.0")),
         agent_max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "5")),
         agent_api_version=os.getenv("AGENT_OPENAI_API_VERSION", "2025-04-01-preview"),

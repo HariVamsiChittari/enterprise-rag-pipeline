@@ -49,7 +49,7 @@ class RagService:
         embedding_deployment: str,
         chat_deployment: str,
         retrieval_timeout_seconds: float = 5.0,
-        generation_timeout_seconds: float = 3.0,
+        generation_timeout_seconds: float = 15.0,
         max_evidence: int = 5,
         max_planned_queries: int = 3,
         *,
