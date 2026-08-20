@@ -78,9 +78,6 @@ evaluation/results/raw/
 # Cosmos data exports (runtime output, not source)
 data/*.json
 
-# Draft docs (not ready for commit)
-docs/COST_ESTIMATION.md
-
 # Local configuration
 local.settings.json
 .env.local

@@ -82,7 +82,7 @@ All settings are environment variables:
 | `INCLUDE_CITATIONS` | No | `true` | When `false`, response returns empty citations array |
 | `ACL_ENABLED` | No | `true` | When `false`, skip ACL filtering — all authorized callers see all documents |
 | `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Cosmos retrieval timeout per query |
-| `GENERATION_TIMEOUT_SECONDS` | No | `3.0` | Answer generation LLM call timeout |
+| `GENERATION_TIMEOUT_SECONDS` | No | `15.0` | Answer generation LLM call timeout |
 | `AGENT_TIMEOUT_SECONDS` | No | `8.0` | Agentic path timeout before fallback |
 | `AGENT_MAX_ITERATIONS` | No | `5` | Max LLM reasoning roundtrips per agentic request |
 | `RATE_LIMIT_RPM` | No | `30` | Per-user requests per minute before HTTP 429 |
@@ -104,11 +104,17 @@ All settings are environment variables:
 
 Retrieval is served by the hybrid RAG service on ACA / AKS (Function App proxies `/api/query` via `RETRIEVAL_SERVICE_URL`).
 
+> **See [docs/API_REFERENCE.md](docs/API_REFERENCE.md)** for the complete API contract: headers, request/response schemas, error codes, and PowerShell examples for every endpoint.
+
 ## Query API
 
 **Request:** `POST /api/query`
 
-```json
+```http
+POST /api/query HTTP/1.1
+Authorization: Bearer <token>
+Content-Type: application/json
+
 {
   "question": "What is the password policy?",
   "mode": "hybrid",
@@ -135,6 +141,8 @@ Retrieval is served by the hybrid RAG service on ACA / AKS (Function App proxies
   "request_id": "uuid"
 }
 ```
+
+For error codes, rate limiting, and multi-turn history format, see [docs/API_REFERENCE.md](docs/API_REFERENCE.md#post-apiquery).
 
 ## Idempotent Re-Runs
 
@@ -234,6 +242,6 @@ az containerapp update --name <aca-name> --resource-group <rg> --image <acr>.azu
 ├── infra/                 # Bicep modules (Cosmos, Functions, VNet, PEs)
 ├── evaluation/            # Evaluation schemas (ground-truth, experiments)
 ├── tests/                 # Unit tests (ingestion, retrieval, infra)
-├── docs/                  # ARCHITECTURE.md, PRODUCTION_READINESS.md, COST_ESTIMATION.md
+├── docs/                  # ARCHITECTURE.md, API_REFERENCE.md, AZURE_SETUP.md, PRODUCTION_READINESS.md, DEMO_RUNBOOK.md, E2E_TEST_RUNBOOK.md, INFRASTRUCTURE_REQUEST.md
 └── data/                  # Sample Cosmos data exports
 ```
