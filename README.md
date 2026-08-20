@@ -65,18 +65,28 @@ All settings are environment variables:
 | `ACL_RESYNC_SCHEDULE` | No | `0 0 3 * * 0` | ACL-resync timer (weekly Sunday 03:00 UTC) |
 | `WEBHOOK_CLIENT_STATE` | Yes | — | Shared secret for Graph webhook clientState validation |
 | `SUBSCRIPTION_RENEW_SCHEDULE` | No | `0 0 2 * * *` | Graph webhook subscription renewal (daily 02:00 UTC) |
+| `FUNCTION_PUBLIC_BASE_URL` | Yes | — | Public HTTPS URL of Function App (for Graph webhook notification URL) |
+| `SHAREPOINT_SITE_URL` | No | — | SharePoint site URL for site group ACL resolution via REST API |
 
 ### Retrieval Service (ACA / AKS)
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `RETRIEVAL_SERVICE_URL` | Yes | — | Internal URL of retrieval service (Function App query proxy target) |
+| `COSMOS_DATABASE` | Yes | — | Cosmos DB database name (note: ingestion uses `COSMOS_DATABASE_NAME`) |
+| `AZURE_OPENAI_ENDPOINT` | Yes | — | Azure OpenAI endpoint (note: ingestion uses `OPENAI_ENDPOINT`) |
+| `CHAT_DEPLOYMENT` | Yes | — | Chat completion model deployment name |
+| `TENANT_ID` | Yes | — | Entra tenant ID for Graph group resolution |
+| `MANAGED_IDENTITY_CLIENT_ID` | Yes | — | User-assigned MI client ID |
 | `MAX_EVIDENCE_CHUNKS` | No | `5` | Default top-K chunks retrieved when `top_k` not in request |
 | `INCLUDE_CITATIONS` | No | `true` | When `false`, response returns empty citations array |
+| `ACL_ENABLED` | No | `true` | When `false`, skip ACL filtering (dev only) |
 | `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Cosmos retrieval timeout per query |
-| `GENERATION_TIMEOUT_SECONDS` | No | `15.0` | Answer generation LLM call timeout |
+| `GENERATION_TIMEOUT_SECONDS` | No | `3.0` | Answer generation LLM call timeout |
 | `AGENT_TIMEOUT_SECONDS` | No | `8.0` | Agentic path timeout before fallback |
-| `QUERY_PROXY_TIMEOUT_SECONDS` | No | `60` | Function App → retrieval service proxy timeout |
+| `AGENT_MAX_ITERATIONS` | No | `5` | Max LLM reasoning roundtrips per agentic request |
+| `RATE_LIMIT_RPM` | No | `30` | Per-user requests per minute before HTTP 429 |
+| `QUERY_PROXY_TIMEOUT_SECONDS` | No | `30.0` | Function App → retrieval service proxy timeout |
 
 ## Endpoints
 
@@ -86,6 +96,7 @@ All settings are environment variables:
 | `/api/ingestion/status` | GET | Query orchestration status |
 | `/api/ingestion/terminate` | POST | Terminate orchestration, force-fail stuck docs, finalize run |
 | `/api/ingestion/retry-failed` | POST | Retry only the failed docs from the current full-sync run |
+| `/api/ingestion/purge` | DELETE | Delete items from a Cosmos container (targeted IDs or purge-all) |
 | `/api/ingestion/inspect` | GET | Read Cosmos data (container, runId, limit) |
 | `/api/query` | POST | Proxy RAG queries to the retrieval service |
 | `/api/webhook/sharepoint` | POST | Microsoft Graph change notifications (no auth required) |
@@ -206,6 +217,7 @@ az containerapp update --name <aca-name> --resource-group <rg> --image <acr>.azu
 │   │   ├── enrichment.py  # Language AI: key phrases, entities, summary
 │   │   ├── embedding.py   # OpenAI embedding
 │   │   ├── telemetry.py   # Ingestion audit to Cosmos
+│   │   ├── subscription.py # Graph webhook subscription lifecycle
 │   │   └── errors.py      # TerminalDocumentError, StaleFenceError
 │   └── retrieval/
 │       ├── agent.py       # Agent Framework agent factory

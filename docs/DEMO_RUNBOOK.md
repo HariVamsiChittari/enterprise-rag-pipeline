@@ -5,9 +5,11 @@ Run each step sequentially in PowerShell.
 ## Step 0: Authenticate
 
 ```powershell
-$token = az account get-access-token --resource "api://f6a39f07-5d1d-4e83-936c-28d0fed0e3fe" --query accessToken -o tsv
+$funcApp = "<function-app-name>"           # e.g. rag-dev-func-apniu6o4
+$clientId = "<admin-api-client-id>"        # e.g. f6a39f07-5d1d-4e83-936c-28d0fed0e3fe
+$token = az account get-access-token --resource "api://$clientId" --query accessToken -o tsv
 $h = @{ 'Authorization' = "Bearer $token"; 'Content-Type' = 'application/json' }
-$baseUrl = "https://rag-rag-project-func-2gdoajpu.azurewebsites.net"
+$baseUrl = "https://$funcApp.azurewebsites.net"
 ```
 
 ---
@@ -182,7 +184,69 @@ if ($agentic) { Write-Host "  AVG: $([Math]::Round(($agentic | Measure-Object -P
 
 ## Ingestion Validation
 
-### Step 12: 4-Level Cross-File Validation
+### Step 12: Ingestion Status and Document Count
+
+```powershell
+# Full-sync status
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status" -Method GET -Headers $h -UseBasicParsing
+$status = $r.Content | ConvertFrom-Json
+Write-Host "Full-sync: $($status.output.status) | discovered=$($status.output.discovered) succeeded=$($status.output.succeeded) failed=$($status.output.failed)"
+
+# Delta-sync status
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status?instanceId=delta-sync-sharepoint-drive" -Method GET -Headers $h -UseBasicParsing
+$delta = $r.Content | ConvertFrom-Json
+Write-Host "Delta-sync: $($delta.output | ConvertTo-Json -Compress)"
+
+# Document count
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=200" -Method GET -Headers $h -UseBasicParsing
+$docs = ($r.Content | ConvertFrom-Json).rows
+$ready = ($docs | Where-Object { $_.status -eq "ready" }).Count
+$retired = ($docs | Where-Object { $_.status -eq "retired" }).Count
+Write-Host "Documents: ready=$ready retired=$retired total=$($docs.Count)"
+
+# Chunk count
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=search-chunks&limit=1" -Method GET -Headers $h -UseBasicParsing
+Write-Host "Search chunks: $((($r.Content | ConvertFrom-Json).count))"
+```
+
+### Step 13: Webhook Subscription and Real-Time Sync
+
+```powershell
+# Verify webhook subscription
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=ingestion-runs&limit=50" -Method GET -Headers $h -UseBasicParsing
+$sub = ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.id -eq "webhook-subscription" }
+Write-Host "Webhook: subscriptionId=$($sub.subscriptionId) updated=$($sub.updatedAt)"
+
+# Test webhook handshake
+$r = Invoke-WebRequest -Uri "$baseUrl/api/webhook/sharepoint?validationToken=demo-test" -Method POST -ContentType "text/plain" -SkipHttpErrorCheck
+Write-Host "Webhook handshake: $($r.StatusCode) body=$($r.Content)"
+```
+
+### Step 14: Document ACL Inspection
+
+```powershell
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=5" -Method GET -Headers $h -UseBasicParsing
+($r.Content | ConvertFrom-Json).rows | Where-Object { $_.status -eq "ready" } | ForEach-Object {
+  Write-Host "$($_.sourceName)"
+  Write-Host "  Groups: $($_.allowedGroupIds -join ', ')"
+  Write-Host "  ACL evaluated: $($_.aclEvaluatedAt)"
+  Write-Host "  Chunks: $($_.writtenChunkCount) | Pages: $($_.pageCount)"
+}
+```
+
+### Step 15: Data Export (download all containers)
+
+```powershell
+$outDir = "./data"
+if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
+@("ingestion-runs","source-documents","search-chunks","service-audit") | ForEach-Object {
+  $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=$_&limit=500" -Method GET -Headers $h -UseBasicParsing
+  $r.Content | ConvertFrom-Json | ConvertTo-Json -Depth 10 > "$outDir/$_.json"
+  Write-Host "$_ : $(($r.Content | ConvertFrom-Json).count) rows exported"
+}
+```
+
+### Step 16: 4-Level Cross-File Validation
 
 ```powershell
 $dataDir = "data"
@@ -224,7 +288,7 @@ Write-Host "  Orphaned chunks (docId not in source-documents): $($orphaned.Count
 Write-Host "  VERDICT: $(if ($orphaned.Count -eq 0) {'PASS'} else {'FAIL'})"
 ```
 
-### Step 13: Per-File Gate Validation
+### Step 17: Per-File Gate Validation
 
 ```powershell
 $docs = (Get-Content "data\source-documents.json" | ConvertFrom-Json).rows

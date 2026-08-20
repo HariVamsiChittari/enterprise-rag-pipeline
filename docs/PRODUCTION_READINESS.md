@@ -146,13 +146,16 @@ Both sync and async OpenAI clients set `max_retries=2` for automatic exponential
 [ ] 6. Build and deploy retrieval image: az acr build + az containerapp update
 [ ] 7. Set WAVE_SIZE app setting (match to granted TPM)
 [ ] 8. Set RETRIEVAL_SERVICE_URL on Function App (HTTPS, internal ACA FQDN)
-[ ] 9. Run full-sync test with 24 files → expect 21+ success
-[ ] 10. Verify delta-sync fires every 15 min (check App Insights logs)
-[ ] 11. Verify ACL-resync fires daily at 03:00 UTC
-[ ] 12. Test retrieval query via /api/query endpoint
-[ ] 13. Verify llm-audit container has both ingestion + retrieval records
-[ ] 14. Monitor Cosmos 429 metrics (should be near zero)
-[ ] 15. Monitor OpenAI 429 metrics (should be within retry budget)
+[ ] 9. Set WEBHOOK_CLIENT_STATE and FUNCTION_PUBLIC_BASE_URL on Function App
+[ ] 10. Set SHAREPOINT_SITE_URL if site uses site groups for permissions
+[ ] 11. Run full-sync test with 24 files → expect 21+ success
+[ ] 12. Verify webhook subscription created (check logs for subscription_created)
+[ ] 13. Verify reconciliation_timer fires daily at 04:00 UTC (safety-net delta query)
+[ ] 14. Verify acl_resync_timer fires weekly Sunday at 03:00 UTC
+[ ] 15. Test retrieval query via /api/query endpoint
+[ ] 16. Verify service-audit container has both ingestion + retrieval records
+[ ] 17. Monitor Cosmos 429 metrics (should be near zero)
+[ ] 18. Monitor OpenAI 429 metrics (should be within retry budget)
 ```
 
 ## Orchestration Batching Strategy (continue_as_new)
@@ -217,11 +220,15 @@ If `max(duration) > 5000ms`, implement `continue_as_new` batching.
 
 ## Incremental Ingestion (Delta-Sync) — Implemented
 
-Delta-sync runs on a 15-minute timer (`DELTA_SYNC_SCHEDULE`). It uses the Microsoft Graph Delta API to detect added, modified, and deleted files. Deleted files are hard-deleted from Cosmos (source-documents + search-chunks). Updated files are re-processed, and the old version is retired (`status=retired`, `retired_reason=superseded`). The delta cursor is stored in a dedicated `delta-control` item in `ingestion-runs`.
+Delta-sync is primarily triggered by **Microsoft Graph webhooks** — when a file is added, modified, or deleted in SharePoint, Graph sends a change notification to `POST /api/webhook/sharepoint`, which starts the `delta_sync_orchestrator`. A daily **reconciliation timer** (`DELTA_SYNC_SCHEDULE`, default 04:00 UTC) runs the same delta query as a safety net to catch any missed webhook notifications.
 
-ACL resync runs daily at 03:00 UTC (`ACL_RESYNC_SCHEDULE`). It re-verifies document permissions via Graph and patches `allowedGroupIds` on both source-documents and search-chunks when ACLs change. Documents with revoked access are retired (`retired_reason=acl_revoked`).
+The delta query uses the Microsoft Graph Delta API to detect changed files. Deleted files are hard-deleted from Cosmos (source-documents + search-chunks). Updated files are re-processed, and the old version is retired (`status=retired`, `retired_reason=superseded`). The delta cursor is stored in a dedicated `delta-control` item in `ingestion-runs`.
 
-Both timers skip execution while a full-sync orchestration is running.
+When the delta feed returns zero content changes (`itemsSeen == 0`), the orchestrator automatically runs one page of ACL resync to catch permission-only changes that Graph does not surface via `@microsoft.graph.sharedChanged`.
+
+ACL resync runs weekly on Sunday at 03:00 UTC (`ACL_RESYNC_SCHEDULE`). It re-verifies document permissions via Graph and the SharePoint REST API (for site group resolution), then patches `allowedGroupIds` on both source-documents and search-chunks when ACLs change. Documents with revoked access are retired (`retired_reason=acl_revoked`).
+
+All timers and webhook handlers skip execution while a full-sync orchestration is running.
 
 ## Hybrid RAG Retrieval — Implemented
 
