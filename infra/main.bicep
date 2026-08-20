@@ -31,6 +31,9 @@ param sharePointAppClientId string
 @description('Assigned SharePoint document-library drive ID')
 param sharePointDriveId string
 
+@description('SharePoint site URL for site group ACL resolution via REST API (leave empty to disable site group resolution)')
+param sharePointSiteUrl string = ''
+
 @description('Stable source registration ID')
 param ingestionSourceId string
 
@@ -147,9 +150,9 @@ module durableTask './modules/durable-task.bicep' = {
     schedulerName: take('${prefix}-dts-${suffix}', 45)
     location: location
     functionAppPrincipalId: identity.outputs.identityPrincipalId
-    // Goal 7: independent scaling per source -- each source's azd deployment provisions
-    // its own scheduler (per confirmed answer), so the task hub is named from the
-    // source rather than the misleading hardcoded 'full-sync' literal.
+    // Independent scaling per source: each source's azd deployment provisions its own
+    // scheduler, so the task hub is named from the source rather than a hardcoded
+    // 'full-sync' literal.
     taskHubName: take('${ingestionSourceId}-sync', 45)
     tags: tags
   }
@@ -250,6 +253,7 @@ module functions './modules/functions.bicep' = {
     sharePointAppClientId: sharePointAppClientId
     ingestionSourceId: ingestionSourceId
     sharePointDriveId: sharePointDriveId
+    sharePointSiteUrl: sharePointSiteUrl
     sharePointCertificateSecretName: sharePointCertificateSecretName
     adminApiClientId: adminApiClientId
     webhookClientState: webhookClientState

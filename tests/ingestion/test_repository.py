@@ -1014,6 +1014,7 @@ def test_services_finalize_marks_completed_with_errors_when_documents_failed() -
         chunk_max_tokens=800, chunk_overlap_tokens=100, acl_max_pages=10,
         download_timeout_seconds=120.0, delta_max_pages=200, embedding_batch_size=100,
         max_pdf_pages=500, query_proxy_timeout_seconds=30.0,
+        sharepoint_site_url="",
     )
 
     finalized = finalize(config, activated.run.etag, repository, items_scanned=1)

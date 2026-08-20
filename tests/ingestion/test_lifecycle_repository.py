@@ -1,4 +1,4 @@
-"""Tests for Goal 6b/8's post-ingestion lifecycle repository."""
+"""Tests for the post-ingestion lifecycle repository (ACL resync and delta sync)."""
 
 from __future__ import annotations
 

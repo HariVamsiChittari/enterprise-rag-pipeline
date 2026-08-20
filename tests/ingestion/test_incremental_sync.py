@@ -1,9 +1,9 @@
-"""Tests for Goal 8 delta-sync and Goal 6b ACL-resync orchestration logic in services.py.
+"""Tests for delta-sync and ACL-resync orchestration logic in services.py.
 
 process_document() itself (extract/chunk/embed/write) is already exercised by the
-full-sync path; these tests focus on the NEW orchestration: adapting delta items,
-retiring superseded versions, hard-deleting on Graph deletion, and the ACL-resync
-unchanged/updated/retired decision tree.
+full-sync path; these tests focus on the incremental orchestration: adapting delta
+items, retiring superseded versions, hard-deleting on Graph deletion, and the
+ACL-resync unchanged/updated/retired decision tree.
 """
 
 from __future__ import annotations
@@ -61,6 +61,7 @@ def build_config(**overrides: Any) -> IngestionConfig:
         embedding_batch_size=100,
         max_pdf_pages=500,
         query_proxy_timeout_seconds=30.0,
+        sharepoint_site_url="",
     )
     values.update(overrides)
     return IngestionConfig(**values)

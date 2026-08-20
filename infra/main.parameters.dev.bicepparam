@@ -9,6 +9,7 @@ param chatDeploymentName = readEnvironmentVariable('OPENAI_CHAT_DEPLOYMENT_NAME'
 param sharePointTenantId = readEnvironmentVariable('SHAREPOINT_TENANT_ID')
 param sharePointAppClientId = readEnvironmentVariable('SHAREPOINT_APP_CLIENT_ID')
 param sharePointDriveId = readEnvironmentVariable('SHAREPOINT_ASSIGNED_DRIVE_ID')
+param sharePointSiteUrl = readEnvironmentVariable('SHAREPOINT_SITE_URL', '')
 param ingestionSourceId = readEnvironmentVariable('INGESTION_SOURCE_ID')
 param sharePointCertificateSecretName = readEnvironmentVariable(
   'SHAREPOINT_CERTIFICATE_SECRET_NAME',

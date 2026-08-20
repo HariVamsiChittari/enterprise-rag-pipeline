@@ -1,4 +1,4 @@
-"""Tests for the Goal 2 CosmosRegistry: config parsing and default single-instance behavior."""
+"""Tests for CosmosRegistry: config parsing and default single-instance behavior."""
 
 from __future__ import annotations
 

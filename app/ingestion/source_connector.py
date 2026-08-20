@@ -1,5 +1,5 @@
-"""Goal 1: a thin connector boundary between ingestion's business logic (services.py) and
-the source-specific discovery/ACL/download/delta mechanism.
+"""Thin connector boundary between ingestion's business logic (services.py) and the
+source-specific discovery/ACL/download/delta mechanism.
 
 Deliberately NOT a rewrite of the Cosmos schema or graph.py's internals -- SourceDocumentRecord
 still uses SharePoint-shaped fields (drive_id, item_id) since that schema is already
@@ -54,6 +54,8 @@ class SharePointConnector:
 
     client: httpx.Client
     drive_id: str
+    sp_client: httpx.Client | None = None
+    site_url: str = ""
 
     def discover_next_page(
         self,
@@ -64,7 +66,7 @@ class SharePointConnector:
         return discover_next_page(self.client, self.drive_id, state, limits, allowed_extensions)
 
     def read_verified_acl(self, item_id: str, max_pages: int) -> VerifiedAcl:
-        return read_verified_acl(self.client, self.drive_id, item_id, max_pages)
+        return read_verified_acl(self.client, self.drive_id, item_id, max_pages, sp_client=self.sp_client, site_url=self.site_url)
 
     def download_content_sync(self, item_id: str, max_bytes: int, timeout_seconds: float) -> bytes:
         return download_content_sync(self.client, self.drive_id, item_id, max_bytes, timeout_seconds)

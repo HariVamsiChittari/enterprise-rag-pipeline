@@ -43,8 +43,8 @@ class DocumentStatus(str, Enum):
     RETIRED = "retired"
 
 
-# Reasons a previously-ready document can leave retrieval: permission loss (Goal 6b ACL
-# resync), a newer version superseding it, or the source item being deleted (Goal 8).
+# Reasons a previously-ready document can leave retrieval: permission loss detected by
+# ACL resync, a newer version superseding it, or the source item being deleted.
 RETIRED_REASONS = frozenset({"acl_revoked", "superseded", "deleted"})
 
 

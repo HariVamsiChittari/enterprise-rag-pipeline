@@ -1,5 +1,5 @@
-"""Tests for the Goal 1 SourceConnector boundary: SharePointConnector must delegate to
-the same graph.py functions unchanged, just with drive_id/client pre-bound."""
+"""Tests for the SourceConnector boundary: SharePointConnector must delegate to the
+same graph.py functions unchanged, just with drive_id/client pre-bound."""
 
 from __future__ import annotations
 

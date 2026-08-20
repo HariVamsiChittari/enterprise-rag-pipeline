@@ -27,7 +27,6 @@ def _int(name: str, default: int) -> int:
 
 @dataclass(frozen=True)
 class IngestionConfig:
-    # Feature toggles
     extraction_enabled: bool
     enrichment_enabled: bool
     summary_enabled: bool
@@ -63,6 +62,7 @@ class IngestionConfig:
     embedding_batch_size: int
     max_pdf_pages: int
     query_proxy_timeout_seconds: float
+    sharepoint_site_url: str
 
 
 def load_config() -> IngestionConfig:
@@ -104,4 +104,5 @@ def load_config() -> IngestionConfig:
         embedding_batch_size=_int("EMBEDDING_BATCH_SIZE", 100),
         max_pdf_pages=_int("MAX_PDF_PAGES", 500),
         query_proxy_timeout_seconds=float(os.getenv("QUERY_PROXY_TIMEOUT_SECONDS", "30.0")),
+        sharepoint_site_url=os.getenv("SHAREPOINT_SITE_URL", "").strip(),
     )

@@ -1,4 +1,4 @@
-"""Goal 2: a registry of Cosmos DB instances (one per source) for retrieval fan-out.
+"""Registry of Cosmos DB instances (one per source) for retrieval fan-out.
 
 Defaults to exactly one instance built from RetrievalConfig's existing single-instance
 fields, so behavior is unchanged for the current single-source deployment. A second

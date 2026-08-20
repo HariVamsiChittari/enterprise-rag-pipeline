@@ -1,4 +1,4 @@
-"""Tests for retrieval's optional GenAI OpenTelemetry tracing (Goal 4 recommendation).
+"""Tests for retrieval's optional GenAI OpenTelemetry tracing.
 
 _configure_tracing must never raise -- it is called once at FastAPI startup and a
 misconfiguration must not prevent the retrieval service from starting.

@@ -179,13 +179,16 @@ def test_read_verified_acl_rejects_unverified_groups(security_enabled: bool) -> 
             read_verified_acl(client, "drive", "item", 1)
 
 
-def test_read_verified_acl_accepts_group_not_found_in_graph() -> None:
-    """Groups returning 404 are accepted (app may lack Group.Read.All)."""
+def test_read_verified_acl_skips_group_not_found_in_graph() -> None:
+    """Groups returning 404 are skipped (deleted from Entra)."""
+    import pytest
+    from ingestion.errors import TerminalDocumentError
+
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/permissions"):
             return httpx.Response(200, json={"value": [{"roles": ["read"], "grantedToV2": {"group": {"id": "group"}}}]})
         return httpx.Response(404)
 
     with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-        acl = read_verified_acl(client, "drive", "item", 1)
-    assert acl.allowed_group_ids == ("group",)
+        with pytest.raises(TerminalDocumentError, match="no_verified_security_groups"):
+            read_verified_acl(client, "drive", "item", 1)

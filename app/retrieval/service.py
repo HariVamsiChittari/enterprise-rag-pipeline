@@ -163,7 +163,7 @@ class RagService:
         effective_max = max_k or self._max_evidence
         planned = queries[:self._max_planned_queries]
         instances = self._registry.items()
-        # Thread-safe collector for usage records from concurrent retrieval tasks
+        # Thread-safe collector for usage records from concurrent retrieval workers
         usage_lock = threading.Lock()
         futures: list[Future[list[RetrievedChunk]]] = [
             self._executor.submit(self._retrieve_for_query, query, retriever, principal, mode, usage, usage_lock)

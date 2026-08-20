@@ -64,8 +64,6 @@ class DocumentLifecycleRepository:
         self._source_documents = source_documents
         self._search_chunks = search_chunks
 
-    # ---- ACL resync scan ----
-
     def list_ready_documents_page(
         self,
         *,
@@ -117,8 +115,6 @@ class DocumentLifecycleRepository:
             return None
         return _ready_ref_from_row(rows[0])
 
-    # ---- retire (soft, status-flip only; no chunk writes needed) ----
-
     def retire_document(
         self,
         *,
@@ -149,8 +145,6 @@ class DocumentLifecycleRepository:
             if _error_status(error) in (404, 412):
                 raise LifecycleConflictError("document already retired or changed") from None
             raise LifecycleRepositoryError("Cosmos document retirement failed") from None
-
-    # ---- ACL drift (permissions changed but not revoked): patch doc + every chunk ----
 
     def refresh_document_acl(
         self,
@@ -212,8 +206,6 @@ class DocumentLifecycleRepository:
         except Exception:
             raise LifecycleRepositoryError("Cosmos chunk ACL batch patch failed") from None
 
-    # ---- hard delete (Goal 8 delete case, per explicit requirement) ----
-
     def delete_document_and_chunks(
         self,
         *,
@@ -257,8 +249,6 @@ class DocumentLifecycleRepository:
                 return
             raise LifecycleRepositoryError("Cosmos delete failed") from None
 
-    # ---- delta-sync cursor (per source_id singleton, ingestion-runs container) ----
-
     def get_delta_cursor(self, source_id: str) -> str | None:
         try:
             item = self._ingestion_runs.read_item(item=DELTA_CONTROL_ID, partition_key=source_id)
@@ -284,8 +274,6 @@ class DocumentLifecycleRepository:
             self._ingestion_runs.upsert_item(body=item)
         except Exception:
             raise LifecycleRepositoryError("Cosmos delta cursor save failed") from None
-
-    # ---- webhook subscription ID (per source_id singleton, ingestion-runs container) ----
 
     def get_webhook_subscription_id(self, source_id: str) -> str | None:
         try:

@@ -16,6 +16,7 @@ from ingestion.enrichment import enrich_chunks
 from ingestion.errors import TerminalDocumentError
 from ingestion.extraction import extract_pdf
 from ingestion.graph import (
+    DeltaResetRequired,
     DiscoveryState,
     DiscoveryStep,
     VerifiedAcl,
@@ -213,7 +214,6 @@ def process_document(
         else:
             enrichments = enrich_chunks(None, [chunk.content for chunk in chunks])
 
-        # Build searchable text (content + enrichments) for embedding and full-text search
         searchable_texts = [
             _build_searchable_text(chunk.content, enrichments[i]["key_phrases"], enrichments[i]["summary"])
             for i, chunk in enumerate(chunks)
@@ -236,7 +236,6 @@ def process_document(
 
         written = repository.write_chunks(chunk_records)
 
-        # Mark ready
         ready_doc = replace(
             current_doc,
             status=DocumentStatus.READY, stage=DocumentStage.TERMINAL,
@@ -337,8 +336,6 @@ def get_retry_candidates(
     return repository.get_failed_documents(config.source_id, run_id)
 
 
-# --- Goal 8: delta-sync (incremental add/update/delete, separate from full-sync) ---
-
 @dataclass(frozen=True)
 class DeltaSyncOutcome:
     bootstrapped: bool = False
@@ -368,7 +365,14 @@ def run_delta_sync(
         lifecycle_repository.save_delta_cursor(config.source_id, bootstrap_link)
         return DeltaSyncOutcome(bootstrapped=True)
 
-    delta = connector.read_drive_delta(config.delta_max_pages, delta_link=cursor)
+    try:
+        delta = connector.read_drive_delta(config.delta_max_pages, delta_link=cursor)
+    except DeltaResetRequired:
+        # Cursor permanently invalidated; re-bootstrap per MS Graph guidance
+        logger.warning("delta_cursor_invalidated, re-bootstrapping")
+        bootstrap_link = connector.bootstrap_delta_cursor()
+        lifecycle_repository.save_delta_cursor(config.source_id, bootstrap_link)
+        return DeltaSyncOutcome(bootstrapped=True)
     run_id = create_run_id(_utc_now(), f"{config.source_id}:delta")
 
     created_or_updated = 0
@@ -406,7 +410,8 @@ def run_delta_sync(
                 failed += 1
             continue
 
-        # Permission-only change: resync ACL without full reprocessing
+        # Per-item permission change: Graph only surfaces this for file-level ACL edits;
+        # library-level permission changes are caught by the zero-delta ACL resync path.
         if item.get("@microsoft.graph.sharedChanged") is True:
             ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
             if ref is not None:
@@ -491,8 +496,6 @@ def _delta_item_to_document(
     return _pdf_to_document(pdf, config, run_id, ingestion_mode="delta-sync")
 
 
-# --- Goal 6b: ACL resync (timer-driven, re-verifies already-ingested documents) ---
-
 @dataclass(frozen=True)
 class AclResyncOutcome:
     checked: int = 0
@@ -564,8 +567,6 @@ def run_acl_resync_page(
     )
     return outcome, page.continuation_token
 
-
-# --- Private helpers ---
 
 def _fail_document(doc: SourceDocumentRecord, etag: str, error: BaseException, repository: IngestionRepository) -> None:
     try:

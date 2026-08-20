@@ -10,7 +10,7 @@ Endpoints:
 
 Timers:
   reconciliation_timer     Daily safety-net delta query (replaces 15-min polling)
-  acl_resync_timer         Re-verify ACLs on already-ingested documents (Goal 6b)
+  acl_resync_timer         Re-verify ACLs on already-ingested documents
   subscription_renew_timer Renew Microsoft Graph webhook subscription daily
 """
 
@@ -169,6 +169,108 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
     return _json_response({"container": container_name, "count": len(sanitized), "rows": sanitized}, 200)
 
 
+_PARTITION_KEY_FIELD = {
+    "ingestion-runs": "sourceId",
+    "source-documents": "sourceRunId",
+    "search-chunks": "documentKey",
+    "service-audit": "id",
+}
+
+
+@app.route(route="ingestion/purge", methods=["DELETE"], auth_level=func.AuthLevel.ANONYMOUS)
+def purge_data(req: func.HttpRequest) -> func.HttpResponse:
+    """Delete items from a Cosmos container. Writes an audit record for every purge."""
+    from azure.cosmos import CosmosClient
+    from azure.identity import DefaultAzureCredential
+    from datetime import datetime, timezone
+    import uuid
+
+    try:
+        body = req.get_json()
+    except ValueError:
+        return _json_response({"error": "invalid_json"}, 400)
+
+    container_name = (body.get("container") or "").strip()
+    purgeable = {"ingestion-runs", "source-documents", "search-chunks"}
+    if container_name not in purgeable:
+        return _json_response({"error": "invalid_container", "allowed": sorted(purgeable)}, 400)
+
+    ids = body.get("ids")
+    purge_all = body.get("purgeAll", False)
+    confirm = body.get("confirm", "")
+
+    if not ids and not purge_all:
+        return _json_response({"error": "provide 'ids' (list) or 'purgeAll':true"}, 400)
+    if purge_all and confirm != "yes":
+        return _json_response({"error": "purgeAll requires 'confirm':'yes'"}, 400)
+    if ids and (not isinstance(ids, list) or len(ids) > 100):
+        return _json_response({"error": "ids must be a list with max 100 items"}, 400)
+
+    operator = req.headers.get("X-MS-CLIENT-PRINCIPAL-NAME", "unknown")
+    pk_field = _PARTITION_KEY_FIELD[container_name]
+
+    try:
+        credential = DefaultAzureCredential(managed_identity_client_id=os.getenv("AZURE_CLIENT_ID", ""))
+        cosmos = CosmosClient(os.getenv("COSMOS_ENDPOINT", ""), credential=credential)
+        db = cosmos.get_database_client(os.getenv("COSMOS_DATABASE_NAME", ""))
+        container = db.get_container_client(container_name)
+        audit_container = db.get_container_client("service-audit")
+
+        deleted_ids = []
+        failed = 0
+
+        if ids:
+            # Read each item to get its partition key, then delete
+            for item_id in ids:
+                try:
+                    items = list(container.query_items(
+                        query="SELECT c.id, c[@pk] as pk FROM c WHERE c.id = @id",
+                        parameters=[{"name": "@id", "value": item_id}, {"name": "@pk", "value": pk_field}],
+                        enable_cross_partition_query=True,
+                    ))
+                    if not items:
+                        failed += 1
+                        continue
+                    pk_value = items[0].get("pk", items[0].get(pk_field, ""))
+                    container.delete_item(item=item_id, partition_key=pk_value)
+                    deleted_ids.append(item_id)
+                except Exception:
+                    failed += 1
+        else:
+            while True:
+                batch = list(container.query_items(
+                    query=f"SELECT TOP 100 c.id, c.{pk_field} FROM c",
+                    enable_cross_partition_query=True,
+                ))
+                if not batch:
+                    break
+                for item in batch:
+                    try:
+                        container.delete_item(item=item["id"], partition_key=item[pk_field])
+                        deleted_ids.append(item["id"])
+                    except Exception:
+                        failed += 1
+
+        audit_record = {
+            "id": str(uuid.uuid4()),
+            "operation": "purge",
+            "container": container_name,
+            "operator": operator,
+            "deletedIds": deleted_ids[:100],
+            "deletedCount": len(deleted_ids),
+            "failedCount": failed,
+            "purgeAll": purge_all,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        audit_container.upsert_item(audit_record)
+        logger.warning("purge_executed container=%s deleted=%d failed=%d operator=%s", container_name, len(deleted_ids), failed, operator)
+
+        return _json_response({"deleted": len(deleted_ids), "failed": failed, "auditId": audit_record["id"]}, 200)
+    except Exception:
+        logger.exception("purge_data failed")
+        return _json_response({"error": "purge_failed"}, 503)
+
+
 @app.route(route="query", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def query_endpoint(req: func.HttpRequest) -> func.HttpResponse:
     """Proxy RAG queries to the internal ACA retrieval service."""
@@ -239,8 +341,8 @@ async def reconciliation_timer(timer: func.TimerRequest, client) -> None:
 @app.timer_trigger(schedule=ACL_RESYNC_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
 @app.durable_client_input(client_name="client")
 async def acl_resync_timer(timer: func.TimerRequest, client) -> None:
-    """Kick off one ACL-resync pass (Goal 6b) unless the previous pass, or a
-    full-sync, is still running."""
+    """Kick off one ACL-resync pass unless the previous pass, or a full-sync,
+    is still running."""
     source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
     if not source_id:
         logger.warning("acl_resync_timer skipped: missing INGESTION_SOURCE_ID")
@@ -259,13 +361,11 @@ async def acl_resync_timer(timer: func.TimerRequest, client) -> None:
     await client.start_new("acl_resync_orchestrator", instance_id=instance_id)
 
 
-# --- Webhook endpoints (unauthenticated — secured by clientState + auth exclusion) ---
 
 @app.route(route="webhook/sharepoint", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 @app.durable_client_input(client_name="client")
 async def webhook_sharepoint(req: func.HttpRequest, client) -> func.HttpResponse:
     """Receive Microsoft Graph change notifications for the subscribed drive."""
-    # Graph subscription validation handshake
     validation_token = req.params.get("validationToken")
     if validation_token:
         return func.HttpResponse(validation_token, status_code=200, mimetype="text/plain")
@@ -422,17 +522,24 @@ def full_sync_orchestrator(context: df.DurableOrchestrationContext):
 
 @app.orchestration_trigger(context_name="context")
 def delta_sync_orchestrator(context: df.DurableOrchestrationContext):
-    """One bounded delta-sync tick (Goal 8): adds/updates/deletes since the last cursor."""
+    """One bounded delta-sync tick: adds/updates/deletes since the last cursor."""
     retry = df.RetryOptions(first_retry_interval_in_milliseconds=5000, max_number_of_attempts=3)
     result = yield context.call_activity_with_retry("delta_sync_activity", retry, None)
     if result.get("error"):
         return {"status": "failed", "error": result["error"]}
+    # Webhook fired but delta saw no content changes — check for permission drift
+    if result.get("itemsSeen", -1) == 0:
+        acl = yield context.call_activity_with_retry(
+            "acl_resync_page_activity", retry, {"continuationToken": None}
+        )
+        if not acl.get("error"):
+            result["aclResynced"] = acl.get("updated", 0)
     return {"status": "completed", **result}
 
 
 @app.orchestration_trigger(context_name="context")
 def acl_resync_orchestrator(context: df.DurableOrchestrationContext):
-    """Page through all ready documents re-verifying ACLs (Goal 6b)."""
+    """Page through all ready documents re-verifying ACLs."""
     retry = df.RetryOptions(first_retry_interval_in_milliseconds=5000, max_number_of_attempts=3)
     continuation_token: str | None = None
     total_checked = total_updated = total_retired = 0
@@ -541,7 +648,8 @@ def process_document_activity(payload: dict) -> dict:
             return {"documentId": document_ref["documentId"], "status": "skipped"}
 
         with graph_client:
-            connector = SharePointConnector(graph_client, config.drive_id)
+            sp_client = _build_sharepoint_client(config)
+            connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
             outcome = process_document(
                 config, stored.record, stored.etag, repository,
                 connector, di_client, language_client, openai_client,
@@ -589,7 +697,8 @@ def delta_sync_activity(payload: Any) -> dict:
         openai_client = _build_openai_client(config)
         audit_container = _build_audit_container(config)
         with graph_client:
-            connector = SharePointConnector(graph_client, config.drive_id)
+            sp_client = _build_sharepoint_client(config)
+            connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
             outcome = run_delta_sync(
                 config, repository, lifecycle_repository, connector,
                 di_client, language_client, openai_client,
@@ -622,7 +731,8 @@ def acl_resync_page_activity(payload: dict) -> dict:
         lifecycle_repository = _build_lifecycle_repository(config)
         graph_client = _build_graph_client(config)
         with graph_client:
-            connector = SharePointConnector(graph_client, config.drive_id)
+            sp_client = _build_sharepoint_client(config)
+            connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
             outcome, token = run_acl_resync_page(
                 config, lifecycle_repository, connector,
                 page_size=ACL_RESYNC_PAGE_SIZE,
@@ -725,6 +835,32 @@ def _build_graph_client(config):
     )
     transport = httpx.HTTPTransport(retries=3)
     return httpx.Client(auth=GraphCredentialAuth(graph_credential, "https://graph.microsoft.com/.default"), transport=transport, timeout=120)
+
+
+def _build_sharepoint_client(config):
+    """Build an httpx.Client for SharePoint REST API using the same cert but SP scope."""
+    from azure.identity import CertificateCredential, DefaultAzureCredential
+    from azure.keyvault.secrets import SecretClient
+    from ingestion.graph import GraphCredentialAuth
+    import httpx
+    import base64
+
+    if not config.sharepoint_site_url:
+        return None
+    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+    secret_client = SecretClient(config.key_vault_uri, credential)
+    cert_secret = secret_client.get_secret(config.certificate_secret_name)
+    cert_data = base64.b64decode(cert_secret.value, validate=True)
+    from urllib.parse import urlparse
+    host = urlparse(config.sharepoint_site_url).hostname or ""
+    sp_scope = f"https://{host}/.default"
+    sp_credential = CertificateCredential(
+        tenant_id=config.tenant_id,
+        client_id=config.app_client_id,
+        certificate_data=cert_data,
+    )
+    transport = httpx.HTTPTransport(retries=3)
+    return httpx.Client(auth=GraphCredentialAuth(sp_credential, sp_scope), transport=transport, timeout=60)
 
 
 def _build_di_client(config):

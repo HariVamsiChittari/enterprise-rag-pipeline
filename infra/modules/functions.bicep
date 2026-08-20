@@ -88,11 +88,11 @@ param sharePointCertificateSecretName string
 @description('Microsoft Entra application client ID protecting operator endpoints')
 param adminApiClientId string
 
-@description('NCRONTAB schedule for the delta-sync timer (Goal 8 incremental add/update/delete)')
-param deltaSyncSchedule string = '0 */15 * * * *'
+@description('NCRONTAB schedule for the reconciliation timer (daily safety-net delta query; webhooks are the primary trigger)')
+param deltaSyncSchedule string = '0 0 4 * * *'
 
-@description('NCRONTAB schedule for the ACL-resync timer (Goal 6b)')
-param aclResyncSchedule string = '0 0 3 * * *'
+@description('NCRONTAB schedule for the ACL-resync timer (weekly Sunday 03:00 UTC)')
+param aclResyncSchedule string = '0 0 3 * * 0'
 
 @description('Page size for each ACL-resync activity call')
 @minValue(1)
@@ -108,6 +108,9 @@ param webhookClientState string
 
 @description('NCRONTAB schedule for Graph subscription renewal')
 param subscriptionRenewSchedule string = '0 0 2 * * *'
+
+@description('SharePoint site URL for site group ACL resolution via REST API (empty disables site group resolution)')
+param sharePointSiteUrl string = ''
 
 @description('Resource tags')
 param tags object = {}
@@ -264,10 +267,6 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
           value: 'https://${functionAppName}.azurewebsites.net'
         }
         {
-          name: 'FULL_SYNC_APP_ROLE'
-          value: 'Rag.FullSync'
-        }
-        {
           name: 'DELTA_SYNC_SCHEDULE'
           value: deltaSyncSchedule
         }
@@ -309,7 +308,7 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         }
         {
           name: 'QUERY_PROXY_TIMEOUT_SECONDS'
-          value: '60'
+          value: '30'
         }
         {
           name: 'RETRIEVAL_SERVICE_URL'
@@ -322,6 +321,10 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         {
           name: 'SUBSCRIPTION_RENEW_SCHEDULE'
           value: subscriptionRenewSchedule
+        }
+        {
+          name: 'SHAREPOINT_SITE_URL'
+          value: sharePointSiteUrl
         }
         {
           name: 'INSTANCE_MEMORY_MB'

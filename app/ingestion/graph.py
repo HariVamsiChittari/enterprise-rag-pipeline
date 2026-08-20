@@ -340,7 +340,6 @@ def advance_discovery(
         name = item.get("name")
         if not isinstance(name, str):
             continue
-        # Configurable file extension filter
         name_lower = name.lower()
         if not any(name_lower.endswith(ext) for ext in allowed_extensions):
             continue
@@ -451,7 +450,11 @@ def _read_delta_pages(
     except DeltaResetRequired as reset:
         if not allow_reset:
             raise
-        values, final_delta_link = read_json_pages(client, reset.location, max_pages, headers=delta_headers)
+        try:
+            values, final_delta_link = read_json_pages(client, reset.location, max_pages, headers=delta_headers)
+        except DeltaResetRequired as second_reset:
+            # Graph occasionally double-410s during server-side state transitions
+            values, final_delta_link = read_json_pages(client, second_reset.location, max_pages, headers=delta_headers)
         is_reset = True
     if not final_delta_link:
         raise ValueError("Graph delta traversal completed without a deltaLink")
@@ -510,7 +513,7 @@ def bootstrap_delta_cursor(client: httpx.Client, drive_id: str) -> str:
     corpus via its own tree walk; delta-sync only needs a starting cursor, not a replay.
     """
     url = f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/root/delta?token=latest"
-    response = client.get(url)
+    response = client.get(url, headers={"Prefer": DELTA_PREFER})
     response.raise_for_status()
     try:
         payload = response.json()
@@ -572,8 +575,7 @@ def read_security_enabled_group_ids(
             params={"$select": "id,securityEnabled,groupTypes,mailEnabled"},
         )
         if response.status_code == 404:
-            # App may lack Group.Read.All; accept group from SharePoint permissions
-            security_group_ids.add(group_id)
+            # Group deleted from Entra — skip it
             continue
         if response.status_code == 429:
             raise TimeoutError(
@@ -594,10 +596,17 @@ def read_security_enabled_group_ids(
     return security_group_ids
 
 
-def _permission_group_ids_strict(permissions: list[dict[str, Any]]) -> set[str]:
+@dataclass(frozen=True)
+class PermissionIdentities:
+    entra_group_ids: set[str]
+    site_group_ids: set[str]
+
+
+def _permission_group_ids_strict(permissions: list[dict[str, Any]]) -> PermissionIdentities:
     if not permissions:
         raise TerminalDocumentError("unsafe_acl:empty_permissions")
     group_ids: set[str] = set()
+    site_group_ids: set[str] = set()
     for permission in permissions:
         roles = permission.get("roles")
         if (
@@ -629,21 +638,55 @@ def _permission_group_ids_strict(permissions: list[dict[str, Any]]) -> set[str]:
 
         for identity in identities:
             group = identity.get("group")
-            if group is None:
-                # SharePoint site groups / user-only identities — skip, don't reject
-                continue
-            if not isinstance(group, dict):
-                raise TerminalDocumentError(
-                    "unsafe_acl:ambiguous_or_missing_entra_principal"
-                )
-            group_id = group.get("id")
-            if not isinstance(group_id, str) or not group_id:
-                raise TerminalDocumentError("unsafe_acl:missing_principal_id")
-            group_ids.add(group_id)
-    # Fail closed: at least one verified Entra group must exist across all permissions
-    if not group_ids:
+            site_group = identity.get("siteGroup")
+            if group is not None:
+                if not isinstance(group, dict):
+                    raise TerminalDocumentError(
+                        "unsafe_acl:ambiguous_or_missing_entra_principal"
+                    )
+                group_id = group.get("id")
+                if not isinstance(group_id, str) or not group_id:
+                    raise TerminalDocumentError("unsafe_acl:missing_principal_id")
+                group_ids.add(group_id)
+            elif site_group is not None:
+                if isinstance(site_group, dict):
+                    sg_id = site_group.get("id")
+                    if isinstance(sg_id, (str, int)) and sg_id:
+                        site_group_ids.add(str(sg_id))
+    if not group_ids and not site_group_ids:
         raise TerminalDocumentError("unsafe_acl:no_entra_groups_found")
-    return group_ids
+    return PermissionIdentities(entra_group_ids=group_ids, site_group_ids=site_group_ids)
+
+
+def resolve_site_group_security_groups(
+    sp_client: httpx.Client,
+    site_url: str,
+    site_group_ids: set[str],
+) -> set[str]:
+    """Resolve Entra SGs nested inside SharePoint site groups via REST API."""
+    entra_ids: set[str] = set()
+    base = site_url.rstrip("/")
+    for sg_id in sorted(site_group_ids):
+        url = f"{base}/_api/web/sitegroups({sg_id})/users"
+        response = sp_client.get(url, headers={"Accept": "application/json;odata=nometadata"})
+        if response.status_code == 404:
+            continue
+        response.raise_for_status()
+        payload = response.json()
+        users = payload.get("value")
+        if not isinstance(users, list):
+            continue
+        for user in users:
+            # PrincipalType 4 = SecurityGroup in SharePoint
+            if user.get("PrincipalType") == 4:
+                login = user.get("LoginName", "")
+                # Format: c:0t.c|tenant|{guid} or c:0o.c|...|{guid}_o
+                parts = login.rsplit("|", 1)
+                if len(parts) == 2 and parts[1]:
+                    raw_id = parts[1].rstrip("_o").rstrip("_m")
+                    if len(raw_id) == 36 and "-" in raw_id:
+                        entra_ids.add(raw_id)
+    return entra_ids
 
 
 def read_verified_acl(
@@ -651,10 +694,19 @@ def read_verified_acl(
     drive_id: str,
     item_id: str,
     max_pages: int,
+    *,
+    sp_client: httpx.Client | None = None,
+    site_url: str = "",
 ) -> VerifiedAcl:
     permissions = read_permissions(client, drive_id, item_id, max_pages)
-    group_ids = _permission_group_ids_strict(permissions)
-    verified_group_ids = read_security_enabled_group_ids(client, group_ids)
+    perm_ids = _permission_group_ids_strict(permissions)
+    all_group_ids = set(perm_ids.entra_group_ids)
+    if perm_ids.site_group_ids and sp_client and site_url:
+        sp_groups = resolve_site_group_security_groups(sp_client, site_url, perm_ids.site_group_ids)
+        all_group_ids.update(sp_groups)
+    if not all_group_ids:
+        raise TerminalDocumentError("unsafe_acl:no_entra_groups_found")
+    verified_group_ids = read_security_enabled_group_ids(client, all_group_ids)
     if not verified_group_ids:
         raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
     canonical = tuple(sorted(verified_group_ids))
