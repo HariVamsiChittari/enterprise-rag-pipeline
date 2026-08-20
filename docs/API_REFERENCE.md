@@ -396,7 +396,7 @@ Content-Type: application/json
 | Status | Body | Reason |
 |---|---|---|
 | 400 | `{"error":"question_required"}` | Missing or empty `question` |
-| 429 | `{"detail":"rate_limit_exceeded"}` | Per-user sliding window exceeded (default 30 RPM, see `RATE_LIMIT_RPM`) |
+| 429 | `{"detail":"rate_limit_exceeded"}` | Per-user **per-replica** sliding window exceeded (default 30 RPM; effective ceiling ≈ `RATE_LIMIT_RPM × replicaCount`, see ARCHITECTURE L8) |
 | 500 | `{"error":"RETRIEVAL_SERVICE_URL must use HTTPS"}` | Misconfigured proxy target |
 | 501 | `{"error":"RETRIEVAL_SERVICE_URL not configured"}` | Env var missing |
 | 503 | `{"error":"service_unavailable"}` | Retrieval service unreachable (timeout, network error) |
@@ -585,7 +585,7 @@ Retrieval service (FastAPI) errors follow FastAPI's default:
 | 403 | Token valid but caller lacks permission (webhook clientState mismatch, or EasyAuth policy) |
 | 404 | Resource not found (orchestration instance, document, container) |
 | 409 | Conflict — already running, or state prevents this operation |
-| 429 | Rate limit exceeded (per-user sliding window on `/api/query`) |
+| 429 | Rate limit exceeded (per-user **per-replica** sliding window on `/api/query`) |
 | 500 | Server misconfiguration (missing env var, invalid config) |
 | 501 | Required env var not configured (`RETRIEVAL_SERVICE_URL`) |
 | 503 | Downstream service unreachable (Cosmos, retrieval service) |
@@ -602,7 +602,7 @@ Retrieval service (FastAPI) errors follow FastAPI's default:
 | `invalid_container` | `GET /inspect`, `DELETE /purge` | Container name not in allowlist |
 | `invalid_json` | `DELETE /purge` | Body is not valid JSON |
 | `question_required` | `POST /query` | Missing or empty `question` field |
-| `rate_limit_exceeded` | `POST /query` | Per-user RPM exceeded |
+| `rate_limit_exceeded` | `POST /query` | Per-user **per-replica** RPM exceeded |
 | `cosmos_query_failed` | `GET /inspect` | Cosmos SDK exception |
 | `purge_failed` | `DELETE /purge` | Cosmos delete error |
 | `service_unavailable` | `POST /query` | Retrieval service timeout or network error |

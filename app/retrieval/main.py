@@ -229,7 +229,7 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
     start = time.perf_counter()
     log = logger.bind(request_id=request_id)
 
-    principal = _resolve_principal(request)
+    principal = await asyncio.to_thread(_resolve_principal, request)
 
     if not _rate_limiter.is_allowed(principal.user_id):
         raise HTTPException(status_code=429, detail="rate_limit_exceeded")

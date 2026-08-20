@@ -595,7 +595,7 @@ Per [MS Learn - AKS Pod Security Best Practices](https://learn.microsoft.com/azu
 | UC-24 | Three retrieval modes | Hybrid (RRF of vector + full-text), vector-only (DiskANN), full-text-only (BM25) |
 | UC-25 | Multi-instance Cosmos fan-out | Query multiple Cosmos instances (one per source) in parallel via `CosmosRegistry` |
 | UC-26 | Prompt injection defense | Hardened system prompt + regex chunk sanitization + `[S#]` input segmentation |
-| UC-27 | Per-user rate limiting | Sliding-window limiter (default 30 RPM per user), returns HTTP 429 |
+| UC-27 | Per-user rate limiting | Sliding-window limiter (default 30 RPM per user **per replica**), returns HTTP 429. Effective ceiling ≈ `RATE_LIMIT_RPM × replicaCount` (see L8). |
 | UC-28 | Citations with page references | Each `[S#]` marker maps to `source_url#page=N` with source name |
 | UC-29 | Multi-turn conversation | Conversation history (up to 10 messages) passed to the query planner for context-aware decomposition |
 | UC-30 | Query proxy | Function App forwards `/api/query` to the internal retrieval service with EasyAuth header passthrough |
@@ -620,7 +620,7 @@ Per [MS Learn - AKS Pod Security Best Practices](https://learn.microsoft.com/azu
 | L5 | **No streaming response** — Query API returns the complete answer as a single JSON payload. No SSE or chunked transfer for progressive token delivery. | Higher perceived latency for long answers | Switch to `stream=True` on the OpenAI call and yield SSE events from FastAPI |
 | L6 | **No conversation persistence** — History is passed per-request by the caller. The system does not store or manage sessions. | Caller must manage and re-send history on every request | Add a session store (Cosmos TTL container or Redis) keyed by `request_id` |
 | L7 | **No user feedback loop** — No thumbs up/down, relevance scoring, or correction mechanism. | Cannot measure or improve retrieval quality from real usage | Add a `/api/feedback` endpoint writing to `service-audit`; use for evaluation datasets |
-| L8 | **In-memory rate limiter** — Not shared across ACA/AKS replicas. Scaling to N replicas multiplies the effective limit by N. | Rate limit enforcement is approximate under scale-out | Replace with a shared counter (Redis or Cosmos atomic increment) |
+| L8 | **In-memory rate limiter** — Not shared across ACA/AKS replicas. At `maxReplicas=5`, the effective per-user ceiling is 5 × `RATE_LIMIT_RPM`. | Not a hard DoS control at scale-out | Enforce upstream via Azure Front Door + WAF rate-limit rule, or replace with a shared counter (Redis / Cosmos atomic increment) |
 | L9 | **No front-end application** — API-only. No web UI, Teams bot, or Copilot plugin. | End users need a separate client to interact with the system | Build a React SPA or Teams bot that calls `/api/query` |
 | L10 | **No CI/CD pipeline** — Build and deploy are manual (`azd deploy`, `az acr build`). No GitHub Actions or Azure Pipelines. | Manual deployments are error-prone and slow | Add a GitHub Actions workflow for build → test → deploy |
 | L11 | **No automated evaluation** — Evaluation schemas exist but no runner, ground-truth dataset, or quality metrics pipeline. | Cannot systematically measure answer quality or detect regressions | Implement the evaluation runner using the existing `evaluation/schemas/` |

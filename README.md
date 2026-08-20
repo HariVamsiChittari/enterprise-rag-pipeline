@@ -85,7 +85,7 @@ All settings are environment variables:
 | `GENERATION_TIMEOUT_SECONDS` | No | `15.0` | Answer generation LLM call timeout |
 | `AGENT_TIMEOUT_SECONDS` | No | `8.0` | Agentic path timeout before fallback |
 | `AGENT_MAX_ITERATIONS` | No | `5` | Max LLM reasoning roundtrips per agentic request |
-| `RATE_LIMIT_RPM` | No | `30` | Per-user requests per minute before HTTP 429 |
+| `RATE_LIMIT_RPM` | No | `30` | Per-user requests per minute **per replica** before HTTP 429 (effective ceiling ≈ value × replica count; not a hard DoS control at scale-out — use Front Door WAF for enforcement) |
 | `QUERY_PROXY_TIMEOUT_SECONDS` | No | `30.0` | Function App → retrieval service proxy timeout |
 
 ## Endpoints
@@ -156,7 +156,7 @@ Full-sync skips unchanged files automatically (same eTag). Use `retry-failed` fo
 - All Azure access via Managed Identity (no secrets in code)
 - Graph access via certificate stored in Key Vault
 - Prompt injection defense: hardened system prompt + chunk sanitization (strips injection prefixes) + input segmentation
-- Per-user rate limiting (default 30 RPM, configurable via `RATE_LIMIT_RPM`)
+- Per-user rate limiting **per replica** (default 30 RPM, configurable via `RATE_LIMIT_RPM`; effective ceiling ≈ value × replica count — not a hard DoS control at scale-out)
 - Thread-safe concurrent retrieval with `threading.Lock` on shared state
 - EasyAuth with Entra ID: tenant-locked, audience-validated; production should set `allowedApplications` to restrict calling clients
 - AKS pods: Pod Security Standards (Restricted) — `runAsNonRoot`, `readOnlyRootFilesystem`, `drop ALL` capabilities

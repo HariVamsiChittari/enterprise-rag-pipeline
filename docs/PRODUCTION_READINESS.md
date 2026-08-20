@@ -119,9 +119,9 @@ az rest --method PUT \
 
 Per [MS Learn](https://learn.microsoft.com/azure/app-service/configure-authentication-provider-aad#authorize-requests): only tokens from the named client are accepted.
 
-### Per-User Rate Limiting
+### Per-User, Per-Replica Rate Limiting
 
-The retrieval service enforces a sliding-window rate limiter (`RATE_LIMIT_RPM`, default 30 requests/minute per user). Returns HTTP 429 when exceeded. For production with high concurrency, consider adding Azure API Management or Azure Front Door WAF rules upstream.
+The retrieval service enforces a sliding-window rate limiter (`RATE_LIMIT_RPM`, default 30 requests/minute per user **per replica**). Returns HTTP 429 when exceeded. **Effective ceiling** ≈ `RATE_LIMIT_RPM × replicaCount` — at `maxReplicas=5`, a single user can reach ~150 RPM before any replica rejects. This is **not a hard DoS control** at scale-out; enforce upstream via Azure Front Door + WAF rate-limit rules, Azure API Management, or replace the in-memory limiter with a shared counter (Redis / Cosmos atomic increment).
 
 ### Thread Safety
 
