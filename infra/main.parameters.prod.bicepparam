@@ -1,3 +1,6 @@
+// STATUS: Scaffolding only. Not currently deployed against any environment.
+// Before using this file for a real production deployment, apply the
+// hardening checklist in docs/PRODUCTION_READINESS.md.
 using './main.bicep'
 
 param environmentName = 'prod'
@@ -17,6 +20,11 @@ param sharePointCertificateSecretName = readEnvironmentVariable(
 )
 param adminApiClientId = readEnvironmentVariable('ADMIN_API_CLIENT_ID')
 param webhookClientState = readEnvironmentVariable('WEBHOOK_CLIENT_STATE')
+// Restrict which Entra apps can call the API. Populate with the frontend client
+// ID(s) for a hardened deployment. Leave empty to allow any tenant app.
+param allowedApplicationClientIds = [
+  readEnvironmentVariable('FRONTEND_CLIENT_ID', '')
+]
 param graphServicePrincipalId = readEnvironmentVariable('GRAPH_SERVICE_PRINCIPAL_ID')
 param cosmosDbMode = 'provisioned'
 param deployAks = true

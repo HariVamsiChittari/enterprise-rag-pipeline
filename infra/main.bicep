@@ -47,6 +47,9 @@ param adminApiClientId string
 @description('Shared secret for Microsoft Graph webhook clientState validation')
 param webhookClientState string
 
+@description('Entra app client IDs allowed to call the Function App API. Empty = any tenant app (dev default). Set the frontend client ID here to restrict callers in hardened deployments.')
+param allowedApplicationClientIds array = []
+
 @description('Microsoft Graph service principal object ID (tenant-specific, from az ad sp show --id 00000003-0000-0000-c000-000000000000 --query id)')
 param graphServicePrincipalId string
 
@@ -119,7 +122,11 @@ module keyVault './modules/keyvault.bicep' = {
   params: {
     keyVaultName: take('${prefix}-kv2-${suffix}', 24)
     location: location
-    enablePurgeProtection: false
+    // Purge protection uses the module's secure default (true). Once enabled it
+    // cannot be disabled; a deleted vault must complete soft-delete retention
+    // before the name is reusable. If a fast dev teardown is required, set
+    // softDeleteRetentionDays: 7 on the keyvault module instead of disabling
+    // purge protection.
     tags: tags
   }
 }
@@ -257,6 +264,7 @@ module functions './modules/functions.bicep' = {
     sharePointCertificateSecretName: sharePointCertificateSecretName
     adminApiClientId: adminApiClientId
     webhookClientState: webhookClientState
+    allowedApplicationClientIds: allowedApplicationClientIds
     retrievalServiceUrl: deployAks ? '' : aca.outputs.internalUrl
     tags: tags
   }

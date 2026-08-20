@@ -112,6 +112,9 @@ param subscriptionRenewSchedule string = '0 0 2 * * *'
 @description('SharePoint site URL for site group ACL resolution via REST API (empty disables site group resolution)')
 param sharePointSiteUrl string = ''
 
+@description('Entra app client IDs allowed to call the API. Empty array = any tenant app (dev default). Populate to restrict which callers can obtain tokens for this audience.')
+param allowedApplicationClientIds array = []
+
 @description('Resource tags')
 param tags object = {}
 
@@ -399,6 +402,7 @@ resource authSettings 'Microsoft.Web/sites/config@2025-03-01' = {
             'api://${adminApiClientId}'
           ]
           defaultAuthorizationPolicy: {
+            allowedApplications: allowedApplicationClientIds
             allowedPrincipals: {}
           }
         }
