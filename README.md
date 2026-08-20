@@ -80,7 +80,7 @@ All settings are environment variables:
 | `MANAGED_IDENTITY_CLIENT_ID` | Yes | — | User-assigned MI client ID |
 | `MAX_EVIDENCE_CHUNKS` | No | `5` | Default top-K chunks retrieved when `top_k` not in request |
 | `INCLUDE_CITATIONS` | No | `true` | When `false`, response returns empty citations array |
-| `ACL_ENABLED` | No | `true` | When `false`, skip ACL filtering (dev only) |
+| `ACL_ENABLED` | No | `true` | When `false`, skip ACL filtering — all authorized callers see all documents |
 | `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Cosmos retrieval timeout per query |
 | `GENERATION_TIMEOUT_SECONDS` | No | `3.0` | Answer generation LLM call timeout |
 | `AGENT_TIMEOUT_SECONDS` | No | `8.0` | Agentic path timeout before fallback |
