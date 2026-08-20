@@ -404,6 +404,42 @@ The function app name is in the deployment output or: `az functionapp list --res
 
 The retrieval service can be deployed to either ACA (dev) or AKS (prod). Set `deployAks = true` in Bicep parameters for AKS.
 
+#### Env Var Flow: How Retrieval Configuration Reaches the Pod
+
+**Single source of truth**: [infra/modules/retrieval-config.bicep](../infra/modules/retrieval-config.bicep) defines all 22 retrieval env vars in one place. Both ACA and AKS consume it — the delivery mechanism differs.
+
+| Step | ACA path | AKS path |
+|---|---|---|
+| 1. Bicep computes values | Same file, same values | Same file, same values |
+| 2. Delivered to workload as | ACA `containerApp.properties.template.containers[0].env` (auto-set by Bicep) | Bicep deployment output `retrievalConfigMap` (JSON object) |
+| 3. Loaded by workload as | Container environment variables (Azure Container Apps native) | Kubernetes ConfigMap → pod via `envFrom: configMapRef` |
+| 4. Manual step required? | **No** — one `azd provision` sets everything | **Yes** — run [scripts/generate-k8s-configmap.ps1](../scripts/generate-k8s-configmap.ps1) to regenerate `configmap.yaml` from Bicep outputs before `kubectl apply` |
+
+**Key insight**: Neither ACA nor AKS requires setting env vars manually. For AKS, the "manual step" is a single command that reads Bicep outputs and writes `configmap.yaml`.
+
+**Zero secrets in either path**: All auth (Cosmos, OpenAI, Graph, App Insights) uses Managed Identity. The MI client ID travels through the config, not a secret. AKS additionally uses Workload Identity — the K8s ServiceAccount is federated to the MI, so there are no kubeconfig secrets to manage.
+
+```mermaid
+flowchart TB
+    Bicep["retrieval-config.bicep
+    (22 env vars defined once)"]
+    
+    Bicep -->|ACA path| A1["Bicep provisions ACA
+    with env: [] block populated"]
+    A1 --> A2["ACA container reads env vars
+    at runtime (native)"]
+    
+    Bicep -->|AKS path| K1["Bicep exposes as
+    retrievalConfigMap output"]
+    K1 -->|generate-k8s-configmap.ps1| K2["configmap.yaml regenerated
+    (PLACEHOLDERs replaced)"]
+    K2 -->|kubectl apply -k| K3["ConfigMap in cluster"]
+    K3 -->|envFrom in deployment.yaml| K4["Pod reads env vars
+    at startup"]
+```
+
+### 2.4.1 Deploy the Retrieval Service
+
 #### Option A: ACA Deployment (default)
 
 ```powershell
