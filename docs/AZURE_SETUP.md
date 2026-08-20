@@ -423,12 +423,12 @@ The retrieval service can be deployed to either ACA (dev) or AKS (prod). Set `de
 flowchart TB
     Bicep["retrieval-config.bicep
     (22 env vars defined once)"]
-    
+
     Bicep -->|ACA path| A1["Bicep provisions ACA
     with env: [] block populated"]
     A1 --> A2["ACA container reads env vars
     at runtime (native)"]
-    
+
     Bicep -->|AKS path| K1["Bicep exposes as
     retrievalConfigMap output"]
     K1 -->|generate-k8s-configmap.ps1| K2["configmap.yaml regenerated
@@ -811,9 +811,134 @@ Invoke-WebRequest -Uri "$base/admin/functions/<timer-name>" -Method POST `
 
 ### Environment Variable Management
 
+#### Where Values Come From (Source of Truth)
+
+Env var values fall into five categories. This section shows exactly how to obtain each one for a fresh deployment.
+
+**Category 1: You decide (invent it)**
+
+| Env Var | How to generate |
+|---|---|
+| `INGESTION_SOURCE_ID` | Pick a stable slug (e.g., `sharepoint-policies`). This becomes part of Cosmos partition keys and Durable orchestration instance IDs — do not change after data exists. |
+| `WEBHOOK_CLIENT_STATE` | Generate a 32-char random secret: `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+
+> **Migration note**: If you are moving an **existing** deployment to a new environment (rehydrating from a Cosmos backup), keep the original `INGESTION_SOURCE_ID` value — changing it would orphan every existing row (partition keys embed it). Verify the value in the current deployment first: `az functionapp config appsettings list --name <func-app> --resource-group <rg> --query "[?name=='INGESTION_SOURCE_ID'].value" -o tsv`.
+
+**Category 2: From Entra ID (Azure Portal or `az` CLI)**
+
+| Env Var | Where to get it |
+|---|---|
+| `SHAREPOINT_TENANT_ID` | `az account show --query tenantId -o tsv` |
+| `SHAREPOINT_APP_CLIENT_ID` | After creating the Entra app registration in §1.2: `az ad app list --display-name "<app-name>" --query "[0].appId" -o tsv` |
+| `ADMIN_API_CLIENT_ID` | After creating the EasyAuth app registration in §1.4: `az ad app list --display-name "<easyauth-app-name>" --query "[0].appId" -o tsv` |
+| `GRAPH_SERVICE_PRINCIPAL_ID` | `az ad sp list --filter "appId eq '00000003-0000-0000-c000-000000000000'" --query "[0].id" -o tsv` (Graph is always this well-known appId) |
+
+**Category 3: From Microsoft Graph (SharePoint metadata)**
+
+| Env Var | Where to get it |
+|---|---|
+| `SHAREPOINT_SITE_URL` | You know this from your SharePoint tenant. Example: `https://<tenant>.sharepoint.com/sites/<site-name>` |
+| `SHAREPOINT_ASSIGNED_DRIVE_ID` | Query Graph after cert auth is set up: **see full command below** |
+
+Getting the SharePoint drive ID (requires cert auth already working — do this after §1.6):
+
+> **Permission note**: The command below uses your **signed-in az CLI user's** delegated token, not the app cert. Your user account must have at least read access to the SharePoint site. If you get `403 accessDenied`, either grant yourself site access, or run the equivalent Graph call using the app cert (see [ingestion/graph.py](../app/ingestion/graph.py) `_build_graph_client` for the pattern).
+
+```powershell
+# Resolve site ID from URL
+$siteHostname = "<tenant>.sharepoint.com"
+$sitePath = "/sites/<site-name>"
+$token = (az account get-access-token --resource "https://graph.microsoft.com" --query accessToken -o tsv)
+
+# Get site ID
+$site = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/${siteHostname}:${sitePath}" `
+  -Headers @{Authorization = "Bearer $token"}
+Write-Host "Site ID: $($site.id)"
+
+# List all document libraries (drives) in the site
+$drives = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/drives" `
+  -Headers @{Authorization = "Bearer $token"}
+$drives.value | Select-Object name, id, webUrl | Format-Table
+
+# Pick the one you want and set:
+# SHAREPOINT_ASSIGNED_DRIVE_ID = <the drive id you picked>
+```
+
+**Category 4: From Bicep outputs (after `azd provision`)**
+
+These are auto-populated by Bicep — you rarely need to fetch them manually because `azd provision` already wires them into the Function App. Fetch them only for debugging or if setting on a separately-deployed workload.
+
+> **Env var name differences between ingestion and retrieval**: The two services use **different names** for the same underlying value — don't copy names between them:
+>
+> | Ingestion (Function App) | Retrieval (ACA / AKS) | Same value? |
+> |---|---|---|
+> | `COSMOS_DATABASE_NAME` | `COSMOS_DATABASE` | Yes |
+> | `OPENAI_ENDPOINT` | `AZURE_OPENAI_ENDPOINT` | Yes |
+> | `AZURE_CLIENT_ID` | `MANAGED_IDENTITY_CLIENT_ID` | Yes |
+> | `SHAREPOINT_TENANT_ID` | `TENANT_ID` | Yes |
+> | `OPENAI_CHAT_DEPLOYMENT_NAME` | `CHAT_DEPLOYMENT` | Yes |
+>
+> The fetch commands below produce the value; assign it to the right name based on which workload you're configuring.
+
+| Env Var | Fetch command |
+|---|---|
+| `KEY_VAULT_URI` | `az keyvault show --name <kv-name> --query properties.vaultUri -o tsv` |
+| `COSMOS_ENDPOINT` | `az cosmosdb show --name <cosmos-name> --resource-group <rg> --query documentEndpoint -o tsv` |
+| `COSMOS_DATABASE_NAME` | Look up in Bicep (`rag-db` by default), or `az cosmosdb sql database list --account-name <cosmos-name> --resource-group <rg> --query "[].name" -o tsv` |
+| `OPENAI_ENDPOINT` / `AZURE_OPENAI_ENDPOINT` | `az cognitiveservices account show --name <openai-name> --resource-group <openai-rg> --query properties.endpoint -o tsv` |
+| `DOCUMENT_INTELLIGENCE_ENDPOINT` | `az cognitiveservices account show --name <di-name> --resource-group <rg> --query properties.endpoint -o tsv` |
+| `AZURE_LANGUAGE_ENDPOINT` | `az cognitiveservices account show --name <language-name> --resource-group <rg> --query properties.endpoint -o tsv` |
+| `AZURE_CLIENT_ID` / `MANAGED_IDENTITY_CLIENT_ID` | `az identity show --name <mi-name> --resource-group <rg> --query clientId -o tsv` |
+| `CHAT_DEPLOYMENT` / `OPENAI_CHAT_DEPLOYMENT_NAME` | You chose this when creating the OpenAI deployment: `az cognitiveservices account deployment list --name <openai-name> --resource-group <openai-rg> --query "[].name" -o tsv` |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | `az monitor app-insights component show --app <ai-name> --resource-group <rg> --query connectionString -o tsv` |
+| `RETRIEVAL_SERVICE_URL` (ACA) | `az containerapp show --name <aca-name> --resource-group <rg> --query "properties.configuration.ingress.fqdn" -o tsv` then prefix with `https://` |
+| `RETRIEVAL_SERVICE_URL` (AKS) | Internal cluster DNS: `http://retrieval-agent.default.svc.cluster.local` (K8s Service exposes port 80 → pod port 8080). **Note**: the Function App query proxy currently enforces `https://` (see [function_app.py L287](../app/function_app.py)). For AKS, either add a TLS ingress in front of the service (`https://retrieval-agent.<ns>.svc.cluster.local`) or relax the check — decision pending. |
+
+**Category 5: Computed at deploy time**
+
+| Env Var | How to compute |
+|---|---|
+| `FUNCTION_PUBLIC_BASE_URL` | `https://<function-app-name>.azurewebsites.net` — always this pattern; used by `subscription_renew_timer` to build webhook URLs |
+| `TASKHUB_NAME` | Bicep sets to `${INGESTION_SOURCE_ID}-sync` truncated to 45 chars — you don't set this manually |
+| `DURABLE_TASK_SCHEDULER_CONNECTION_STRING` | Bicep constructs from DTS endpoint + MI — you don't set this manually |
+
+#### Bulk-Fetch After Provisioning (Recommended)
+
+Instead of running the commands above one by one, read all Bicep outputs at once:
+
+```powershell
+az deployment group show --resource-group <rg> --name main `
+  --query "properties.outputs" -o json | ConvertFrom-Json
+```
+
+This shows every value Bicep produced — endpoints, resource names, identity IDs, and the `retrievalConfigMap` object used for AKS.
+
+#### One-Command Rebuild of All Env Vars
+
+Once you've deployed once, you can regenerate any missing app settings by re-reading Bicep outputs:
+
+```powershell
+$outputs = az deployment group show --resource-group <rg> --name main `
+  --query "properties.outputs" -o json | ConvertFrom-Json
+
+# Example: sync a value that got manually removed
+az functionapp config appsettings set --name <func-app> --resource-group <rg> `
+  --settings "COSMOS_ENDPOINT=$($outputs.cosmosEndpoint.value)"
+```
+
+For AKS, the [scripts/generate-k8s-configmap.ps1](../scripts/generate-k8s-configmap.ps1) does this automatically for all retrieval env vars in one shot.
+
+### Inspecting Env Vars on Deployed Workloads
+
+#### Function App (ingestion)
+
 ```powershell
 # List all settings
 az functionapp config appsettings list --name <func-app> --resource-group rg-rag-project -o table
+
+# Get a single setting's value
+az functionapp config appsettings list --name <func-app> --resource-group rg-rag-project `
+  --query "[?name=='WEBHOOK_CLIENT_STATE'].value" -o tsv
 
 # Set a single setting
 az functionapp config appsettings set --name <func-app> --resource-group rg-rag-project `
@@ -826,7 +951,84 @@ az functionapp config appsettings set --name <func-app> --resource-group rg-rag-
 # Delete a setting
 az functionapp config appsettings delete --name <func-app> --resource-group rg-rag-project `
   --setting-names "KEY"
+
+# Restart to pick up changes
+az functionapp restart --name <func-app> --resource-group rg-rag-project
 ```
+
+#### Azure Container Apps (retrieval — dev)
+
+```powershell
+# List all env vars for the active revision (JSON)
+az containerapp show --name <aca-name> --resource-group rg-rag-project `
+  --query "properties.template.containers[0].env" -o json
+
+# List as a compact table
+az containerapp show --name <aca-name> --resource-group rg-rag-project `
+  --query "properties.template.containers[0].env[].{name:name,value:value}" -o table
+
+# Get a single value
+az containerapp show --name <aca-name> --resource-group rg-rag-project `
+  --query "properties.template.containers[0].env[?name=='COSMOS_ENDPOINT'].value" -o tsv
+
+# Update env vars (creates a new revision automatically)
+az containerapp update --name <aca-name> --resource-group rg-rag-project `
+  --set-env-vars "KEY1=value1" "KEY2=value2"
+
+# Remove an env var
+az containerapp update --name <aca-name> --resource-group rg-rag-project `
+  --remove-env-vars "KEY"
+```
+
+> Note: In this project, ACA env vars are populated from Bicep at deploy time. Prefer updating [retrieval-config.bicep](../infra/modules/retrieval-config.bicep) and running `azd provision` instead of setting values imperatively — otherwise your next provision will overwrite changes.
+
+#### AKS (retrieval — prod)
+
+Retrieval env vars live in a Kubernetes ConfigMap named `retrieval-config`, loaded into the pod via `envFrom` in [deployment.yaml](../app/retrieval/kubernetes/deployment.yaml).
+
+```powershell
+# Get AKS credentials (once per machine/session)
+az aks get-credentials --resource-group rg-rag-project --name <aks-cluster-name> --overwrite-existing
+
+# List all keys in the ConfigMap
+kubectl get configmap retrieval-config -o jsonpath='{.data}' | ConvertFrom-Json
+
+# View the full ConfigMap as YAML
+kubectl get configmap retrieval-config -o yaml
+
+# Get a single value
+kubectl get configmap retrieval-config -o jsonpath='{.data.COSMOS_ENDPOINT}'
+
+# Verify what env vars the pod actually sees (from inside the container)
+kubectl exec -it deployment/retrieval-agent -- env | sort
+
+# Verify a single env var inside the pod
+kubectl exec deployment/retrieval-agent -- printenv COSMOS_ENDPOINT
+
+# Update the ConfigMap (imperative — for quick tests only)
+kubectl set env deployment/retrieval-agent --from=configmap/retrieval-config
+
+# Regenerate ConfigMap from Bicep outputs (recommended for prod)
+./scripts/generate-k8s-configmap.ps1 -ResourceGroup rg-rag-project
+kubectl apply -f app/retrieval/kubernetes/configmap.yaml
+
+# Restart pods to pick up ConfigMap changes
+kubectl rollout restart deployment/retrieval-agent
+kubectl rollout status deployment/retrieval-agent --timeout=2m
+```
+
+> Note: Similar to ACA, retrieval env vars are owned by [retrieval-config.bicep](../infra/modules/retrieval-config.bicep). The recommended flow is: edit Bicep → `azd provision` → regenerate ConfigMap → `kubectl apply`. See §2.4 Env Var Flow for the full pipeline.
+
+#### Comparison Table
+
+| Operation | Function App | ACA | AKS |
+|---|---|---|---|
+| List all env vars | `az functionapp config appsettings list` | `az containerapp show ... --query "properties.template.containers[0].env"` | `kubectl get configmap retrieval-config -o yaml` |
+| Get one value | `... --query "[?name=='X'].value" -o tsv` | `... --query "...env[?name=='X'].value" -o tsv` | `kubectl get configmap retrieval-config -o jsonpath='{.data.X}'` |
+| See from inside process | Restart + tail logs | `az containerapp exec ... -- env` | `kubectl exec ... -- env` |
+| Persistent change | `appsettings set` (or Bicep) | Bicep + `azd provision` (or `--set-env-vars`) | Bicep → `generate-k8s-configmap.ps1` → `kubectl apply` → `rollout restart` |
+| Ephemeral test | `appsettings set` | `--set-env-vars` (new revision) | `kubectl set env` |
+| Apply time | Automatic (Function App auto-reloads) | Automatic (new ACA revision) | Manual `rollout restart` |
 
 Key settings to know:
 
