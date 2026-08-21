@@ -239,12 +239,21 @@ $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-doc
 ```powershell
 $outDir = "./data"
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
-@("ingestion-runs","source-documents","search-chunks","service-audit") | ForEach-Object {
-  $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=$_&limit=500" -Method GET -Headers $h -UseBasicParsing
-  $r.Content | ConvertFrom-Json | ConvertTo-Json -Depth 10 > "$outDir/$_.json"
-  Write-Host "$_ : $(($r.Content | ConvertFrom-Json).count) rows exported"
+foreach ($c in @("ingestion-runs","source-documents","search-chunks","service-audit")) {
+  $r = Invoke-RestMethod -Uri "$baseUrl/api/ingestion/inspect?container=$c&limit=500" -Headers $h -TimeoutSec 60
+  $r | ConvertTo-Json -Depth 10 | Out-File "$outDir/$c.json" -Encoding utf8
+  Write-Host "$c : $($r.count) rows exported"
 }
 ```
+
+**Known limit (verified):** `GET /api/ingestion/inspect` caps `limit` at 200 rows server-side
+([app/function_app.py](../app/function_app.py) — `limit = min(int(req.params.get("limit", "10")), 200)`),
+with no pagination/continuation token. Requesting `limit=500` above still returns at most 200
+rows per container. This is fine for `ingestion-runs` and `source-documents` (small containers),
+but `search-chunks` and `service-audit` will only export a **200-row sample**, not the full
+container, once the corpus grows past ~200 chunks or audit records. Treat the exported
+`search-chunks.json`/`service-audit.json` as a sample for spot-checks (e.g. Step 16's Level 3
+chunk integrity check), not a full data dump.
 
 ### Step 16: 4-Level Cross-File Validation
 
@@ -305,3 +314,80 @@ $docs | ForEach-Object {
     Write-Host "$(if ($ok) {'PASS'} else {'FAIL'}) | $($gates -join ' | ') | $name"
 }
 ```
+
+---
+
+## Live Change Tracking (Add / Update / Delete)
+
+Use this after uploading, editing, or deleting a file in SharePoint to trace it through the
+whole pipeline: webhook → delta-sync → extraction → chunks. Set `$fileFilter` to a distinct
+substring of the filename you changed, then run each step in order. Uses `$h` and `$baseUrl`
+from Step 0.
+
+### Step 18: Set the target filename
+
+```powershell
+$fileFilter = "<distinct-substring-of-filename>"   # e.g. "bfl-abac-policy-v1"
+```
+
+### Step 19: Confirm the webhook fired
+
+```powershell
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=service-audit&limit=500" -Method GET -Headers $h -UseBasicParsing
+$audit = ($r.Content | ConvertFrom-Json).rows
+$audit | Where-Object { $_.operation -eq "webhook_received" -or $_.sourceName -match $fileFilter } |
+  Sort-Object recordedAt -Descending | Select-Object -First 10 recordedAt, operation, sourceName, action |
+  Format-Table -AutoSize
+```
+Expect a recent `webhook_received` row with `action: delta_sync_triggered` at/after the time you
+made the change in SharePoint. If nothing appears within ~1 minute, the subscription may have
+expired — check Step 13.
+
+### Step 20: Watch the delta-sync orchestration run
+
+```powershell
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status?instanceId=delta-sync-sharepoint-drive" -Method GET -Headers $h -UseBasicParsing
+($r.Content | ConvertFrom-Json) | ConvertTo-Json -Depth 6
+```
+Re-run this until `runtimeStatus` is `Completed`. The `output` block reports
+`createdOrUpdated`, `deleted`, `failed`, and `itemsSeen` counts for this tick.
+
+### Step 21: Check the document's ingestion record
+
+```powershell
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=50" -Method GET -Headers $h -UseBasicParsing
+($r.Content | ConvertFrom-Json).rows | Where-Object { $_.sourceName -match $fileFilter } |
+  Select-Object sourceName, status, stage, attemptCount, pageCount, expectedChunkCount, writtenChunkCount, error, retiredReason, discoveredAt, updatedAt |
+  Format-List
+```
+- **Add/update**: expect one row with `status: "ready"`, `error: $null`,
+  `expectedChunkCount == writtenChunkCount`, and `pageCount` matching the real page count of the
+  file (not capped at 2 — see [Troubleshooting](TROUBLESHOOTING.md#2-ingested-documents-show-pagecount-2-regardless-of-actual-page-count-no-error-recorded)
+  if it is).
+- **Delete**: expect the prior "ready" version's row to flip to `status: "retired"` with
+  `retiredReason` populated (e.g. `"deleted_upstream"`).
+- **Stuck at `processing` with `error: $null`**: see
+  [Troubleshooting #1](TROUBLESHOOTING.md#1-full-sync-completes-with-failed--0-andor-runstatus-finalization_failed).
+
+### Step 22: Confirm chunks were written (or removed, for deletes)
+
+```powershell
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=search-chunks&limit=200" -Method GET -Headers $h -UseBasicParsing
+$chunkMatches = ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.sourceName -match $fileFilter }
+Write-Host "Chunks found for '$fileFilter' in this sample: $($chunkMatches.Count)"
+$chunkMatches | Select-Object chunkIndex, pageStart, pageEnd, sectionPath | Format-Table -AutoSize
+```
+Note: `limit` is capped at 200 rows with no pagination. Once the corpus has hundreds/thousands
+of chunks, a plain scan may not surface this file's rows in the sample — treat the
+`source-documents` record from Step 21 (`expectedChunkCount == writtenChunkCount`) as the
+authoritative signal, and use this step as a spot-check when the corpus is small.
+
+### Step 23: Confirm retrieval reflects the change end-to-end
+
+```powershell
+$body = "{`"question`": `"<a question whose answer only exists in the new/updated content>`"}"
+$r = Invoke-WebRequest -Uri "$baseUrl/api/query" -Method POST -Headers $h -Body $body -UseBasicParsing
+($r.Content | ConvertFrom-Json) | ConvertTo-Json -Depth 5
+```
+For an add/update, expect a citation pointing to `$fileFilter` in the response. For a delete,
+expect the file to no longer appear in citations for questions it previously answered.

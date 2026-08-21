@@ -52,7 +52,8 @@ param agentTimeoutSeconds string = '20.0'
 param agentMaxIterations string = '5'
 
 @description('OpenAI API version used for agent/tool-call requests')
-param agentOpenAiApiVersion string = '2025-04-01-preview'
+// Azure OpenAI v1 Responses API only supports "preview" today; "latest" (GA) isn't released yet.
+param agentOpenAiApiVersion string = 'preview'
 
 @description('Maximum evidence chunks returned per retrieval call')
 param maxEvidenceChunks string = '5'

@@ -55,7 +55,9 @@ def load_retrieval_config() -> RetrievalConfig:
         generation_timeout_seconds=float(os.getenv("GENERATION_TIMEOUT_SECONDS", "15.0")),
         agent_timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "8.0")),
         agent_max_iterations=int(os.getenv("AGENT_MAX_ITERATIONS", "5")),
-        agent_api_version=os.getenv("AGENT_OPENAI_API_VERSION", "2025-04-01-preview"),
+        # Azure OpenAI v1 Responses API only supports "preview" today; "latest" (GA) isn't
+        # released yet. Override via AGENT_OPENAI_API_VERSION once Microsoft ships "latest".
+        agent_api_version=os.getenv("AGENT_OPENAI_API_VERSION", "preview"),
         max_evidence_chunks=int(os.getenv("MAX_EVIDENCE_CHUNKS", "5")),
         max_planned_queries=int(os.getenv("MAX_PLANNED_QUERIES", "3")),
         graph_group_timeout_seconds=float(os.getenv("GRAPH_GROUP_TIMEOUT_SECONDS", "10.0")),

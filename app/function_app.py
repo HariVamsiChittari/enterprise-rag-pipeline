@@ -496,7 +496,18 @@ def full_sync_orchestrator(context: df.DurableOrchestrationContext):
         deadline = context.current_utc_datetime + timedelta(minutes=WAVE_TIMEOUT_MINUTES)
         timer = context.create_timer(deadline)
         wave_task = context.task_all(tasks)
-        winner = yield context.task_any([wave_task, timer])
+        try:
+            winner = yield context.task_any([wave_task, timer])
+        except Exception:
+            # One or more activities exhausted all retries (e.g. sustained 429s).
+            # task_all fails fast in Python, so sweep this run for any docs still
+            # stuck non-terminal rather than guessing which ones completed.
+            timer.cancel()
+            swept = yield context.call_activity(
+                "fail_wave_documents_activity", {"runId": run_id, "reason": "wave_retry_exhausted"},
+            )
+            total_failed += swept.get("failedCount", len(wave))
+            continue
         if winner == timer:
             total_failed += len(wave)
         else:
@@ -580,7 +591,15 @@ def retry_failed_orchestrator(context: df.DurableOrchestrationContext):
         )
         deadline = context.current_utc_datetime + timedelta(minutes=WAVE_TIMEOUT_MINUTES)
         timer = context.create_timer(deadline)
-        winner = yield context.task_any([task, timer])
+        try:
+            winner = yield context.task_any([task, timer])
+        except Exception:
+            timer.cancel()
+            swept = yield context.call_activity(
+                "fail_wave_documents_activity", {"runId": run_id, "reason": "retry_exhausted"},
+            )
+            failed += max(swept.get("failedCount", 0), 1)
+            continue
         if winner == timer:
             failed += 1
         else:
@@ -664,8 +683,29 @@ def process_document_activity(payload: dict) -> dict:
             "error": outcome.error.code if outcome.error else None,
         }
     except Exception as error:
+        from ingestion.models import safe_error_from_exception
         logger.exception("process_document_activity failed")
+        # Retryable errors (e.g. OpenAI 429) must propagate so call_activity_with_retry
+        # actually retries; only non-retryable/unexpected errors become a terminal result here.
+        if safe_error_from_exception(error, "activity").retryable:
+            raise
         return {"documentId": document_ref.get("documentId", ""), "status": "failed", "error": str(error)}
+
+
+@app.activity_trigger(input_name="payload")
+def fail_wave_documents_activity(payload: dict) -> dict:
+    """Force-fail any discovered/processing docs for this run after retry exhaustion."""
+    from config import load_config
+    try:
+        config = load_config()
+        repository = _build_repository(config)
+        failed_count = repository.fail_nonterminal_documents(
+            config.source_id, payload["runId"], payload.get("reason", "wave_retry_exhausted"),
+        )
+        return {"failedCount": failed_count}
+    except Exception as error:
+        logger.exception("fail_wave_documents_activity failed")
+        return {"error": str(error), "failedCount": 0}
 
 
 @app.activity_trigger(input_name="payload")

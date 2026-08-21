@@ -21,8 +21,8 @@ param graphServicePrincipalId = readEnvironmentVariable('GRAPH_SERVICE_PRINCIPAL
 param cosmosDbMode = 'serverless'
 param deployAks = false
 param storageRedundancy = 'LRS'
-param useDocumentIntelligenceFreeTier = true
-param useLanguageFreeTier = true
+param useDocumentIntelligenceFreeTier = false
+param useLanguageFreeTier = false
 param applicationInsightsDailyCapGb = 5
 param tags = {
   Environment: 'Development'

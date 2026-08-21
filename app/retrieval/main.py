@@ -126,16 +126,15 @@ async def _lifespan(app: FastAPI):
     if _AGENT_AVAILABLE:
         try:
             from agent_framework.openai import OpenAIChatClient
-            from openai import AsyncAzureOpenAI
 
-            async_openai = AsyncAzureOpenAI(
-                azure_endpoint=config.openai_endpoint,
-                azure_ad_token_provider=_openai_token_provider,
-                api_version=config.agent_api_version,
-                max_retries=2,
-            )
+            async def _agent_token_provider() -> str:
+                return await asyncio.to_thread(_openai_token_provider)
+
             _state.agent_chat_client = OpenAIChatClient(
-                config.chat_deployment, async_client=async_openai,
+                model=config.chat_deployment,
+                base_url=f"{config.openai_endpoint.rstrip('/')}/openai/v1",
+                api_version=config.agent_api_version,
+                api_key=_agent_token_provider,
             )
         except Exception:
             logger.warning("agent_chat_client_init_failed", exc_info=True)
