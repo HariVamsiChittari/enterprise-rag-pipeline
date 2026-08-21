@@ -336,7 +336,7 @@ sequenceDiagram
 
     User->>Proxy: POST /api/query {question, mode}
     Proxy->>RAG: Forward (X-MS-CLIENT-PRINCIPAL)
-    RAG->>Graph: GET /me/transitiveMemberOf (resolve ACL groups)
+    RAG->>Graph: GET /users/{oid}/transitiveMemberOf/microsoft.graph.group (resolve ACL groups)
     RAG->>OAI: plan_queries (decompose question into 1..3 sub-queries)
     alt 1 query → Standard Path
         RAG->>OAI: Embed query (text-embedding-3-large, 3072 dims)
@@ -367,8 +367,8 @@ All queries are analyzed by the LLM query planner (regardless of conversation hi
 
 | Planned Queries | Path | Latency | Description |
 |----------------|------|---------|-------------|
-| 1 | Standard RAG | ~5s | Fixed pipeline: embed → retrieve → generate |
-| 2–3 | Agentic RAG | ~8-10s | Agent Framework agent with iterative tool calls |
+| 1 | Standard RAG | ~5s (target budget, not yet measured) | Fixed pipeline: embed → retrieve → generate |
+| 2–3 | Agentic RAG | ~8-10s (target budget, not yet measured) | Agent Framework agent with iterative tool calls |
 
 If the agentic path times out (`AGENT_TIMEOUT_SECONDS`, default 8s) or fails, the system falls back to the standard path using the already-planned queries.
 
@@ -626,3 +626,5 @@ Per [MS Learn - AKS Pod Security Best Practices](https://learn.microsoft.com/azu
 | L11 | **No automated evaluation** — Evaluation schemas exist but no runner, ground-truth dataset, or quality metrics pipeline. | Cannot systematically measure answer quality or detect regressions | Implement the evaluation runner using the existing `evaluation/schemas/` |
 | L12 | **No image/figure extraction** — Embedded images and figures in PDFs are not captured. | Visual content (charts, diagrams) is invisible to retrieval | Use Document Intelligence figure extraction or a vision model for image-to-text |
 | L13 | **No individual user ACL** — Only Entra security groups are accepted. Files shared directly with a single user (not via group) are rejected. | Direct-share-only files are not retrievable | Extract `user` identities from `grantedToV2` and match against caller's `oid` |
+| L14 | **No cap on ingestion retry attempts** — `POST /api/ingestion/retry-failed` increments `attempt_count` but nothing enforces a maximum. A chronically failing document can be retried indefinitely, incurring repeated extraction/embedding cost. | Silent cost risk on poison documents; no operator signal after N retries | Add a `MAX_RETRY_ATTEMPTS` guard in `process_document` that marks the document permanently failed once exceeded |
+| L15 | **Function App admin endpoints lack per-user role enforcement** — EasyAuth `requireAuthentication` + `allowedApplications` restrict which client apps can call the API, but no endpoint checks the caller's Entra role. `require_easy_auth_role()` exists in code but is unused in `function_app.py`. | Any user of an allowed client application can call destructive endpoints (`purge`, `terminate`) | Call `require_easy_auth_role()` with an `Ingestion.Admin` app role check at the top of each admin/destructive endpoint |

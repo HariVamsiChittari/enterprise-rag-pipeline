@@ -687,7 +687,7 @@ The self-signed certificate expires after 2 years. To renew:
 
 ## Post-Deployment Validation
 
-After deployment, validate end-to-end functionality using [docs/E2E_TEST_RUNBOOK.md](E2E_TEST_RUNBOOK.md).
+After deployment, validate end-to-end functionality using [docs/archive/E2E_TEST_RUNBOOK_2026-08-19.md](archive/E2E_TEST_RUNBOOK_2026-08-19.md) as a reference (dated test run, archived).
 
 **Quick validation checklist:**
 

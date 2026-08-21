@@ -1,6 +1,6 @@
 # Enterprise RAG Pipeline
 
-Secure, ACL-trimmed RAG system that ingests PDFs from a SharePoint document library and serves grounded answers with per-document security trimming. Ingestion extracts, chunks, enriches, and embeds content into Cosmos DB. Retrieval uses a hybrid architecture: an LLM query planner routes simple queries through a fast standard RAG path (~5s) and complex queries through an Agent Framework agentic path (~8-10s), with automatic fallback.
+Secure, ACL-trimmed RAG system that ingests PDFs from a SharePoint document library and serves grounded answers with per-document security trimming. Ingestion extracts, chunks, enriches, and embeds content into Cosmos DB. Retrieval uses a hybrid architecture: an LLM query planner routes simple queries through a fast standard RAG path (~5s target budget) and complex queries through an Agent Framework agentic path (~8-10s target budget), with automatic fallback. Figures are configured timeout budgets, not yet measured in production.
 
 ## Architecture
 
@@ -11,6 +11,8 @@ Secure, ACL-trimmed RAG system that ingests PDFs from a SharePoint document libr
 - **AI Services:** Document Intelligence, Azure AI Language, Azure OpenAI
 - **Auth:** Managed Identity (Azure services) + Certificate credential (Microsoft Graph)
 - **Networking:** VNet-integrated with Private Endpoints
+
+For full Azure resource SKUs, RBAC roles, and network configuration, see [docs/AZURE_RESOURCES.md](docs/AZURE_RESOURCES.md).
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and data model.
 
@@ -159,6 +161,7 @@ Full-sync skips unchanged files automatically (same eTag). Use `retry-failed` fo
 - Per-user rate limiting **per replica** (default 30 RPM, configurable via `RATE_LIMIT_RPM`; effective ceiling ≈ value × replica count — not a hard DoS control at scale-out)
 - Thread-safe concurrent retrieval with `threading.Lock` on shared state
 - EasyAuth with Entra ID: tenant-locked, audience-validated; production should set `allowedApplications` to restrict calling clients
+- **Known gap**: `allowedApplications` restricts which client apps can call the API, but the Function App does not currently enforce per-user roles on admin/destructive endpoints (`purge`, `terminate`, `retry-failed`, `inspect`) — any caller from an allowed application can invoke them. See `docs/ARCHITECTURE.md` Known Limitations.
 - AKS pods: Pod Security Standards (Restricted) — `runAsNonRoot`, `readOnlyRootFilesystem`, `drop ALL` capabilities
 - OpenAI clients: `max_retries=2` for transient 429/5xx resilience
 
@@ -242,6 +245,6 @@ az containerapp update --name <aca-name> --resource-group <rg> --image <acr>.azu
 ├── infra/                 # Bicep modules (Cosmos, Functions, VNet, PEs)
 ├── evaluation/            # Evaluation schemas (ground-truth, experiments)
 ├── tests/                 # Unit tests (ingestion, retrieval, infra)
-├── docs/                  # ARCHITECTURE.md, API_REFERENCE.md, AZURE_SETUP.md, PRODUCTION_READINESS.md, DEMO_RUNBOOK.md, E2E_TEST_RUNBOOK.md, INFRASTRUCTURE_REQUEST.md
+├── docs/                  # ARCHITECTURE.md, API_REFERENCE.md, AZURE_RESOURCES.md, AZURE_SETUP.md, PRODUCTION_READINESS.md, DEMO_RUNBOOK.md, INFRASTRUCTURE_REQUEST.md, archive/
 └── data/                  # Sample Cosmos data exports
 ```

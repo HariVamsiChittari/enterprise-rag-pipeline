@@ -651,4 +651,4 @@ Invoke-RestMethod -Method POST -Uri "$base/api/ingestion/retry-failed" -Headers 
 - [README.md](../README.md) — Project overview and env var reference
 - [ARCHITECTURE.md](ARCHITECTURE.md) — System design, flows, and data model
 - [AZURE_SETUP.md](AZURE_SETUP.md) — Deployment guide and operations
-- [E2E_TEST_RUNBOOK.md](E2E_TEST_RUNBOOK.md) — Validation scenarios with real request/response examples
+- [archive/E2E_TEST_RUNBOOK_2026-08-19.md](archive/E2E_TEST_RUNBOOK_2026-08-19.md) — Validation scenarios with real request/response examples (dated test run, archived)

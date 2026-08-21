@@ -2,6 +2,8 @@
 
 ## Current State (Dev)
 
+For full resource SKUs, RBAC, and network configuration, see [AZURE_RESOURCES.md](AZURE_RESOURCES.md). Prod-specific target deltas:
+
 | Resource | Dev Configuration | Prod Target |
 |----------|------------------|-------------|
 | Cosmos DB | Serverless (5,000 RU/s burst) | Provisioned autoscale (Tmax=20,000 RU/s) |
@@ -157,6 +159,18 @@ Both sync and async OpenAI clients set `max_retries=2` for automatic exponential
 [ ] 17. Monitor Cosmos 429 metrics (should be near zero)
 [ ] 18. Monitor OpenAI 429 metrics (should be within retry budget)
 ```
+
+## Rollback Procedure
+
+If a retrieval deployment introduces a regression, roll back to the previous container image tag:
+
+```bash
+az containerapp update --name <aca-name> --resource-group <rg> --image <acr-login-server>/rag-retrieval:<previous-tag>
+```
+
+Verify the previous revision is `Active`/`Running` via `az containerapp revision list --name <aca-name> --resource-group <rg> -o table` before confirming rollback complete. No Cosmos schema changes are made by retrieval deploys, so no data migration or rollback is needed.
+
+For the Function App, redeploy the previous code revision via `func azure functionapp publish <func-app-name> --python` from the last known-good commit, or `azd deploy` after `git checkout <previous-sha>`.
 
 ## Orchestration Batching Strategy (continue_as_new)
 
