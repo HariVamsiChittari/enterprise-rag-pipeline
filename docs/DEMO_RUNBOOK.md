@@ -27,6 +27,7 @@ $r.Content | ConvertFrom-Json | ConvertTo-Json -Depth 5
 ```
 
 Expected shape:
+
 ```json
 {
   "answer": "LLM-generated text with inline [S1] references...",
@@ -119,7 +120,7 @@ try {
 }
 ```
 
-### Step 9: ACL Enforcement (user without groups gets zero results)
+### Step 9: ACL Metadata Inspection
 
 ```powershell
 $graphToken = az account get-access-token --resource "https://graph.microsoft.com" --query accessToken -o tsv
@@ -139,8 +140,11 @@ $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-doc
 $doc = ($r.Content | ConvertFrom-Json).rows[0]
 Write-Host "  Document: $($doc.sourceName)"
 Write-Host "  Required groups: $($doc.allowedGroupIds -join ', ')"
-Write-Host "`n  Intersection: EMPTY — ACL filter blocks access"
+Write-Host "`n  Compare the user's group IDs with the document's required groups."
 ```
+
+This is a metadata pre-check, not an end-to-end authorization test: it does not submit a query
+using the selected user's token. Use Steps 24-28 to validate access with an actual test principal.
 
 ---
 
@@ -202,11 +206,11 @@ $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-doc
 $docs = ($r.Content | ConvertFrom-Json).rows
 $ready = ($docs | Where-Object { $_.status -eq "ready" }).Count
 $retired = ($docs | Where-Object { $_.status -eq "retired" }).Count
-Write-Host "Documents: ready=$ready retired=$retired total=$($docs.Count)"
+Write-Host "Documents returned (max 200): ready=$ready retired=$retired total=$($docs.Count)"
 
-# Chunk count
+# Returned chunk sample (the endpoint does not expose a total-count query)
 $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=search-chunks&limit=1" -Method GET -Headers $h -UseBasicParsing
-Write-Host "Search chunks: $((($r.Content | ConvertFrom-Json).count))"
+Write-Host "Search chunks returned in this sample: $((($r.Content | ConvertFrom-Json).count))"
 ```
 
 ### Step 13: Webhook Subscription and Real-Time Sync
@@ -240,7 +244,7 @@ $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-doc
 $outDir = "./data"
 if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir | Out-Null }
 foreach ($c in @("ingestion-runs","source-documents","search-chunks","service-audit")) {
-  $r = Invoke-RestMethod -Uri "$baseUrl/api/ingestion/inspect?container=$c&limit=500" -Headers $h -TimeoutSec 60
+  $r = Invoke-RestMethod -Uri "$baseUrl/api/ingestion/inspect?container=$c&limit=200" -Headers $h -TimeoutSec 60
   $r | ConvertTo-Json -Depth 10 | Out-File "$outDir/$c.json" -Encoding utf8
   Write-Host "$c : $($r.count) rows exported"
 }
@@ -248,9 +252,9 @@ foreach ($c in @("ingestion-runs","source-documents","search-chunks","service-au
 
 **Known limit (verified):** `GET /api/ingestion/inspect` caps `limit` at 200 rows server-side
 ([app/function_app.py](../app/function_app.py) — `limit = min(int(req.params.get("limit", "10")), 200)`),
-with no pagination/continuation token. Requesting `limit=500` above still returns at most 200
-rows per container. This is fine for `ingestion-runs` and `source-documents` (small containers),
-but `search-chunks` and `service-audit` will only export a **200-row sample**, not the full
+with no pagination/continuation token. Each export requests the maximum 200 rows per container.
+This is fine for `ingestion-runs` and `source-documents` while they remain small, but
+`search-chunks` and `service-audit` will only export a **200-row sample**, not the full
 container, once the corpus grows past ~200 chunks or audit records. Treat the exported
 `search-chunks.json`/`service-audit.json` as a sample for spot-checks (e.g. Step 16's Level 3
 chunk integrity check), not a full data dump.
@@ -333,15 +337,17 @@ $fileFilter = "<distinct-substring-of-filename>"   # e.g. "bfl-abac-policy-v1"
 ### Step 19: Confirm the webhook fired
 
 ```powershell
-$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=service-audit&limit=500" -Method GET -Headers $h -UseBasicParsing
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=service-audit&limit=200" -Method GET -Headers $h -UseBasicParsing
 $audit = ($r.Content | ConvertFrom-Json).rows
 $audit | Where-Object { $_.operation -eq "webhook_received" -or $_.sourceName -match $fileFilter } |
   Sort-Object recordedAt -Descending | Select-Object -First 10 recordedAt, operation, sourceName, action |
   Format-Table -AutoSize
 ```
+
 Expect a recent `webhook_received` row with `action: delta_sync_triggered` at/after the time you
-made the change in SharePoint. If nothing appears within ~1 minute, the subscription may have
-expired — check Step 13.
+made the change in SharePoint. A missing row does not prove the subscription expired: the function
+does not write this audit event while full-sync or another delta-sync tick is already running.
+Check Step 13 and Step 20 before treating it as a subscription failure.
 
 ### Step 20: Watch the delta-sync orchestration run
 
@@ -349,38 +355,49 @@ expired — check Step 13.
 $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status?instanceId=delta-sync-sharepoint-drive" -Method GET -Headers $h -UseBasicParsing
 ($r.Content | ConvertFrom-Json) | ConvertTo-Json -Depth 6
 ```
+
 Re-run this until `runtimeStatus` is `Completed`. The `output` block reports
-`createdOrUpdated`, `deleted`, `failed`, and `itemsSeen` counts for this tick.
+`createdOrUpdated`, `deleted`, `aclResynced`, `failed`, and `itemsSeen` counts for the most
+recent completed delta-sync tick. The durable instance is a singleton: notifications received
+while it is running are coalesced, so the counts can cover multiple changes and cannot by
+themselves prove that this file was processed. Correlate `lastUpdatedTime` with Step 19, then use
+Step 21 as the authoritative per-file result. For a delete processed by this tick, expect
+`deleted` to be greater than zero.
 
 ### Step 21: Check the document's ingestion record
 
 ```powershell
-$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=50" -Method GET -Headers $h -UseBasicParsing
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=200" -Method GET -Headers $h -UseBasicParsing
 ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.sourceName -match $fileFilter } |
   Select-Object sourceName, status, stage, attemptCount, pageCount, expectedChunkCount, writtenChunkCount, error, retiredReason, discoveredAt, updatedAt |
   Format-List
 ```
+
 - **Add/update**: expect one row with `status: "ready"`, `error: $null`,
   `expectedChunkCount == writtenChunkCount`, and `pageCount` matching the real page count of the
   file (not capped at 2 — see [Troubleshooting](TROUBLESHOOTING.md#2-ingested-documents-show-pagecount-2-regardless-of-actual-page-count-no-error-recorded)
   if it is).
 - **Delete**: expect the prior "ready" version's row to flip to `status: "retired"` with
-  `retiredReason` populated (e.g. `"deleted_upstream"`).
+  `retiredReason: "deleted"`.
 - **Stuck at `processing` with `error: $null`**: see
   [Troubleshooting #1](TROUBLESHOOTING.md#1-full-sync-completes-with-failed--0-andor-runstatus-finalization_failed).
 
-### Step 22: Confirm chunks were written (or removed, for deletes)
+### Step 22: Spot-check raw chunks for an add or update
 
 ```powershell
 $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=search-chunks&limit=200" -Method GET -Headers $h -UseBasicParsing
 $chunkMatches = ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.sourceName -match $fileFilter }
-Write-Host "Chunks found for '$fileFilter' in this sample: $($chunkMatches.Count)"
+Write-Host "Raw chunk records found for '$fileFilter' in this sample: $($chunkMatches.Count)"
 $chunkMatches | Select-Object chunkIndex, pageStart, pageEnd, sectionPath | Format-Table -AutoSize
 ```
+
 Note: `limit` is capped at 200 rows with no pagination. Once the corpus has hundreds/thousands
 of chunks, a plain scan may not surface this file's rows in the sample — treat the
 `source-documents` record from Step 21 (`expectedChunkCount == writtenChunkCount`) as the
-authoritative signal, and use this step as a spot-check when the corpus is small.
+authoritative signal, and use this step as a spot-check when the corpus is small. Deletes retire
+the source-document manifest; they do not hard-delete its raw chunk records. The retrieval path
+excludes chunks whose manifest is not `status: "ready"`, so validate a delete with Steps 21 and 23,
+not by requiring this sample to return zero rows.
 
 ### Step 23: Confirm retrieval reflects the change end-to-end
 
@@ -389,5 +406,69 @@ $body = "{`"question`": `"<a question whose answer only exists in the new/update
 $r = Invoke-WebRequest -Uri "$baseUrl/api/query" -Method POST -Headers $h -Body $body -UseBasicParsing
 ($r.Content | ConvertFrom-Json) | ConvertTo-Json -Depth 5
 ```
+
 For an add/update, expect a citation pointing to `$fileFilter` in the response. For a delete,
 expect the file to no longer appear in citations for questions it previously answered.
+
+---
+
+## Live ACL Change Tracking
+
+Use this to validate a SharePoint permission-only change without modifying file content. There is
+no manual ACL-resync endpoint: the normal path is SharePoint security-change notification →
+delta-sync → ACL refresh or retirement. The weekly ACL-resync timer is a safety net.
+
+### Step 24: Capture the current document ACL
+
+```powershell
+$fileFilter = "<distinct-substring-of-filename>"
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=200" -Method GET -Headers $h -UseBasicParsing
+$before = ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.sourceName -match $fileFilter -and $_.status -eq "ready" } | Select-Object -First 1
+if (-not $before) { throw "No ready source document found for '$fileFilter' in the returned sample." }
+$before | Select-Object sourceName, documentId, status, allowedGroupIds, aclHash, aclEvaluatedAt | Format-List
+```
+
+### Step 25: Change only the file permission in SharePoint
+
+Grant or revoke a test security group on the target file in SharePoint. Do not edit its contents.
+Record the change time, then use Step 19 to confirm a webhook notification and Step 20 to wait for
+the delta-sync tick. For a surfaced permission change, expect `aclResynced` to be greater than
+zero; a zero-delta tick also runs a bounded ACL-resync safety check.
+
+### Step 26: Confirm the stored ACL changed
+
+```powershell
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=200" -Method GET -Headers $h -UseBasicParsing
+$after = ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.documentId -eq $before.documentId } | Select-Object -First 1
+if (-not $after) { throw "The document was not returned by the inspect sample." }
+$after | Select-Object sourceName, status, allowedGroupIds, aclHash, aclEvaluatedAt, retiredReason, updatedAt | Format-List
+Write-Host "ACL hash changed: $($before.aclHash -ne $after.aclHash)"
+```
+
+Expect an ACL grant/replacement to preserve `status: "ready"` and change `allowedGroupIds` and
+`aclHash`. If SharePoint reports no remaining readable ACL for the ingestion identity, expect
+`status: "retired"` and `retiredReason: "acl_revoked"` instead.
+
+### Step 27: Obtain a token as a test principal
+
+Sign in as a principal in the granted group, then repeat after signing in as a principal outside
+the allowed groups. Do not reuse the Step 0 token for both tests.
+
+```powershell
+az logout
+az login --tenant "<tenant-id>"
+$principalToken = az account get-access-token --resource "api://$clientId" --query accessToken -o tsv
+$principalHeaders = @{ 'Authorization' = "Bearer $principalToken"; 'Content-Type' = 'application/json' }
+```
+
+### Step 28: Validate retrieval authorization
+
+```powershell
+$body = '{"question": "<a question answered uniquely by the ACL-tested file>", "mode": "hybrid"}'
+$r = Invoke-WebRequest -Uri "$baseUrl/api/query" -Method POST -Headers $principalHeaders -Body $body -UseBasicParsing
+($r.Content | ConvertFrom-Json) | ConvertTo-Json -Depth 5
+```
+
+The allowed principal should receive a citation to the target file. The excluded principal must
+not receive that citation. Repeat Step 0 afterward to restore the administrator token used by the
+ingestion validation commands.
