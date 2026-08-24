@@ -390,21 +390,25 @@ def run_delta_sync(
             try:
                 ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
                 if ref is not None:
-                    lifecycle_repository.retire_document(
-                        source_run_id=ref.source_run_id,
-                        document_id=document_id,
-                        etag=ref.etag,
-                        reason="deleted",
-                    )
-                    deleted += 1
-                    if audit_container is not None:
-                        write_audit_record(audit_container, config.source_id, run_id, {
-                            "operation": "document_retired", "documentId": document_id,
-                            "retiredReason": "deleted",
-                            "sourceName": getattr(ref, "source_name", ""),
-                            "sourceUrl": getattr(ref, "source_url", ""),
-                            "method": "delta_sync",
-                        })
+                    try:
+                        lifecycle_repository.delete_document_and_chunks(
+                            source_run_id=ref.source_run_id,
+                            document_id=document_id,
+                            document_key=ref.document_key,
+                            etag=ref.etag,
+                        )
+                    except LifecycleConflictError:
+                        pass  # already deleted/changed concurrently -- acceptable no-op
+                    else:
+                        deleted += 1
+                        if audit_container is not None:
+                            write_audit_record(audit_container, config.source_id, run_id, {
+                                "operation": "document_deleted", "documentId": document_id,
+                                "reason": "deleted",
+                                "sourceName": getattr(ref, "source_name", ""),
+                                "sourceUrl": getattr(ref, "source_url", ""),
+                                "method": "delta_sync",
+                            })
             except Exception:
                 logger.error("delta_sync delete failed for item %s", item_id, exc_info=True)
                 failed += 1
@@ -459,14 +463,23 @@ def run_delta_sync(
             })
         if prev_ref is not None and prev_ref.document_key != document.document_key:
             try:
-                lifecycle_repository.retire_document(
+                lifecycle_repository.delete_document_and_chunks(
                     source_run_id=prev_ref.source_run_id,
                     document_id=document_id,
+                    document_key=prev_ref.document_key,
                     etag=prev_ref.etag,
-                    reason="superseded",
                 )
             except LifecycleConflictError:
-                pass  # already retired concurrently (e.g. ACL resync) -- acceptable no-op
+                pass  # already deleted/changed concurrently (e.g. ACL resync) -- acceptable no-op
+            else:
+                if audit_container is not None:
+                    write_audit_record(audit_container, config.source_id, run_id, {
+                        "operation": "document_deleted", "documentId": document_id,
+                        "reason": "superseded", "method": "delta_sync",
+                        "replacedDocumentKey": prev_ref.document_key,
+                        "newDocumentKey": document.document_key,
+                        "sourceName": document.source_name,
+                    })
 
     lifecycle_repository.save_delta_cursor(config.source_id, delta.delta_link)
     return DeltaSyncOutcome(

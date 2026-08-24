@@ -107,11 +107,20 @@ class FakeContainer:
                 stored[operation["path"].lstrip("/")] = operation["value"]
         return [{"statusCode": 200} for _ in batch_operations]
 
-    def delete_item(self, *, item: str, partition_key: str) -> None:
+    def delete_item(
+        self,
+        *,
+        item: str,
+        partition_key: str,
+        etag: str | None = None,
+        match_condition: MatchConditions | None = None,
+    ) -> None:
         self.delete_calls.append((item, partition_key))
         key = (partition_key, item)
         if key not in self.items:
             raise FakeCosmosError(404)
+        if etag is not None and self.items[key].get("_etag") != etag:
+            raise FakeCosmosError(412)
         del self.items[key]
 
     def query_items(
@@ -219,7 +228,7 @@ def test_delete_document_and_chunks_removes_everything() -> None:
     repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
 
     repo.delete_document_and_chunks(
-        source_run_id="source:run-a", document_id="doc-1", document_key="source:run-a:doc-1"
+        source_run_id="source:run-a", document_id="doc-1", document_key="source:run-a:doc-1", etag="etag-1"
     )
 
     assert ("source:run-a", "doc-1") not in documents.items
@@ -229,7 +238,23 @@ def test_delete_document_and_chunks_removes_everything() -> None:
 def test_delete_document_and_chunks_is_idempotent_when_already_gone() -> None:
     repo = DocumentLifecycleRepository(FakeContainer("sourceId"), FakeContainer("sourceRunId"), FakeContainer("documentKey"))
 
-    repo.delete_document_and_chunks(source_run_id="source:run-a", document_id="doc-1", document_key="source:run-a:doc-1")
+    repo.delete_document_and_chunks(
+        source_run_id="source:run-a", document_id="doc-1", document_key="source:run-a:doc-1", etag="etag-1"
+    )
+
+
+def test_delete_document_and_chunks_conflict_on_stale_etag() -> None:
+    documents = FakeContainer("sourceRunId", {("source:run-a", "doc-1"): _ready_document()})
+    chunks = FakeContainer("documentKey")
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), documents, chunks)
+
+    with pytest.raises(LifecycleConflictError):
+        repo.delete_document_and_chunks(
+            source_run_id="source:run-a", document_id="doc-1", document_key="source:run-a:doc-1", etag="stale-etag"
+        )
+
+    # Document survives a rejected delete; only a matching etag removes it.
+    assert ("source:run-a", "doc-1") in documents.items
 
 
 def test_list_ready_documents_page_and_find_by_document_id() -> None:

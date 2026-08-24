@@ -675,7 +675,7 @@ def process_document_activity(payload: dict) -> dict:
                 audit_container=audit_container,
             )
         if outcome.status.value == "succeeded":
-            _retire_prior_version(config, document_ref["documentId"], document_ref["sourceRunId"])
+            _retire_prior_version(config, document_ref["documentId"], document_ref["sourceRunId"], audit_container)
         return {
             "documentId": outcome.document_id,
             "status": outcome.status.value,
@@ -795,19 +795,26 @@ def acl_resync_page_activity(payload: dict) -> dict:
 
 
 
-def _retire_prior_version(config, document_id: str, current_source_run_id: str) -> None:
-    """After full-sync re-processes a file, retire any old ready version from a prior run."""
+def _retire_prior_version(config, document_id: str, current_source_run_id: str, audit_container=None) -> None:
+    """After full-sync re-processes a file, hard-delete any old ready version from a prior run."""
     from ingestion.lifecycle_repository import LifecycleConflictError
+    from ingestion.telemetry import write_audit_record
     try:
         lifecycle_repo = _build_lifecycle_repository(config)
         ref = lifecycle_repo.find_ready_document_by_document_id(document_id)
         if ref is not None and ref.source_run_id != current_source_run_id:
-            lifecycle_repo.retire_document(
+            lifecycle_repo.delete_document_and_chunks(
                 source_run_id=ref.source_run_id,
                 document_id=document_id,
+                document_key=ref.document_key,
                 etag=ref.etag,
-                reason="superseded",
             )
+            if audit_container is not None:
+                write_audit_record(audit_container, config.source_id, current_source_run_id, {
+                    "operation": "document_deleted", "documentId": document_id,
+                    "reason": "superseded", "method": "full_sync",
+                    "replacedDocumentKey": ref.document_key,
+                })
     except LifecycleConflictError:
         pass
     except Exception:

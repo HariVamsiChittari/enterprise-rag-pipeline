@@ -212,10 +212,25 @@ class DocumentLifecycleRepository:
         source_run_id: str,
         document_id: str,
         document_key: str,
+        etag: str,
     ) -> None:
+        # Chunks are safe to delete unconditionally: each ingestion run mints a new
+        # document_key, so a concurrent re-add can never collide with this document_key's chunks.
         for chunk_id in self._list_chunk_ids(document_key):
             self._delete_item(self._search_chunks, chunk_id, document_key)
-        self._delete_item(self._source_documents, document_id, source_run_id)
+        try:
+            self._source_documents.delete_item(
+                item=document_id,
+                partition_key=source_run_id,
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if _error_status(error) == 404:
+                return
+            if _error_status(error) == 412:
+                raise LifecycleConflictError("document already changed or removed") from None
+            raise LifecycleRepositoryError("Cosmos document delete failed") from None
 
     def _list_chunk_ids(self, document_key: str) -> list[str]:
         query = "SELECT c.id FROM c WHERE c.documentKey = @documentKey"

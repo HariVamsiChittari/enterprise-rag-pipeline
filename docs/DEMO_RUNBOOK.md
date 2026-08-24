@@ -377,8 +377,9 @@ $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-doc
   `expectedChunkCount == writtenChunkCount`, and `pageCount` matching the real page count of the
   file (not capped at 2 — see [Troubleshooting](TROUBLESHOOTING.md#2-ingested-documents-show-pagecount-2-regardless-of-actual-page-count-no-error-recorded)
   if it is).
-- **Delete**: expect the prior "ready" version's row to flip to `status: "retired"` with
-  `retiredReason: "deleted"`.
+- **Delete**: expect the prior "ready" version's row to be **absent** from this response
+  (hard-deleted, not retired). Confirm by `documentId`/`sourceName`, not by looking for a
+  `status: "retired"` row.
 - **Stuck at `processing` with `error: $null`**: see
   [Troubleshooting #1](TROUBLESHOOTING.md#1-full-sync-completes-with-failed--0-andor-runstatus-finalization_failed).
 
@@ -394,9 +395,9 @@ $chunkMatches | Select-Object chunkIndex, pageStart, pageEnd, sectionPath | Form
 Note: `limit` is capped at 200 rows with no pagination. Once the corpus has hundreds/thousands
 of chunks, a plain scan may not surface this file's rows in the sample — treat the
 `source-documents` record from Step 21 (`expectedChunkCount == writtenChunkCount`) as the
-authoritative signal, and use this step as a spot-check when the corpus is small. Deletes retire
-the source-document manifest; they do not hard-delete its raw chunk records. The retrieval path
-excludes chunks whose manifest is not `status: "ready"`, so validate a delete with Steps 21 and 23,
+authoritative signal, and use this step as a spot-check when the corpus is small. Deletes
+hard-delete both the source-document manifest and its raw chunk records, so validate a delete
+with Steps 21 and 23,
 not by requiring this sample to return zero rows.
 
 ### Step 23: Confirm retrieval reflects the change end-to-end

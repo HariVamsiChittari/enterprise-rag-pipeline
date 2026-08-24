@@ -121,17 +121,20 @@ sequenceDiagram
         Act->>Graph: GET /root/delta (with stored deltaLink)
         loop Each changed item
             alt Item deleted
-                Act->>Cosmos: Delete document + all chunks
+                Act->>Cosmos: Delete document + chunks (reason=deleted)
                 Act->>Cosmos: Write document_deleted audit
+            else Item permission-only change (sharedChanged)
+                Act->>Graph: GET /permissions for item (resync_document_acl)
+                Act->>Cosmos: Update allowedGroupIds on doc + chunks, or retire (acl_revoked)
             else Item added or updated
                 Act->>Pipeline: Full pipeline (ACL → extract → chunk → enrich → embed)
                 Pipeline->>Cosmos: Write chunks + mark READY
-                Act->>Cosmos: Retire previous version (if exists)
                 Act->>Cosmos: Write document_ingested audit
+                Act->>Cosmos: Delete previous version + chunks (reason=superseded), write document_deleted audit
             end
         end
         Act->>Cosmos: Save new delta cursor
-        Act-->>Orch: created/updated/deleted/failed counts
+        Act-->>Orch: created/updated/deleted/aclResynced/failed counts
     end
 ```
 
@@ -139,8 +142,9 @@ sequenceDiagram
 
 - **Bootstrap**: On the first tick (no cursor in `delta-control`), the timer fetches `?token=latest` with the same `Prefer` headers used for steady-state reads (`deltashowremovedasdeleted, deltatraversepermissiongaps, deltashowsharingchanges`). This ensures the bootstrap token is compatible with subsequent delta reads.
 - **Steady state**: Each tick reads Graph's delta feed, deduplicates by item ID (latest change wins), and processes additions/updates/deletions.
-- **Additions/updates**: Run through the full processing pipeline (ACL verification → Document Intelligence extraction → chunking → Language AI enrichment → embedding → Cosmos write). Previous versions are retired via `lifecycle_repository.retire_document()`.
-- **Deletions**: Document record and all associated chunks are removed from Cosmos.
+- **Additions/updates**: Run through the full processing pipeline (ACL verification → Document Intelligence extraction → chunking → Language AI enrichment → embedding → Cosmos write). Previous versions are hard-deleted (document + chunks) via `lifecycle_repository.delete_document_and_chunks()`, ETag-guarded against concurrent changes, once the replacement is already `ready`.
+- **Permission-only changes**: When Graph flags `@microsoft.graph.sharedChanged` on an item with no content change, `resync_document_acl()` re-verifies that document's ACL directly (same outcome as ACL Resync below) instead of running the full pipeline. ACL revocation still soft-retires (`status=retired`, `retiredReason=acl_revoked`) rather than hard-deleting, since it reflects a permission change, not a confirmed source deletion.
+- **Deletions**: The document and its chunks are hard-deleted from Cosmos via `lifecycle_repository.delete_document_and_chunks()`, guarded by the document's ETag so a concurrent change (e.g. a racing ACL resync) is detected as a conflict and safely skipped rather than deleting stale data.
 - **Concurrency guard**: Skips if a full-sync orchestration or a previous delta tick is still running.
 - **Cursor persistence**: The new `deltaLink` is saved to Cosmos only after all items are processed, ensuring crash-safe resumption.
 - **Double-410 recovery**: If Graph returns `410 Gone` on the stored cursor AND the first reset-location URL, a nested handler retries the second reset-location. If that also fails, `run_delta_sync()` catches `DeltaResetRequired` and re-bootstraps the cursor from scratch.
@@ -294,7 +298,8 @@ Append-only audit log for all service calls and document lifecycle events.
 | `embedding` | retrieval/service.py | Per query | model, tokens, latency |
 | `answer_generation` | retrieval/service.py | Per query | model, tokens, latency |
 | `query_request` | retrieval/main.py | Per query | question, answer_preview, citations_count, path, planned_queries, e2e_latency_ms |
-| `document_deleted` | services.py | Per delta deletion | documentId, sourceName, sourceUrl |
+| `document_retired` | services.py | Per ACL revocation (soft-retire only) | documentId, retiredReason, sourceName, sourceUrl |
+| `document_deleted` | services.py, function_app.py | Per delta deletion or version supersession (full-sync or delta-sync) | documentId, reason (deleted\|superseded), method, replacedDocumentKey |
 | `document_ingested` | services.py | Per delta add/update | documentId, sourceName, action, chunks |
 | `webhook_received` | function_app.py | Per webhook notification | action (delta_sync_triggered) |
 | `purge` | function_app.py | Per purge request | container, operator, deletedCount, failedCount, purgeAll |

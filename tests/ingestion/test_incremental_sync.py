@@ -95,8 +95,8 @@ class FakeLifecycleRepository:
     def find_ready_document_by_document_id(self, document_id: str) -> ReadyDocumentRef | None:
         return self.ready_by_document_id.get(document_id)
 
-    def delete_document_and_chunks(self, *, source_run_id: str, document_id: str, document_key: str) -> None:
-        self.deleted.append({"source_run_id": source_run_id, "document_id": document_id, "document_key": document_key})
+    def delete_document_and_chunks(self, *, source_run_id: str, document_id: str, document_key: str, etag: str) -> None:
+        self.deleted.append({"source_run_id": source_run_id, "document_id": document_id, "document_key": document_key, "etag": etag})
 
     def retire_document(self, *, source_run_id: str, document_id: str, etag: str, reason: str) -> None:
         self.retired.append({"source_run_id": source_run_id, "document_id": document_id, "reason": reason})
@@ -169,7 +169,7 @@ def test_run_delta_sync_processes_add_and_advances_cursor(monkeypatch: pytest.Mo
     assert lifecycle.retired == []  # no prior ready version -> pure add, nothing to retire
 
 
-def test_run_delta_sync_retires_superseded_version_after_successful_update(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_delta_sync_deletes_superseded_version_after_successful_update(monkeypatch: pytest.MonkeyPatch) -> None:
     config = build_config()
     document_id = create_document_id("source", "drive", "item-1")
     prev_ref = ReadyDocumentRef(
@@ -201,9 +201,11 @@ def test_run_delta_sync_retires_superseded_version_after_successful_update(monke
         outcome = services.run_delta_sync(config, repository, lifecycle, connector, None, None, None)
 
     assert outcome.created_or_updated == 1
-    assert len(lifecycle.retired) == 1
-    assert lifecycle.retired[0]["source_run_id"] == prev_ref.source_run_id
-    assert lifecycle.retired[0]["reason"] == "superseded"
+    assert lifecycle.retired == []
+    assert len(lifecycle.deleted) == 1
+    assert lifecycle.deleted[0]["source_run_id"] == prev_ref.source_run_id
+    assert lifecycle.deleted[0]["document_key"] == prev_ref.document_key
+    assert lifecycle.deleted[0]["etag"] == prev_ref.etag
 
 
 def test_run_delta_sync_deletes_document_and_chunks_on_graph_deletion() -> None:
@@ -227,7 +229,11 @@ def test_run_delta_sync_deletes_document_and_chunks_on_graph_deletion() -> None:
         outcome = services.run_delta_sync(config, FakeRepository(), lifecycle, connector, None, None, None)
 
     assert outcome.deleted == 1
-    assert lifecycle.retired == [{"source_run_id": "source:run-a", "document_id": document_id, "reason": "deleted"}]
+    assert lifecycle.retired == []
+    assert lifecycle.deleted == [{
+        "source_run_id": "source:run-a", "document_id": document_id,
+        "document_key": ref.document_key, "etag": ref.etag,
+    }]
 
 
 def test_run_delta_sync_deletion_of_untracked_item_is_a_no_op() -> None:
