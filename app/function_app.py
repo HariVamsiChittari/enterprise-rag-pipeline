@@ -193,8 +193,11 @@ def inspect_data(req: func.HttpRequest) -> func.HttpResponse:
                 partition_key=f"{source_id}:{run_id}",
             ))
         else:
+            # service-audit is self-partitioned (partition key = each record's own id), so
+            # order by recordedAt to avoid an arbitrary cross-partition sample.
+            order_by = " ORDER BY c.recordedAt DESC" if container_name == "service-audit" else ""
             rows = list(container.query_items(
-                query="SELECT TOP @limit * FROM c",
+                query=f"SELECT TOP @limit * FROM c{order_by}",
                 parameters=[{"name": "@limit", "value": limit}],
                 enable_cross_partition_query=True,
             ))

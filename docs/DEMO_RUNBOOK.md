@@ -156,7 +156,7 @@ using the selected user's token. Use Steps 24-28 to validate access with an actu
 $h2 = @{ 'Authorization' = "Bearer $token" }
 $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=service-audit&limit=200" -Method GET -Headers $h2 -UseBasicParsing
 $data = ($r.Content | ConvertFrom-Json).rows
-$data | Where-Object { $_.requestId -and $_.requestId -ne "" } | Group-Object requestId | Select-Object -Last 6 | ForEach-Object {
+$data | Where-Object { $_.requestId -and $_.requestId -ne "" } | Group-Object requestId | Select-Object -First 6 | ForEach-Object {
   $summary = $_.Group | Where-Object { $_.operation -eq "query_request" }
   $steps = $_.Group | Where-Object { $_.operation -ne "query_request" }
   if ($summary) {
@@ -255,11 +255,12 @@ foreach ($c in @("ingestion-runs","source-documents","search-chunks","service-au
 **Known limit (verified):** `GET /api/ingestion/inspect` caps `limit` at 200 rows server-side
 ([app/function_app.py](../app/function_app.py) — `limit = min(int(req.params.get("limit", "10")), 200)`),
 with no pagination/continuation token. Each export requests the maximum 200 rows per container.
-This is fine for `ingestion-runs` and `source-documents` while they remain small, but
-`search-chunks` and `service-audit` will only export a **200-row sample**, not the full
-container, once the corpus grows past ~200 chunks or audit records. Treat the exported
-`search-chunks.json`/`service-audit.json` as a sample for spot-checks (e.g. Step 16's Level 3
-chunk integrity check), not a full data dump.
+This is fine for `ingestion-runs` and `source-documents` while they remain small.
+`service-audit` orders by `recordedAt DESC` server-side, so its 200-row export is the
+**200 most recent records**, not an arbitrary sample. `search-chunks` has no such ordering, so
+once the corpus grows past ~200 chunks its export is still an arbitrary sample — treat
+`search-chunks.json` accordingly (e.g. Step 16's Level 3 chunk integrity check is a spot-check,
+not a full data dump).
 
 ### Step 16: 4-Level Cross-File Validation
 
@@ -334,7 +335,16 @@ from Step 0.
 
 ```powershell
 $fileFilter = "<distinct-substring-of-filename>"   # e.g. "bfl-abac-policy-v1"
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=200" -Method GET -Headers $h -UseBasicParsing
+$targetDoc = ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.sourceName -match $fileFilter -and $_.status -eq "ready" } | Select-Object -First 1
+if (-not $targetDoc) { throw "No ready source document found for '$fileFilter' in the returned sample." }
+$targetDocumentId = $targetDoc.documentId
+Write-Host "Target documentId: $targetDocumentId"
 ```
+
+Capture `$targetDocumentId` now, before editing or deleting the file: a delete's audit record
+has no `sourceName` to search by later (see Step 22), and the row itself disappears from
+`source-documents` once the delete is processed.
 
 ### Step 19: Confirm the webhook fired
 
@@ -388,7 +398,20 @@ $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-doc
 - **Stuck at `processing` with `error: $null`**: see
   [Troubleshooting #1](TROUBLESHOOTING.md#1-full-sync-completes-with-failed--0-andor-runstatus-finalization_failed).
 
-### Step 22: Spot-check raw chunks for an add or update
+### Step 22: Verify the hard-delete audit record (delete only)
+
+```powershell
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=service-audit&limit=10" -Method GET -Headers $h -UseBasicParsing
+$deleteAudit = ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.operation -eq "document_deleted" -and $_.documentId -eq $targetDocumentId } | Select-Object -First 1
+$deleteAudit | Format-List
+```
+
+Expect one `document_deleted` record for `$targetDocumentId` with `reason: "deleted"` and
+`method: "delta_sync"`. `service-audit` is ordered by `recordedAt DESC` server-side, so a small
+`limit` is enough to find a just-written record — no need to scan the full 200-row cap. Skip
+this step for an add/update; only deletes and superseded versions write `document_deleted`.
+
+### Step 23: Spot-check raw chunks for an add or update
 
 ```powershell
 $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=search-chunks&limit=200" -Method GET -Headers $h -UseBasicParsing
@@ -402,10 +425,10 @@ of chunks, a plain scan may not surface this file's rows in the sample — treat
 `source-documents` record from Step 21 (`expectedChunkCount == writtenChunkCount`) as the
 authoritative signal, and use this step as a spot-check when the corpus is small. Deletes
 hard-delete both the source-document manifest and its raw chunk records, so validate a delete
-with Steps 21 and 23,
+with Steps 21, 22, and 24,
 not by requiring this sample to return zero rows.
 
-### Step 23: Confirm retrieval reflects the change end-to-end
+### Step 24: Confirm retrieval reflects the change end-to-end
 
 ```powershell
 $body = "{`"question`": `"<a question whose answer only exists in the new/updated content>`"}"
@@ -424,7 +447,7 @@ Use this to validate a SharePoint permission-only change without modifying file 
 no manual ACL-resync endpoint: the normal path is SharePoint security-change notification →
 delta-sync → ACL refresh or retirement. The weekly ACL-resync timer is a safety net.
 
-### Step 24: Capture the current document ACL
+### Step 25: Capture the current document ACL
 
 ```powershell
 $fileFilter = "<distinct-substring-of-filename>"
@@ -434,14 +457,14 @@ if (-not $before) { throw "No ready source document found for '$fileFilter' in t
 $before | Select-Object sourceName, documentId, status, allowedGroupIds, aclHash, aclEvaluatedAt | Format-List
 ```
 
-### Step 25: Change only the file permission in SharePoint
+### Step 26: Change only the file permission in SharePoint
 
 Grant or revoke a test security group on the target file in SharePoint. Do not edit its contents.
 Record the change time, then use Step 19 to confirm a webhook notification and Step 20 to wait for
 the delta-sync tick. For a surfaced permission change, expect `aclResynced` to be greater than
 zero; a zero-delta tick also runs a bounded ACL-resync safety check.
 
-### Step 26: Confirm the stored ACL changed
+### Step 27: Confirm the stored ACL changed
 
 ```powershell
 $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=200" -Method GET -Headers $h -UseBasicParsing
@@ -455,7 +478,19 @@ Expect an ACL grant/replacement to preserve `status: "ready"` and change `allowe
 `aclHash`. If SharePoint reports no remaining readable ACL for the ingestion identity, expect
 `status: "retired"` and `retiredReason: "acl_revoked"` instead.
 
-### Step 27: Obtain a token as a test principal
+### Step 28: Verify the ACL-revocation audit record (revocation only)
+
+```powershell
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=service-audit&limit=10" -Method GET -Headers $h -UseBasicParsing
+$retireAudit = ($r.Content | ConvertFrom-Json).rows | Where-Object { $_.operation -eq "document_retired" -and $_.documentId -eq $before.documentId } | Select-Object -First 1
+$retireAudit | Format-List
+```
+
+Expect one `document_retired` record for `$before.documentId` with `retiredReason: "acl_revoked"`.
+Skip this step if Step 27 showed `status: "ready"` (an ACL grant/replacement, not a revocation) —
+only a revocation to zero readable groups retires the document and writes this record.
+
+### Step 29: Obtain a token as a test principal
 
 Sign in as a principal in the granted group, then repeat after signing in as a principal outside
 the allowed groups. Do not reuse the Step 0 token for both tests.
@@ -467,7 +502,7 @@ $principalToken = az account get-access-token --resource "api://$clientId" --que
 $principalHeaders = @{ 'Authorization' = "Bearer $principalToken"; 'Content-Type' = 'application/json' }
 ```
 
-### Step 28: Validate retrieval authorization
+### Step 30: Validate retrieval authorization
 
 ```powershell
 $body = '{"question": "<a question answered uniquely by the ACL-tested file>", "mode": "hybrid"}'

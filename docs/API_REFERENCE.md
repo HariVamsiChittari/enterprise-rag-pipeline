@@ -249,6 +249,10 @@ Authorization: Bearer <token>
 | `limit` | No | `10` | Number of rows (max `200`) |
 | `runId` | No | — | If set, filter by partition `<source_id>:<runId>` (avoids cross-partition query) |
 
+Without `runId`, `service-audit` is queried cross-partition (its partition key is each record's
+own `id`) ordered by `recordedAt DESC`, so the result is the most recent rows, not an arbitrary
+sample. `search-chunks` has no equivalent ordering.
+
 **Response — 200 OK**
 
 ```json

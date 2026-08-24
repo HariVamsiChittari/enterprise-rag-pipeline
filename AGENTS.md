@@ -162,3 +162,11 @@ Run commands from the repository root unless noted.
   exact resource SKUs/RBAC.
 - No ADR directory exists today; record architecturally significant decisions as a new
   dated section in `docs/ARCHITECTURE.md` until one is introduced.
+
+## Code Comments
+
+- Add comments only when they explain non-obvious intent, constraints, tradeoffs, invariants, or workarounds.
+- Do not narrate what the code already states, repeat names, restate requirements, or add decorative section comments.
+- Prefer clearer naming and simpler code over explanatory comments.
+- Update or remove comments when the associated behavior changes.
+- Do not delete useful existing comments merely to reduce comment count.
