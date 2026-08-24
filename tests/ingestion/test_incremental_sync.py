@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Any
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -403,9 +404,45 @@ def test_resync_document_acl_retires_on_terminal_acl_error() -> None:
     assert lifecycle.retired == [{"source_run_id": "source:run-a", "document_id": "doc-1", "reason": "acl_revoked"}]
 
 
+def test_resync_document_acl_writes_audit_record_on_retire() -> None:
+    config = build_config()
+    lifecycle = FakeLifecycleRepository()
+    audit_container = MagicMock()
+
+    def _raise(*a: Any, **k: Any) -> None:
+        raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
+
+    connector = FakeConnector(_raise)
+
+    result = services.resync_document_acl(config, _ready_ref(), lifecycle, connector, audit_container=audit_container)
+
+    assert result == "retired"
+    audit_container.create_item.assert_called_once()
+    item = audit_container.create_item.call_args[0][0]
+    assert item["operation"] == "document_retired"
+    assert item["documentId"] == "doc-1"
+    assert item["retiredReason"] == "acl_revoked"
+    assert item["runId"] == "source:run-a"
+
+
+def test_resync_document_acl_skips_audit_when_container_is_none() -> None:
+    config = build_config()
+    lifecycle = FakeLifecycleRepository()
+
+    def _raise(*a: Any, **k: Any) -> None:
+        raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
+
+    connector = FakeConnector(_raise)
+
+    result = services.resync_document_acl(config, _ready_ref(), lifecycle, connector, audit_container=None)
+
+    assert result == "retired"
+
+
 def test_resync_document_acl_tolerates_concurrent_retirement(monkeypatch: pytest.MonkeyPatch) -> None:
     config = build_config()
     lifecycle = FakeLifecycleRepository()
+    audit_container = MagicMock()
 
     def _raise(*a: Any, **k: Any) -> None:
         raise TerminalDocumentError("unsafe_acl:no_verified_security_groups")
@@ -416,6 +453,7 @@ def test_resync_document_acl_tolerates_concurrent_retirement(monkeypatch: pytest
     connector = FakeConnector(_raise)
     monkeypatch.setattr(lifecycle, "retire_document", _retire_conflict)
 
-    result = services.resync_document_acl(config, _ready_ref(), lifecycle, connector)
+    result = services.resync_document_acl(config, _ready_ref(), lifecycle, connector, audit_container=audit_container)
 
     assert result == "retired"
+    audit_container.create_item.assert_not_called()

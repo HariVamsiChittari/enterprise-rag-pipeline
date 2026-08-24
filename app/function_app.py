@@ -841,11 +841,13 @@ def acl_resync_page_activity(payload: dict) -> dict:
         lifecycle_repository = _build_lifecycle_repository(config)
         graph_client = _build_graph_client(config)
         sp_client = _build_sharepoint_client(config)
+        audit_container = _build_audit_container(config)
         connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
         outcome, token = run_acl_resync_page(
             config, lifecycle_repository, connector,
             page_size=ACL_RESYNC_PAGE_SIZE,
             continuation_token=payload.get("continuationToken"),
+            audit_container=audit_container,
         )
         logger.info(
             "acl_resync_page_completed checked=%d unchanged=%d updated=%d retired=%d has_more=%s",

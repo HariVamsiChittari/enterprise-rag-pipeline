@@ -521,6 +521,7 @@ def resync_document_acl(
     ref: ReadyDocumentRef,
     lifecycle_repository: DocumentLifecycleRepository,
     connector: SourceConnector,
+    audit_container: Any | None = None,
 ) -> str:
     """Re-verify one ready document's ACL. Returns 'unchanged' | 'updated' | 'retired'."""
     try:
@@ -535,6 +536,14 @@ def resync_document_acl(
             )
         except LifecycleConflictError:
             pass
+        else:
+            if audit_container is not None:
+                write_audit_record(audit_container, config.source_id, ref.source_run_id, {
+                    "operation": "document_retired", "documentId": ref.document_id,
+                    "retiredReason": "acl_revoked",
+                    "sourceName": getattr(ref, "source_name", ""),
+                    "sourceUrl": getattr(ref, "source_url", ""),
+                })
         return "retired"
 
     if acl.acl_hash == ref.acl_hash:
@@ -560,6 +569,7 @@ def run_acl_resync_page(
     *,
     page_size: int,
     continuation_token: str | None,
+    audit_container: Any | None = None,
 ) -> tuple[AclResyncOutcome, str | None]:
     """Re-verify ACLs for one bounded page of ready documents (Durable-activity-sized)."""
     page = lifecycle_repository.list_ready_documents_page(
@@ -567,7 +577,7 @@ def run_acl_resync_page(
     )
     unchanged = updated = retired = 0
     for ref in page.items:
-        result = resync_document_acl(config, ref, lifecycle_repository, connector)
+        result = resync_document_acl(config, ref, lifecycle_repository, connector, audit_container=audit_container)
         if result == "unchanged":
             unchanged += 1
         elif result == "updated":
