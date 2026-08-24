@@ -85,12 +85,18 @@ Content-Type: application/json
 
 ```json
 {
-  "id": "sharepoint-drive-sync",
-  "statusQueryGetUri": "https://<func>.azurewebsites.net/runtime/webhooks/durabletask/instances/sharepoint-drive-sync?...",
+  "id": "3f9c1a7b2e4d4f6a9c8b1d2e3f4a5b6c",
+  "statusQueryGetUri": "https://<func>.azurewebsites.net/runtime/webhooks/durabletask/instances/3f9c1a7b2e4d4f6a9c8b1d2e3f4a5b6c?...",
   "sendEventPostUri": "...",
   "terminatePostUri": "..."
 }
 ```
+
+Each run gets a fresh, randomly generated instance ID — Durable Functions instance-ID
+reuse is documented as best-effort/racy at the storage layer
+([Azure/azure-functions-durable-python#410](https://github.com/Azure/azure-functions-durable-python/issues/410)),
+so the app never reuses one. The current instance ID for a run is available from the
+response above, or by omitting `instanceId` on `GET /api/ingestion/status` (see below).
 
 **Error responses**
 
@@ -108,7 +114,7 @@ Query the runtime status of an orchestration instance (full-sync, delta-sync, or
 **Request**
 
 ```http
-GET /api/ingestion/status?instanceId=<id> HTTP/1.1
+GET /api/ingestion/status?instanceId=<id>&showHistory=true HTTP/1.1
 Authorization: Bearer <token>
 ```
 
@@ -116,19 +122,19 @@ Authorization: Bearer <token>
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `instanceId` | No | Full-sync singleton for the current `INGESTION_SOURCE_ID` | Any orchestration instance ID |
+| `instanceId` | No | Current full-sync instance for `INGESTION_SOURCE_ID`, resolved via Cosmos | Any orchestration instance ID |
+| `showHistory` | No | `false` | If `true`, adds a `history` field with the orchestration's replay history (diagnostic use) |
 
-Common instance IDs:
-
-- Full-sync: `<source_id>-sync` (e.g. `sharepoint-drive-sync`)
-- Delta-sync: `delta-sync-<source_id>`
-- ACL-resync: `acl-resync-<source_id>`
+Instance IDs are randomly generated per run, not derived from `INGESTION_SOURCE_ID` or the
+orchestration kind — omitting `instanceId` only resolves the *current full-sync* instance.
+To check a delta-sync or ACL-resync tick, use the `instanceId` returned when it started (see
+`webhook_received`/`acl_resync_*` audit records via `/api/ingestion/inspect?container=service-audit`).
 
 **Response — 200 OK**
 
 ```json
 {
-  "instanceId": "sharepoint-drive-sync",
+  "instanceId": "3f9c1a7b2e4d4f6a9c8b1d2e3f4a5b6c",
   "runtimeStatus": "OrchestrationRuntimeStatus.Completed",
   "output": {
     "status": "completed",
@@ -166,7 +172,7 @@ Authorization: Bearer <token>
 
 | Name | Required | Default | Description |
 |---|---|---|---|
-| `instanceId` | No | Full-sync singleton | Instance to terminate |
+| `instanceId` | No | Current full-sync instance, resolved via Cosmos | Instance to terminate |
 
 **Response — 200 OK**
 
@@ -176,7 +182,7 @@ Authorization: Bearer <token>
   "runId": "run:sharepoint-drive:...",
   "docsForceFailed": 3,
   "counters": {"discovered": 22, "ready": 19, "failed": 3},
-  "orchestrationId": "sharepoint-drive-sync"
+  "orchestrationId": "3f9c1a7b2e4d4f6a9c8b1d2e3f4a5b6c"
 }
 ```
 
@@ -210,7 +216,7 @@ Content-Type: application/json
 {
   "status": "retrying",
   "count": 3,
-  "orchestrationId": "retry-failed-sharepoint-drive-sync"
+  "orchestrationId": "retry-failed-3f9c1a7b2e4d4f6a9c8b1d2e3f4a5b6c"
 }
 ```
 

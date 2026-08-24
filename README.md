@@ -6,7 +6,7 @@ Secure, ACL-trimmed RAG system that ingests PDFs from a SharePoint document libr
 
 - **Ingestion:** Azure Functions (Flex Consumption) with Durable Functions orchestration
 - **Retrieval:** Hybrid RAG (standard + agentic) on ACA (dev) / AKS (prod) with automatic routing
-- **Durable Backend:** Durable Task Scheduler (singleton instance per source)
+- **Durable Backend:** Durable Task Scheduler (fresh instance ID per run, tracked via Cosmos)
 - **Storage:** Cosmos DB NoSQL (4 containers: ingestion-runs, source-documents, search-chunks, service-audit)
 - **AI Services:** Document Intelligence, Azure AI Language, Azure OpenAI
 - **Auth:** Managed Identity (Azure services) + Certificate credential (Microsoft Graph)

@@ -293,3 +293,35 @@ def test_save_delta_cursor_rejects_empty_link() -> None:
 
     with pytest.raises(ValueError):
         repo.save_delta_cursor("source", "")
+
+
+def test_trigger_instance_id_round_trip_is_independent_per_control_id() -> None:
+    from ingestion.lifecycle_repository import ACL_RESYNC_TRIGGER_ID, DELTA_SYNC_TRIGGER_ID
+
+    runs = FakeContainer("sourceId")
+    repo = DocumentLifecycleRepository(runs, FakeContainer("sourceRunId"), FakeContainer("documentKey"))
+
+    assert repo.get_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID) is None
+    assert repo.get_trigger_instance_id("source", ACL_RESYNC_TRIGGER_ID) is None
+
+    repo.save_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID, "delta-sync-trigger-abc123")
+    repo.save_trigger_instance_id("source", ACL_RESYNC_TRIGGER_ID, "acl-resync-trigger-def456")
+
+    assert repo.get_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID) == "delta-sync-trigger-abc123"
+    assert repo.get_trigger_instance_id("source", ACL_RESYNC_TRIGGER_ID) == "acl-resync-trigger-def456"
+
+    # Overwriting one control_id must not clobber the other or the unrelated delta cursor.
+    repo.save_delta_cursor("source", "https://graph.microsoft.com/v1.0/drives/d/root/delta?token=abc")
+    repo.save_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID, "delta-sync-trigger-xyz789")
+    assert repo.get_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID) == "delta-sync-trigger-xyz789"
+    assert repo.get_trigger_instance_id("source", ACL_RESYNC_TRIGGER_ID) == "acl-resync-trigger-def456"
+    assert repo.get_delta_cursor("source") == "https://graph.microsoft.com/v1.0/drives/d/root/delta?token=abc"
+
+
+def test_save_trigger_instance_id_rejects_empty_id() -> None:
+    from ingestion.lifecycle_repository import DELTA_SYNC_TRIGGER_ID
+
+    repo = DocumentLifecycleRepository(FakeContainer("sourceId"), FakeContainer("sourceRunId"), FakeContainer("documentKey"))
+
+    with pytest.raises(ValueError):
+        repo.save_trigger_instance_id("source", DELTA_SYNC_TRIGGER_ID, "")

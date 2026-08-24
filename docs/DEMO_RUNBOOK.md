@@ -196,8 +196,10 @@ $r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status" -Method GET -Headers
 $status = $r.Content | ConvertFrom-Json
 Write-Host "Full-sync: $($status.output.status) | discovered=$($status.output.discovered) succeeded=$($status.output.succeeded) failed=$($status.output.failed)"
 
-# Delta-sync status
-$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status?instanceId=delta-sync-sharepoint-drive" -Method GET -Headers $h -UseBasicParsing
+# Delta-sync status (instance ID is randomly generated per tick, never reused — look it up)
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=ingestion-runs&limit=50" -Method GET -Headers $h -UseBasicParsing
+$deltaInstanceId = (($r.Content | ConvertFrom-Json).rows | Where-Object { $_.id -eq "delta-sync-trigger" }).currentInstanceId
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status?instanceId=$deltaInstanceId" -Method GET -Headers $h -UseBasicParsing
 $delta = $r.Content | ConvertFrom-Json
 Write-Host "Delta-sync: $($delta.output | ConvertTo-Json -Compress)"
 
@@ -352,17 +354,20 @@ Check Step 13 and Step 20 before treating it as a subscription failure.
 ### Step 20: Watch the delta-sync orchestration run
 
 ```powershell
-$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status?instanceId=delta-sync-sharepoint-drive" -Method GET -Headers $h -UseBasicParsing
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/inspect?container=ingestion-runs&limit=50" -Method GET -Headers $h -UseBasicParsing
+$deltaInstanceId = (($r.Content | ConvertFrom-Json).rows | Where-Object { $_.id -eq "delta-sync-trigger" }).currentInstanceId
+$r = Invoke-WebRequest -Uri "$baseUrl/api/ingestion/status?instanceId=$deltaInstanceId" -Method GET -Headers $h -UseBasicParsing
 ($r.Content | ConvertFrom-Json) | ConvertTo-Json -Depth 6
 ```
 
 Re-run this until `runtimeStatus` is `Completed`. The `output` block reports
 `createdOrUpdated`, `deleted`, `aclResynced`, `failed`, and `itemsSeen` counts for the most
-recent completed delta-sync tick. The durable instance is a singleton: notifications received
-while it is running are coalesced, so the counts can cover multiple changes and cannot by
-themselves prove that this file was processed. Correlate `lastUpdatedTime` with Step 19, then use
-Step 21 as the authoritative per-file result. For a delete processed by this tick, expect
-`deleted` to be greater than zero.
+recent completed delta-sync tick. Each tick gets a fresh Durable instance ID, but
+notifications received while a tick is already running are coalesced into it (see
+`_start_if_not_running` in `function_app.py`), so the counts can cover multiple changes and
+cannot by themselves prove that this file was processed. Correlate `lastUpdatedTime` with
+Step 19, then use Step 21 as the authoritative per-file result. For a delete processed by
+this tick, expect `deleted` to be greater than zero.
 
 ### Step 21: Check the document's ingestion record
 

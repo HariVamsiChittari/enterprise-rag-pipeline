@@ -819,7 +819,7 @@ Env var values fall into five categories. This section shows exactly how to obta
 
 | Env Var | How to generate |
 |---|---|
-| `INGESTION_SOURCE_ID` | Pick a stable slug (e.g., `sharepoint-policies`). This becomes part of Cosmos partition keys and Durable orchestration instance IDs — do not change after data exists. |
+| `INGESTION_SOURCE_ID` | Pick a stable slug (e.g., `sharepoint-policies`). This becomes part of Cosmos partition keys — do not change after data exists. |
 | `WEBHOOK_CLIENT_STATE` | Generate a 32-char random secret: `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
 
 > **Migration note**: If you are moving an **existing** deployment to a new environment (rehydrating from a Cosmos backup), keep the original `INGESTION_SOURCE_ID` value — changing it would orphan every existing row (partition keys embed it). Verify the value in the current deployment first: `az functionapp config appsettings list --name <func-app> --resource-group <rg> --query "[?name=='INGESTION_SOURCE_ID'].value" -o tsv`.
@@ -1174,14 +1174,21 @@ Invoke-WebRequest -Uri "$base/api/webhook/sharepoint" -Method POST `
 
 #### Check delta-sync status
 
+Delta-sync/ACL-resync get a fresh, randomly generated Durable instance ID per tick (never
+reused — see [ARCHITECTURE.md](ARCHITECTURE.md)), so look up the current instance ID from its
+Cosmos tracking record first:
+
 ```powershell
-Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=delta-sync-sharepoint-drive" -Headers $headers | ConvertTo-Json -Depth 3
+$rows = (Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=ingestion-runs&limit=50" -Headers $headers).rows
+$deltaInstanceId = ($rows | Where-Object { $_.id -eq "delta-sync-trigger" }).currentInstanceId
+Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=$deltaInstanceId" -Headers $headers | ConvertTo-Json -Depth 3
 ```
 
 #### Check ACL resync status
 
 ```powershell
-Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=acl-resync-sharepoint-drive" -Headers $headers | ConvertTo-Json -Depth 3
+$aclInstanceId = ($rows | Where-Object { $_.id -eq "acl-resync-trigger" }).currentInstanceId
+Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=$aclInstanceId" -Headers $headers | ConvertTo-Json -Depth 3
 ```
 
 #### Query App Insights logs

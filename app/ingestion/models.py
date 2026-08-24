@@ -450,12 +450,6 @@ def run_record_id(run_id: str) -> str:
     return f"run:{run_id}"
 
 
-def create_orchestration_instance_id(source_id: str) -> str:
-    _require_text("source_id", source_id, 200)
-    digest = hashlib.sha256(source_id.encode("utf-8")).hexdigest()[:32]
-    return f"full-sync-{digest}"
-
-
 def create_source_run_id(source_id: str, run_id: str) -> str:
     _require_text("source_id", source_id, 200)
     _require_text("run_id", run_id, 100)

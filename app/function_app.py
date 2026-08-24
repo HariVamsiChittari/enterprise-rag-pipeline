@@ -40,42 +40,56 @@ WEBHOOK_CLIENT_STATE = os.getenv("WEBHOOK_CLIENT_STATE", "")
 @app.route(route="ingestion/full-sync", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 @app.durable_client_input(client_name="client")
 async def start_full_sync(req: func.HttpRequest, client) -> func.HttpResponse:
-    """Start the durable full-sync orchestrator with singleton instance ID."""
-    from ingestion.models import create_orchestration_instance_id
+    """Start the durable full-sync orchestrator with a fresh, never-reused instance ID.
+
+    Durable instance-ID reuse is documented by Microsoft as best-effort and racy at the
+    storage layer (Azure/azure-functions-durable-python#410), so "is a full-sync already
+    running" is tracked via the app's own Cosmos source-control/run records instead of a
+    fixed, guessable Durable instance ID.
+    """
+    from config import load_config
 
     source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
     if not source_id:
         return _json_response({"error": "missing_ingestion_source_id"}, 503)
 
-    instance_id = create_orchestration_instance_id(source_id)
-    existing = await client.get_status(instance_id)
-    if existing and existing.runtime_status in (
-        df.OrchestrationRuntimeStatus.Running,
-        df.OrchestrationRuntimeStatus.Pending,
-    ):
+    config = load_config()
+    repository = _build_repository(config)
+    if _full_sync_is_running(repository, source_id):
+        instance_id = _current_full_sync_instance_id(repository, source_id)
         return _json_response({"status": "already_running", "instanceId": instance_id}, 409)
 
-    await client.start_new("full_sync_orchestrator", instance_id=instance_id)
+    instance_id = await client.start_new("full_sync_orchestrator")
     return client.create_check_status_response(req, instance_id)
 
 
 @app.route(route="ingestion/status", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
 @app.durable_client_input(client_name="client")
 async def get_status(req: func.HttpRequest, client) -> func.HttpResponse:
-    """Query orchestration status."""
-    from ingestion.models import create_orchestration_instance_id
+    """Query orchestration status. ?showHistory=true adds the replay history (diagnostic)."""
+    from config import load_config
     source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
-    instance_id = req.params.get("instanceId") or create_orchestration_instance_id(source_id)
-    status = await client.get_status(instance_id)
+    instance_id = req.params.get("instanceId")
+    if not instance_id:
+        config = load_config()
+        repository = _build_repository(config)
+        instance_id = _current_full_sync_instance_id(repository, source_id)
+        if not instance_id:
+            return _json_response({"error": "not_found"}, 404)
+    show_history = (req.params.get("showHistory") or "").lower() == "true"
+    status = await client.get_status(instance_id, show_history=show_history, show_history_output=show_history)
     if not status:
         return _json_response({"error": "not_found"}, 404)
-    return _json_response({
+    payload = {
         "instanceId": instance_id,
         "runtimeStatus": str(status.runtime_status),
         "output": status.output,
         "createdTime": str(status.created_time) if status.created_time else None,
         "lastUpdatedTime": str(status.last_updated_time) if status.last_updated_time else None,
-    }, 200)
+    }
+    if show_history:
+        payload["history"] = status.history
+    return _json_response(payload, 200)
 
 
 @app.route(route="ingestion/terminate", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
@@ -83,36 +97,59 @@ async def get_status(req: func.HttpRequest, client) -> func.HttpResponse:
 async def terminate_ingestion(req: func.HttpRequest, client) -> func.HttpResponse:
     """Terminate orchestration, fail non-terminal docs, and finalize run as TERMINATED."""
     from config import load_config
-    from ingestion.models import create_orchestration_instance_id
     from ingestion.services import terminate_run
     source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
-    instance_id = req.params.get("instanceId") or create_orchestration_instance_id(source_id)
-    await client.terminate(instance_id, "operator_terminated")
-    await client.purge_instance_history(instance_id)
     config = load_config()
     repository = _build_repository(config)
+    instance_id = req.params.get("instanceId") or _current_full_sync_instance_id(repository, source_id)
+    if instance_id:
+        await client.terminate(instance_id, "operator_terminated")
+        # purge requires the instance to already be in a terminal state.
+        if await _wait_for_terminal_status(client, instance_id):
+            await client.purge_instance_history(instance_id)
+        else:
+            logger.warning("terminate_ingestion: %s did not reach terminal status in time, skipping purge", instance_id)
     result = terminate_run(config, repository)
     result["orchestrationId"] = instance_id
     return _json_response(result, 200)
+
+
+async def _wait_for_terminal_status(client, instance_id: str, timeout_seconds: int = 30) -> bool:
+    """Poll until the instance reaches a status purge_instance_history requires, or timeout.
+
+    terminate()/purge_instance_history() are client-function calls, not orchestrator code,
+    so ordinary async/await and asyncio.sleep are safe here (Durable's determinism
+    constraints only apply inside orchestrator functions).
+    """
+    import asyncio
+    terminal = (
+        df.OrchestrationRuntimeStatus.Completed,
+        df.OrchestrationRuntimeStatus.Failed,
+        df.OrchestrationRuntimeStatus.Terminated,
+    )
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout_seconds
+    while True:
+        status = await client.get_status(instance_id)
+        if status is None or status.runtime_status in terminal:
+            return True
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(1)
 
 
 @app.route(route="ingestion/retry-failed", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 @app.durable_client_input(client_name="client")
 async def retry_failed(req: func.HttpRequest, client) -> func.HttpResponse:
     """Retry only the failed documents from the current run."""
+    import uuid
     from config import load_config
-    from ingestion.models import create_orchestration_instance_id
     from ingestion.services import get_retry_candidates
     source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
-    instance_id = create_orchestration_instance_id(source_id)
-    status = await client.get_status(instance_id)
-    if status and status.runtime_status in (
-        df.OrchestrationRuntimeStatus.Running,
-        df.OrchestrationRuntimeStatus.Pending,
-    ):
-        return _json_response({"error": "sync_in_progress"}, 409)
     config = load_config()
     repository = _build_repository(config)
+    if _full_sync_is_running(repository, source_id):
+        return _json_response({"error": "sync_in_progress"}, 409)
     candidates = get_retry_candidates(config, repository)
     if not candidates:
         return _json_response({"status": "nothing_to_retry", "failed": 0}, 200)
@@ -123,7 +160,7 @@ async def retry_failed(req: func.HttpRequest, client) -> func.HttpResponse:
             reset_docs.append({"documentId": reset["id"], "sourceRunId": reset["sourceRunId"]})
     if not reset_docs:
         return _json_response({"status": "reset_failed", "failed": len(candidates)}, 500)
-    retry_id = f"retry-failed-{instance_id}"
+    retry_id = f"retry-failed-{uuid.uuid4().hex}"
     await client.start_new("retry_failed_orchestrator", instance_id=retry_id, client_input=reset_docs)
     return _json_response({"status": "retrying", "count": len(reset_docs), "orchestrationId": retry_id}, 202)
 
@@ -182,7 +219,6 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
     """Delete items from a Cosmos container. Writes an audit record for every purge."""
     from azure.cosmos import CosmosClient
     from azure.identity import DefaultAzureCredential
-    from datetime import datetime, timezone
     import uuid
 
     try:
@@ -251,8 +287,12 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
                     except Exception:
                         failed += 1
 
-        audit_record = {
-            "id": str(uuid.uuid4()),
+        # write_audit_record never raises, so it can't mask a completed purge as a failure.
+        from ingestion.telemetry import write_audit_record
+        audit_id = str(uuid.uuid4())
+        source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
+        write_audit_record(audit_container, source_id, "purge", {
+            "id": audit_id,
             "operation": "purge",
             "container": container_name,
             "operator": operator,
@@ -260,12 +300,10 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
             "deletedCount": len(deleted_ids),
             "failedCount": failed,
             "purgeAll": purge_all,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        audit_container.upsert_item(audit_record)
+        })
         logger.warning("purge_executed container=%s deleted=%d failed=%d operator=%s", container_name, len(deleted_ids), failed, operator)
 
-        return _json_response({"deleted": len(deleted_ids), "failed": failed, "auditId": audit_record["id"]}, 200)
+        return _json_response({"deleted": len(deleted_ids), "failed": failed, "auditId": audit_id}, 200)
     except Exception:
         logger.exception("purge_data failed")
         return _json_response({"error": "purge_failed"}, 503)
@@ -300,42 +338,74 @@ def query_endpoint(req: func.HttpRequest) -> func.HttpResponse:
 
 
 
-async def _full_sync_is_running(client, source_id: str) -> bool:
+def _current_full_sync_instance_id(repository, source_id: str) -> str | None:
+    """The Durable instance ID of the most recent full-sync run, per Cosmos, or None."""
+    control = repository.get_source_control(source_id)
+    return control.record.current_orchestration_instance_id if control else None
+
+
+def _full_sync_is_running(repository, source_id: str) -> bool:
     """True if full_sync_orchestrator is currently active for this source.
 
     delta-sync/acl-resync skip their tick while this is true: full-sync's
     discover_all() has no knowledge of delta-sync's cursor (and vice versa), so
     running them concurrently on the same changed file could create two
     simultaneously-"ready" versions with neither retiring the other.
+
+    Checked via Cosmos rather than Durable's per-instance-ID status: this app never
+    reuses instance IDs, so there is no fixed ID to poll (see start_full_sync).
     """
-    from ingestion.models import create_orchestration_instance_id
-    status = await client.get_status(create_orchestration_instance_id(source_id))
-    return bool(status and status.runtime_status in (
-        df.OrchestrationRuntimeStatus.Running,
-        df.OrchestrationRuntimeStatus.Pending,
-    ))
+    from ingestion.models import RunStatus
+    control = repository.get_source_control(source_id)
+    if control is None:
+        return False
+    run = repository.get_run(source_id, control.record.current_run_id)
+    return run is not None and run.record.status == RunStatus.RUNNING
+
+
+async def _start_if_not_running(client, lifecycle_repository, source_id: str, control_id: str, orchestrator_name: str) -> str | None:
+    """Start `orchestrator_name` with a fresh, never-reused instance ID, unless the tick
+    tracked under `control_id` is still Running/Pending. Returns the new instance ID, or
+    None if a previous tick is still active.
+
+    Mirrors start_full_sync's fix: Durable instance-ID reuse is best-effort/racy at the
+    storage layer (Azure/azure-functions-durable-python#410), so we never poll or start a
+    fixed ID — the last-dispatched ID is tracked in Cosmos purely so we know what to poll.
+    """
+    import uuid
+    existing_id = lifecycle_repository.get_trigger_instance_id(source_id, control_id)
+    if existing_id:
+        existing = await client.get_status(existing_id)
+        if existing and existing.runtime_status in (
+            df.OrchestrationRuntimeStatus.Running,
+            df.OrchestrationRuntimeStatus.Pending,
+        ):
+            return None
+    instance_id = f"{control_id}-{uuid.uuid4().hex}"
+    lifecycle_repository.save_trigger_instance_id(source_id, control_id, instance_id)
+    await client.start_new(orchestrator_name, instance_id=instance_id)
+    return instance_id
 
 
 @app.timer_trigger(schedule=RECONCILIATION_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
 @app.durable_client_input(client_name="client")
 async def reconciliation_timer(timer: func.TimerRequest, client) -> None:
     """Daily safety-net delta-sync — catches changes missed by webhooks."""
+    from config import load_config
+    from ingestion.lifecycle_repository import DELTA_SYNC_TRIGGER_ID
     source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
     if not source_id:
         logger.warning("reconciliation_timer skipped: missing INGESTION_SOURCE_ID")
         return
-    if await _full_sync_is_running(client, source_id):
+    config = load_config()
+    repository = _build_repository(config)
+    if _full_sync_is_running(repository, source_id):
         logger.info("reconciliation_timer skipped: full-sync is running")
         return
-    instance_id = f"delta-sync-{source_id}"
-    existing = await client.get_status(instance_id)
-    if existing and existing.runtime_status in (
-        df.OrchestrationRuntimeStatus.Running,
-        df.OrchestrationRuntimeStatus.Pending,
-    ):
+    lifecycle_repository = _build_lifecycle_repository(config)
+    started = await _start_if_not_running(client, lifecycle_repository, source_id, DELTA_SYNC_TRIGGER_ID, "delta_sync_orchestrator")
+    if not started:
         logger.info("reconciliation_timer skipped: previous tick still running")
-        return
-    await client.start_new("delta_sync_orchestrator", instance_id=instance_id)
 
 
 @app.timer_trigger(schedule=ACL_RESYNC_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
@@ -343,22 +413,21 @@ async def reconciliation_timer(timer: func.TimerRequest, client) -> None:
 async def acl_resync_timer(timer: func.TimerRequest, client) -> None:
     """Kick off one ACL-resync pass unless the previous pass, or a full-sync,
     is still running."""
+    from config import load_config
+    from ingestion.lifecycle_repository import ACL_RESYNC_TRIGGER_ID
     source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
     if not source_id:
         logger.warning("acl_resync_timer skipped: missing INGESTION_SOURCE_ID")
         return
-    if await _full_sync_is_running(client, source_id):
+    config = load_config()
+    repository = _build_repository(config)
+    if _full_sync_is_running(repository, source_id):
         logger.info("acl_resync_timer skipped: full-sync is running")
         return
-    instance_id = f"acl-resync-{source_id}"
-    existing = await client.get_status(instance_id)
-    if existing and existing.runtime_status in (
-        df.OrchestrationRuntimeStatus.Running,
-        df.OrchestrationRuntimeStatus.Pending,
-    ):
+    lifecycle_repository = _build_lifecycle_repository(config)
+    started = await _start_if_not_running(client, lifecycle_repository, source_id, ACL_RESYNC_TRIGGER_ID, "acl_resync_orchestrator")
+    if not started:
         logger.info("acl_resync_timer skipped: previous pass still running")
-        return
-    await client.start_new("acl_resync_orchestrator", instance_id=instance_id)
 
 
 
@@ -387,20 +456,20 @@ async def webhook_sharepoint(req: func.HttpRequest, client) -> func.HttpResponse
     if not source_id:
         return func.HttpResponse(status_code=200)
 
-    if await _full_sync_is_running(client, source_id):
+    from config import load_config
+    from ingestion.lifecycle_repository import DELTA_SYNC_TRIGGER_ID
+    config = load_config()
+    repository = _build_repository(config)
+    if _full_sync_is_running(repository, source_id):
         logger.info("webhook_sharepoint: full-sync running, skipping delta trigger")
         return func.HttpResponse(status_code=200)
 
-    instance_id = f"delta-sync-{source_id}"
-    existing = await client.get_status(instance_id)
-    if existing and existing.runtime_status in (
-        df.OrchestrationRuntimeStatus.Running,
-        df.OrchestrationRuntimeStatus.Pending,
-    ):
+    lifecycle_repository = _build_lifecycle_repository(config)
+    started = await _start_if_not_running(client, lifecycle_repository, source_id, DELTA_SYNC_TRIGGER_ID, "delta_sync_orchestrator")
+    if not started:
         logger.info("webhook_sharepoint: delta-sync already running")
         return func.HttpResponse(status_code=200)
 
-    await client.start_new("delta_sync_orchestrator", instance_id=instance_id)
     logger.info("webhook_sharepoint: started delta_sync_orchestrator")
     _write_webhook_audit(source_id, "webhook_received", {"action": "delta_sync_triggered"})
     return func.HttpResponse(status_code=200)
@@ -449,20 +518,19 @@ async def subscription_renew_timer(timer: func.TimerRequest) -> None:
     lifecycle_repository = _build_lifecycle_repository(config)
     existing_id = lifecycle_repository.get_webhook_subscription_id(source_id)
 
-    with graph_client:
-        if existing_id:
-            try:
-                info = renew_subscription(graph_client, existing_id)
-                logger.info("subscription_renewed: %s expires %s", info.subscription_id, info.expiration)
-                return
-            except SubscriptionNotFoundError:
-                logger.info("subscription_expired, creating new one")
+    if existing_id:
+        try:
+            info = renew_subscription(graph_client, existing_id)
+            logger.info("subscription_renewed: %s expires %s", info.subscription_id, info.expiration)
+            return
+        except SubscriptionNotFoundError:
+            logger.info("subscription_expired, creating new one")
 
-        info = create_subscription(
-            graph_client, config.drive_id, notification_url, lifecycle_url, WEBHOOK_CLIENT_STATE,
-        )
-        lifecycle_repository.save_webhook_subscription_id(source_id, info.subscription_id)
-        logger.info("subscription_created: %s expires %s", info.subscription_id, info.expiration)
+    info = create_subscription(
+        graph_client, config.drive_id, notification_url, lifecycle_url, WEBHOOK_CLIENT_STATE,
+    )
+    lifecycle_repository.save_webhook_subscription_id(source_id, info.subscription_id)
+    logger.info("subscription_created: %s expires %s", info.subscription_id, info.expiration)
 
 
 @app.orchestration_trigger(context_name="context")
@@ -471,7 +539,9 @@ def full_sync_orchestrator(context: df.DurableOrchestrationContext):
     from datetime import timedelta
     retry = df.RetryOptions(first_retry_interval_in_milliseconds=5000, max_number_of_attempts=5)
 
-    activated = yield context.call_activity_with_retry("activate_run_activity", retry, None)
+    activated = yield context.call_activity_with_retry(
+        "activate_run_activity", retry, {"instanceId": context.instance_id}
+    )
     if activated.get("error"):
         return {"status": "failed", "phase": "activate", "error": activated["error"]}
 
@@ -613,13 +683,13 @@ def retry_failed_orchestrator(context: df.DurableOrchestrationContext):
 
 
 @app.activity_trigger(input_name="payload")
-def activate_run_activity(payload: Any) -> dict:
+def activate_run_activity(payload: dict) -> dict:
     from config import load_config
     from ingestion.services import activate
     try:
         config = load_config()
         repository = _build_repository(config)
-        activated = activate(config, repository)
+        activated = activate(config, repository, payload["instanceId"])
         return {"runId": activated.run.record.run_id, "runEtag": activated.run.etag}
     except Exception as error:
         logger.exception("activate_run_activity failed")
@@ -635,9 +705,8 @@ def discover_all_activity(payload: dict) -> dict:
         config = load_config()
         repository = _build_repository(config)
         graph_client = _build_graph_client(config)
-        with graph_client:
-            connector = SharePointConnector(graph_client, config.drive_id)
-            documents, items_scanned = discover_all(config, payload["runId"], repository, connector)
+        connector = SharePointConnector(graph_client, config.drive_id)
+        documents, items_scanned = discover_all(config, payload["runId"], repository, connector)
         return {
             "documents": [{"documentId": d.document_id, "sourceRunId": d.source_run_id} for d in documents],
             "itemsScanned": items_scanned,
@@ -666,14 +735,13 @@ def process_document_activity(payload: dict) -> dict:
         if stored is None:
             return {"documentId": document_ref["documentId"], "status": "skipped"}
 
-        with graph_client:
-            sp_client = _build_sharepoint_client(config)
-            connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
-            outcome = process_document(
-                config, stored.record, stored.etag, repository,
-                connector, di_client, language_client, openai_client,
-                audit_container=audit_container,
-            )
+        sp_client = _build_sharepoint_client(config)
+        connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
+        outcome = process_document(
+            config, stored.record, stored.etag, repository,
+            connector, di_client, language_client, openai_client,
+            audit_container=audit_container,
+        )
         if outcome.status.value == "succeeded":
             _retire_prior_version(config, document_ref["documentId"], document_ref["sourceRunId"], audit_container)
         return {
@@ -685,11 +753,14 @@ def process_document_activity(payload: dict) -> dict:
     except Exception as error:
         from ingestion.models import safe_error_from_exception
         logger.exception("process_document_activity failed")
-        # Retryable errors (e.g. OpenAI 429) must propagate so call_activity_with_retry
-        # actually retries; only non-retryable/unexpected errors become a terminal result here.
-        if safe_error_from_exception(error, "activity").retryable:
-            raise
-        return {"documentId": document_ref.get("documentId", ""), "status": "failed", "error": str(error)}
+        safe = safe_error_from_exception(error, "activity")
+        # Retryable errors must propagate so call_activity_with_retry actually retries, but
+        # re-raise a sanitized message: a raw exception can embed a signed download URL,
+        # tripping a host bug that corrupts Durable's replay state for exceptions containing
+        # credential-like tokens (Azure/azure-functions-durable-python#600).
+        if safe.retryable:
+            raise TimeoutError(safe.code) from None
+        return {"documentId": document_ref.get("documentId", ""), "status": "failed", "error": safe.code}
 
 
 @app.activity_trigger(input_name="payload")
@@ -736,14 +807,13 @@ def delta_sync_activity(payload: Any) -> dict:
         language_client = _build_language_client(config) if config.enrichment_enabled else None
         openai_client = _build_openai_client(config)
         audit_container = _build_audit_container(config)
-        with graph_client:
-            sp_client = _build_sharepoint_client(config)
-            connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
-            outcome = run_delta_sync(
-                config, repository, lifecycle_repository, connector,
-                di_client, language_client, openai_client,
-                audit_container=audit_container,
-            )
+        sp_client = _build_sharepoint_client(config)
+        connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
+        outcome = run_delta_sync(
+            config, repository, lifecycle_repository, connector,
+            di_client, language_client, openai_client,
+            audit_container=audit_container,
+        )
         logger.info(
             "delta_sync_completed bootstrapped=%s created_or_updated=%d deleted=%d acl_resynced=%d failed=%d items_seen=%d",
             outcome.bootstrapped, outcome.created_or_updated, outcome.deleted, outcome.acl_resynced, outcome.failed, outcome.items_seen,
@@ -770,14 +840,13 @@ def acl_resync_page_activity(payload: dict) -> dict:
         config = load_config()
         lifecycle_repository = _build_lifecycle_repository(config)
         graph_client = _build_graph_client(config)
-        with graph_client:
-            sp_client = _build_sharepoint_client(config)
-            connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
-            outcome, token = run_acl_resync_page(
-                config, lifecycle_repository, connector,
-                page_size=ACL_RESYNC_PAGE_SIZE,
-                continuation_token=payload.get("continuationToken"),
-            )
+        sp_client = _build_sharepoint_client(config)
+        connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
+        outcome, token = run_acl_resync_page(
+            config, lifecycle_repository, connector,
+            page_size=ACL_RESYNC_PAGE_SIZE,
+            continuation_token=payload.get("continuationToken"),
+        )
         logger.info(
             "acl_resync_page_completed checked=%d unchanged=%d updated=%d retired=%d has_more=%s",
             outcome.checked, outcome.unchanged, outcome.updated, outcome.retired, token is not None,
@@ -821,32 +890,40 @@ def _retire_prior_version(config, document_id: str, current_source_run_id: str, 
         logger.warning("retire_prior_version failed for %s", document_id, exc_info=True)
 
 
+# Built once per worker and reused across invocations (Azure Functions Python guidance).
+_client_cache: dict[str, Any] = {}
+
+
 def _build_repository(config):
-    from azure.cosmos import CosmosClient
-    from azure.identity import DefaultAzureCredential
-    from ingestion.repository import IngestionRepository
-    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-    cosmos = CosmosClient(config.cosmos_endpoint, credential=credential)
-    db = cosmos.get_database_client(config.cosmos_database)
-    return IngestionRepository(
-        db.get_container_client(config.cosmos_ingestion_runs_container),
-        db.get_container_client(config.cosmos_source_documents_container),
-        db.get_container_client(config.cosmos_search_chunks_container),
-    )
+    if "repository" not in _client_cache:
+        from azure.cosmos import CosmosClient
+        from azure.identity import DefaultAzureCredential
+        from ingestion.repository import IngestionRepository
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        cosmos = CosmosClient(config.cosmos_endpoint, credential=credential)
+        db = cosmos.get_database_client(config.cosmos_database)
+        _client_cache["repository"] = IngestionRepository(
+            db.get_container_client(config.cosmos_ingestion_runs_container),
+            db.get_container_client(config.cosmos_source_documents_container),
+            db.get_container_client(config.cosmos_search_chunks_container),
+        )
+    return _client_cache["repository"]
 
 
 def _build_lifecycle_repository(config):
-    from azure.cosmos import CosmosClient
-    from azure.identity import DefaultAzureCredential
-    from ingestion.lifecycle_repository import DocumentLifecycleRepository
-    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-    cosmos = CosmosClient(config.cosmos_endpoint, credential=credential)
-    db = cosmos.get_database_client(config.cosmos_database)
-    return DocumentLifecycleRepository(
-        db.get_container_client(config.cosmos_ingestion_runs_container),
-        db.get_container_client(config.cosmos_source_documents_container),
-        db.get_container_client(config.cosmos_search_chunks_container),
-    )
+    if "lifecycle_repository" not in _client_cache:
+        from azure.cosmos import CosmosClient
+        from azure.identity import DefaultAzureCredential
+        from ingestion.lifecycle_repository import DocumentLifecycleRepository
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        cosmos = CosmosClient(config.cosmos_endpoint, credential=credential)
+        db = cosmos.get_database_client(config.cosmos_database)
+        _client_cache["lifecycle_repository"] = DocumentLifecycleRepository(
+            db.get_container_client(config.cosmos_ingestion_runs_container),
+            db.get_container_client(config.cosmos_source_documents_container),
+            db.get_container_client(config.cosmos_search_chunks_container),
+        )
+    return _client_cache["lifecycle_repository"]
 
 
 def _write_webhook_audit(source_id: str, operation: str, extra: dict) -> None:
@@ -862,87 +939,104 @@ def _write_webhook_audit(source_id: str, operation: str, extra: dict) -> None:
 
 
 def _build_graph_client(config):
-    from azure.identity import CertificateCredential, DefaultAzureCredential
-    from azure.keyvault.secrets import SecretClient
-    from ingestion.graph import GraphCredentialAuth
-    import httpx
-    import base64
+    """Cached across invocations — do not wrap call sites in `with graph_client:`, that
+    would close this shared client after first use."""
+    if "graph_client" not in _client_cache:
+        from azure.identity import CertificateCredential, DefaultAzureCredential
+        from azure.keyvault.secrets import SecretClient
+        from ingestion.graph import GraphCredentialAuth
+        import httpx
+        import base64
 
-    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-    secret_client = SecretClient(config.key_vault_uri, credential)
-    try:
-        cert_secret = secret_client.get_secret(config.certificate_secret_name)
-        cert_data = base64.b64decode(cert_secret.value, validate=True)
-    except Exception as error:
-        raise RuntimeError(f"Failed to load Graph certificate from Key Vault: {type(error).__name__}") from error
-    graph_credential = CertificateCredential(
-        tenant_id=config.tenant_id,
-        client_id=config.app_client_id,
-        certificate_data=cert_data,
-    )
-    transport = httpx.HTTPTransport(retries=3)
-    return httpx.Client(auth=GraphCredentialAuth(graph_credential, "https://graph.microsoft.com/.default"), transport=transport, timeout=120)
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        secret_client = SecretClient(config.key_vault_uri, credential)
+        try:
+            cert_secret = secret_client.get_secret(config.certificate_secret_name)
+            cert_data = base64.b64decode(cert_secret.value, validate=True)
+        except Exception as error:
+            raise RuntimeError(f"Failed to load Graph certificate from Key Vault: {type(error).__name__}") from error
+        graph_credential = CertificateCredential(
+            tenant_id=config.tenant_id,
+            client_id=config.app_client_id,
+            certificate_data=cert_data,
+        )
+        transport = httpx.HTTPTransport(retries=3)
+        _client_cache["graph_client"] = httpx.Client(
+            auth=GraphCredentialAuth(graph_credential, "https://graph.microsoft.com/.default"), transport=transport, timeout=120,
+        )
+    return _client_cache["graph_client"]
 
 
 def _build_sharepoint_client(config):
-    """Build an httpx.Client for SharePoint REST API using the same cert but SP scope."""
-    from azure.identity import CertificateCredential, DefaultAzureCredential
-    from azure.keyvault.secrets import SecretClient
-    from ingestion.graph import GraphCredentialAuth
-    import httpx
-    import base64
+    """Build an httpx.Client for SharePoint REST API using the same cert but SP scope. Cached (see _build_graph_client)."""
+    if "sharepoint_client" not in _client_cache:
+        from azure.identity import CertificateCredential, DefaultAzureCredential
+        from azure.keyvault.secrets import SecretClient
+        from ingestion.graph import GraphCredentialAuth
+        import httpx
+        import base64
 
-    if not config.sharepoint_site_url:
-        return None
-    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-    secret_client = SecretClient(config.key_vault_uri, credential)
-    cert_secret = secret_client.get_secret(config.certificate_secret_name)
-    cert_data = base64.b64decode(cert_secret.value, validate=True)
-    from urllib.parse import urlparse
-    host = urlparse(config.sharepoint_site_url).hostname or ""
-    sp_scope = f"https://{host}/.default"
-    sp_credential = CertificateCredential(
-        tenant_id=config.tenant_id,
-        client_id=config.app_client_id,
-        certificate_data=cert_data,
-    )
-    transport = httpx.HTTPTransport(retries=3)
-    return httpx.Client(auth=GraphCredentialAuth(sp_credential, sp_scope), transport=transport, timeout=60)
+        if not config.sharepoint_site_url:
+            _client_cache["sharepoint_client"] = None
+        else:
+            credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+            secret_client = SecretClient(config.key_vault_uri, credential)
+            cert_secret = secret_client.get_secret(config.certificate_secret_name)
+            cert_data = base64.b64decode(cert_secret.value, validate=True)
+            from urllib.parse import urlparse
+            host = urlparse(config.sharepoint_site_url).hostname or ""
+            sp_scope = f"https://{host}/.default"
+            sp_credential = CertificateCredential(
+                tenant_id=config.tenant_id,
+                client_id=config.app_client_id,
+                certificate_data=cert_data,
+            )
+            transport = httpx.HTTPTransport(retries=3)
+            _client_cache["sharepoint_client"] = httpx.Client(auth=GraphCredentialAuth(sp_credential, sp_scope), transport=transport, timeout=60)
+    return _client_cache["sharepoint_client"]
 
 
 def _build_di_client(config):
-    from azure.ai.documentintelligence import DocumentIntelligenceClient
-    from azure.identity import DefaultAzureCredential
-    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-    return DocumentIntelligenceClient(endpoint=config.document_intelligence_endpoint, credential=credential)
+    if "di_client" not in _client_cache:
+        from azure.ai.documentintelligence import DocumentIntelligenceClient
+        from azure.identity import DefaultAzureCredential
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        _client_cache["di_client"] = DocumentIntelligenceClient(endpoint=config.document_intelligence_endpoint, credential=credential)
+    return _client_cache["di_client"]
 
 
 def _build_language_client(config):
-    from azure.ai.textanalytics import TextAnalyticsClient
-    from azure.identity import DefaultAzureCredential
-    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-    return TextAnalyticsClient(endpoint=config.language_endpoint, credential=credential, api_version="2023-04-01")
+    if "language_client" not in _client_cache:
+        from azure.ai.textanalytics import TextAnalyticsClient
+        from azure.identity import DefaultAzureCredential
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        _client_cache["language_client"] = TextAnalyticsClient(endpoint=config.language_endpoint, credential=credential, api_version="2023-04-01")
+    return _client_cache["language_client"]
 
 
 def _build_openai_client(config):
-    from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-    from openai import AzureOpenAI
-    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-    return AzureOpenAI(
-        azure_endpoint=config.openai_endpoint,
-        azure_ad_token_provider=get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default"),
-        api_version="2024-10-21",
-    )
+    if "openai_client" not in _client_cache:
+        from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+        from openai import AzureOpenAI
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        _client_cache["openai_client"] = AzureOpenAI(
+            azure_endpoint=config.openai_endpoint,
+            azure_ad_token_provider=get_bearer_token_provider(credential, "https://cognitiveservices.azure.com/.default"),
+            api_version="2024-10-21",
+        )
+    return _client_cache["openai_client"]
 
 
 def _build_audit_container(config):
-    from azure.cosmos import CosmosClient
-    from azure.identity import DefaultAzureCredential
-    from ingestion.telemetry import COSMOS_AUDIT_CONTAINER_NAME
-    credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-    cosmos = CosmosClient(config.cosmos_endpoint, credential=credential)
-    db = cosmos.get_database_client(config.cosmos_database)
-    return db.get_container_client(COSMOS_AUDIT_CONTAINER_NAME)
+    if "audit_container" not in _client_cache:
+        from azure.cosmos import CosmosClient
+        from azure.identity import DefaultAzureCredential
+        from ingestion.telemetry import COSMOS_AUDIT_CONTAINER_NAME
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        cosmos = CosmosClient(config.cosmos_endpoint, credential=credential)
+        db = cosmos.get_database_client(config.cosmos_database)
+        _client_cache["audit_container"] = db.get_container_client(COSMOS_AUDIT_CONTAINER_NAME)
+    return _client_cache["audit_container"]
 
 
 def _json_response(payload: dict, status_code: int) -> func.HttpResponse:

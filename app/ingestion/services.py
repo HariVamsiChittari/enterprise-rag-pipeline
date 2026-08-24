@@ -49,7 +49,6 @@ from ingestion.models import (
     create_chunk_id,
     create_document_id,
     create_document_key,
-    create_orchestration_instance_id,
     create_run_id,
     create_source_run_id,
     run_record_id,
@@ -67,11 +66,11 @@ from ingestion.telemetry import write_audit_record
 logger = logging.getLogger(__name__)
 
 
-def activate(config: IngestionConfig, repository: IngestionRepository) -> ActivatedRun:
+def activate(config: IngestionConfig, repository: IngestionRepository, orchestration_instance_id: str) -> ActivatedRun:
     """Create a new run and atomically update currentRunId."""
     now = _utc_now()
     run_id = create_run_id(now, config.source_id)
-    instance_id = create_orchestration_instance_id(config.source_id)
+    instance_id = orchestration_instance_id
     run = IngestionRunRecord(
         source_id=config.source_id,
         run_id=run_id,

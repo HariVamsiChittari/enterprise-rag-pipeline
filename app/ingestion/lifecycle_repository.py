@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 DELTA_CONTROL_ID = "delta-control"
 WEBHOOK_CONTROL_ID = "webhook-subscription"
+DELTA_SYNC_TRIGGER_ID = "delta-sync-trigger"
+ACL_RESYNC_TRIGGER_ID = "acl-resync-trigger"
 MAX_PATCH_BATCH_OPERATIONS = 100
 INTERNAL_PAGE_SIZE = 100
 
@@ -289,6 +291,40 @@ class DocumentLifecycleRepository:
             self._ingestion_runs.upsert_item(body=item)
         except Exception:
             raise LifecycleRepositoryError("Cosmos delta cursor save failed") from None
+
+    def get_trigger_instance_id(self, source_id: str, control_id: str) -> str | None:
+        """Last Durable instance ID dispatched for a periodic/webhook-triggered
+        orchestration (control_id is DELTA_SYNC_TRIGGER_ID or ACL_RESYNC_TRIGGER_ID).
+
+        Durable instance-ID reuse is best-effort/racy at the storage layer
+        (Azure/azure-functions-durable-python#410), so callers must mint a fresh,
+        never-reused ID per tick via save_trigger_instance_id rather than polling a
+        fixed ID. This record only remembers which ID to poll for "still running".
+        """
+        try:
+            item = self._ingestion_runs.read_item(item=control_id, partition_key=source_id)
+        except Exception as error:
+            if _error_status(error) == 404:
+                return None
+            raise LifecycleRepositoryError("Cosmos trigger-instance read failed") from None
+        instance_id = item.get("currentInstanceId")
+        if instance_id is not None and not isinstance(instance_id, str):
+            raise LifecycleRepositoryError("Cosmos trigger-instance record is malformed")
+        return instance_id
+
+    def save_trigger_instance_id(self, source_id: str, control_id: str, instance_id: str) -> None:
+        if not instance_id:
+            raise ValueError("instance_id is required")
+        item = {
+            "id": control_id,
+            "sourceId": source_id,
+            "currentInstanceId": instance_id,
+            "updatedAt": _now_iso(),
+        }
+        try:
+            self._ingestion_runs.upsert_item(body=item)
+        except Exception:
+            raise LifecycleRepositoryError("Cosmos trigger-instance save failed") from None
 
     def get_webhook_subscription_id(self, source_id: str) -> str | None:
         try:

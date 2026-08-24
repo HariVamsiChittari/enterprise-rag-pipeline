@@ -114,3 +114,49 @@ Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&l
   Select-Object -ExpandProperty rows | Select-Object sourceName, pageCount, writtenChunkCount
 # Expect: pageCount matches the real page count of each source PDF, not capped at 2
 ```
+
+---
+
+## 3. Full-sync/delta-sync/ACL-resync fails with "Non-Deterministic workflow detected"
+
+### Symptom
+`GET /api/ingestion/status?instanceId=<id>` returns:
+```json
+{
+  "runtimeStatus": "OrchestrationRuntimeStatus.Failed",
+  "output": "Non-Deterministic workflow detected: A previous execution of this orchestration scheduled a timer task with sequence number 12 named but the current orchestration replay instead produced a ScheduleTaskOrchestratorAction action with this sequence number. Was a change made to the orchestrator code after this instance had already started running?"
+}
+```
+Fails consistently at the same replay sequence number on every retry, even with no code change
+to the orchestrator.
+
+### Root cause
+**Pre-fix code defect (resolved 2026-08-24).** Before the fix, full-sync/delta-sync/ACL-resync
+each reused one fixed, predictable Durable instance ID across every run/tick (derived from
+`INGESTION_SOURCE_ID`). Durable instance-ID reuse is documented as best-effort/racy at the
+storage layer — confirmed by a Microsoft engineer:
+["We cannot reliably silently replace instanceIDs that are in the Pending state ... there exists
+a race condition where you have scheduled an orchestrator to be created but that information has
+not yet been propagated throughout our storage."](https://github.com/Azure/azure-functions-durable-python/issues/410)
+Reusing an ID across separate runs corrupted the replay history, which the Durable Task
+Scheduler surfaced as this error.
+
+If you see this on a Function App older than 2026-08-24, redeploy current `app/function_app.py`,
+`app/ingestion/models.py`, `app/ingestion/services.py`, and `app/ingestion/lifecycle_repository.py`
+first — the fix removes fixed instance IDs entirely (every run/tick gets a fresh, randomly
+generated ID; "is it already running" is tracked via Cosmos instead of polling a fixed ID).
+
+### Recovery commands
+```powershell
+# 1. Terminate the stuck run and force-fail non-terminal docs
+Invoke-RestMethod -Uri "$base/api/ingestion/terminate" -Method POST -Headers $h
+
+# 2. Re-run full-sync — it will get a fresh instance ID, not the failed one
+Invoke-RestMethod -Uri "$base/api/ingestion/full-sync" -Method POST -Headers $h
+```
+
+### Verification
+```powershell
+Invoke-RestMethod -Uri "$base/api/ingestion/status" -Headers $h | ConvertTo-Json -Depth 5
+# Expect: a different "instanceId" than the failed run, and runtimeStatus progressing to Completed
+```

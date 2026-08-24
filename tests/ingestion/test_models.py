@@ -28,7 +28,6 @@ from ingestion.models import (
     create_chunk_id,
     create_document_id,
     create_document_key,
-    create_orchestration_instance_id,
     create_run_id,
     create_source_run_id,
     run_record_id,
@@ -50,7 +49,6 @@ def test_identifiers_are_deterministic_and_run_scoped() -> None:
     )
     assert create_source_run_id("source", "run-a") == "source:run-a"
     assert create_chunk_id(7) == "chunk:000007"
-    assert create_orchestration_instance_id("source").startswith("full-sync-")
 
 
 def test_run_id_requires_utc_and_uses_bounded_entropy_hash() -> None:
@@ -72,7 +70,7 @@ def test_source_control_serializes_to_cosmos_field_names() -> None:
     record = SourceControlRecord(
         source_id="source",
         current_run_id="run-a",
-        current_orchestration_instance_id=create_orchestration_instance_id("source"),
+        current_orchestration_instance_id="full-sync-test-instance",
         activated_at=UTC,
         updated_at=UTC,
     )
@@ -80,7 +78,7 @@ def test_source_control_serializes_to_cosmos_field_names() -> None:
     assert record.to_cosmos_item() == {
         "sourceId": "source",
         "currentRunId": "run-a",
-        "currentOrchestrationInstanceId": create_orchestration_instance_id("source"),
+        "currentOrchestrationInstanceId": "full-sync-test-instance",
         "activatedAt": UTC,
         "updatedAt": UTC,
         "lastCompletedRunId": None,
@@ -97,7 +95,7 @@ def test_settings_and_run_serialize_exact_configuration_snapshot() -> None:
         source_id=settings.source_id,
         run_id=run_id,
         drive_id=settings.drive_id,
-        orchestration_instance_id=create_orchestration_instance_id(settings.source_id),
+        orchestration_instance_id="full-sync-test-instance",
         status=RunStatus.RUNNING,
         stage=RunStage.DISCOVERING,
         started_at=UTC,

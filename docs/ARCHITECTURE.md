@@ -33,7 +33,7 @@ flowchart LR
 
 | Method | Route | Purpose |
 |--------|-------|---------|
-| POST | `/api/ingestion/full-sync` | Start durable full-sync orchestrator (singleton, returns 202) |
+| POST | `/api/ingestion/full-sync` | Start durable full-sync orchestrator (fresh instance ID per run, returns 202) |
 | GET | `/api/ingestion/status` | Query orchestration instance status and output |
 | POST | `/api/ingestion/terminate` | Terminate orchestration, force-fail stuck docs, finalize run as TERMINATED |
 | POST | `/api/ingestion/retry-failed` | Retry only the failed documents from the current run |
@@ -75,7 +75,7 @@ sequenceDiagram
     participant Cosmos as Cosmos DB
 
     Operator->>Starter: POST /api/ingestion/full-sync
-    Starter->>Orch: Start (singleton instance ID, returns 202)
+    Starter->>Orch: Start (fresh random instance ID, returns 202)
     Orch->>Cosmos: Activate run, update source-control.currentRunId
     Orch->>Graph: Discover files (BFS /children, paginated FolderCursor stack)
     Note over Orch: Skip-if-ready: skip files with same eTag from previous completed run
@@ -269,8 +269,13 @@ flowchart LR
 ```
 
 ### ingestion-runs (partition: /sourceId)
-- **source-control**: singleton pointer to `currentRunId`, `lastCompletedRunId`
+- **source-control**: singleton pointer to `currentRunId`, `lastCompletedRunId`, and the current
+  full-sync orchestration instance ID (randomly generated per run, never reused \u2014 Durable
+  instance-ID reuse is best-effort/racy at the storage layer,
+  [Azure/azure-functions-durable-python#410](https://github.com/Azure/azure-functions-durable-python/issues/410))
 - **delta-control**: singleton storing the Graph delta cursor for incremental sync
+- **delta-sync-trigger / acl-resync-trigger**: singleton pointers to the current delta-sync/ACL-resync
+  orchestration instance ID, for the same reason as source-control above
 - **run records**: `ingestionMode`, status, stage, counters, `ProfileSnapshot` (extraction/chunking/enrichment/embedding config), timestamps
 
 ### source-documents (partition: /sourceRunId)
