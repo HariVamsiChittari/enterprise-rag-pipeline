@@ -52,7 +52,7 @@ Base URL: `https://<function-app-name>.azurewebsites.net`
 
 Start a full-sync orchestration. Discovers all files in the SharePoint drive, processes each in parallel waves, and writes chunks to Cosmos.
 
-**Request**
+#### Request
 
 ```http
 POST /api/ingestion/full-sync HTTP/1.1
@@ -62,7 +62,7 @@ Content-Type: application/json
 (empty body)
 ```
 
-**Response — 202 Accepted**
+#### Response — 202 Accepted
 
 ```json
 {
@@ -79,7 +79,7 @@ reuse is documented as best-effort/racy at the storage layer
 so the app never reuses one. The current instance ID for a run is available from the
 response above, or by omitting `instanceId` on `GET /api/ingestion/status` (see below).
 
-**Error responses**
+#### Error responses
 
 | Status | Body | Reason |
 |---|---|---|
@@ -92,14 +92,14 @@ response above, or by omitting `instanceId` on `GET /api/ingestion/status` (see 
 
 Query the runtime status of an orchestration instance (full-sync, delta-sync, or ACL-resync).
 
-**Request**
+#### Request
 
 ```http
 GET /api/ingestion/status?instanceId=<id>&showHistory=true HTTP/1.1
 Authorization: Bearer <token>
 ```
 
-**Query parameters**
+#### Query parameters
 
 | Name | Required | Default | Description |
 |---|---|---|---|
@@ -112,7 +112,7 @@ To check a periodic tick, read `currentInstanceId` from the `delta-sync-trigger`
 `acl-resync-trigger`, or `lifecycle-reconcile-trigger` control record in `ingestion-runs`
 through an approved Cosmos read path, then pass that value as `instanceId`.
 
-**Response — 200 OK**
+#### Response — 200 OK
 
 ```json
 {
@@ -131,7 +131,7 @@ through an approved Cosmos read path, then pass that value as `instanceId`.
 }
 ```
 
-**Error responses**
+#### Error responses
 
 | Status | Body | Reason |
 |---|---|---|
@@ -143,20 +143,20 @@ through an approved Cosmos read path, then pass that value as `instanceId`.
 
 Terminate a running orchestration, force-fail any stuck documents, and finalize the run as `TERMINATED`.
 
-**Request**
+#### Request
 
 ```http
 POST /api/ingestion/terminate?instanceId=<id> HTTP/1.1
 Authorization: Bearer <token>
 ```
 
-**Query parameters**
+#### Query parameters
 
 | Name | Required | Default | Description |
 |---|---|---|---|
 | `instanceId` | No | Current full-sync instance, resolved via Cosmos | Instance to terminate |
 
-**Response — 200 OK**
+#### Response — 200 OK
 
 ```json
 {
@@ -168,7 +168,7 @@ Authorization: Bearer <token>
 }
 ```
 
-**Alternative responses (all 200 OK)**
+#### Alternative responses (all 200 OK)
 
 | `status` value | Meaning |
 |---|---|
@@ -182,7 +182,7 @@ Authorization: Bearer <token>
 
 Reprocess only the failed documents from the current run. Skips re-scanning the entire corpus.
 
-**Request**
+#### Request
 
 ```http
 POST /api/ingestion/retry-failed HTTP/1.1
@@ -192,7 +192,7 @@ Content-Type: application/json
 (empty body)
 ```
 
-**Response — 202 Accepted**
+#### Response — 202 Accepted
 
 ```json
 {
@@ -202,7 +202,7 @@ Content-Type: application/json
 }
 ```
 
-**Alternative responses**
+#### Alternative responses
 
 | Status | Body | Reason |
 |---|---|---|
@@ -216,14 +216,14 @@ Content-Type: application/json
 
 Read rows from any Cosmos container for debugging. Sanitizes system fields (`_ts`, `_etag`, etc).
 
-**Request**
+#### Request
 
 ```http
 GET /api/ingestion/inspect?container=<name>&limit=<n> HTTP/1.1
 Authorization: Bearer <token>
 ```
 
-**Query parameters**
+#### Query parameters
 
 | Name | Required | Default | Description |
 |---|---|---|---|
@@ -235,7 +235,7 @@ For `ingestion-runs`, `search-chunks`, and `service-audit`, omit `runId`; their 
 
 Inspect removes Cosmos `_` system properties only. Source documents, chunk content, audit user/tenant IDs, questions, and answer previews can remain in the response. Restrict endpoint access and handle diagnostic output according to its data classification.
 
-**Response — 200 OK**
+#### Response — 200 OK
 
 ```json
 {
@@ -248,7 +248,7 @@ Inspect removes Cosmos `_` system properties only. Source documents, chunk conte
       "sourceName": "Policy.pdf",
       "status": "ready",
       "stage": "terminal",
-      "allowedGroupIds": ["4eac97d2-...", "ba671fcb-..."],
+      "allowedGroupIds": ["<security-group-id-1>", "<security-group-id-2>"],
       "aclHash": "sha256:...",
       "eTag": "..."
     }
@@ -256,7 +256,7 @@ Inspect removes Cosmos `_` system properties only. Source documents, chunk conte
 }
 ```
 
-**Error responses**
+#### Error responses
 
 | Status | Body | Reason |
 |---|---|---|
@@ -269,7 +269,7 @@ Inspect removes Cosmos `_` system properties only. Source documents, chunk conte
 
 Delete items from a Cosmos container with an audit record. Refuses to purge `service-audit`.
 
-**Request**
+#### Request
 
 ```http
 DELETE /api/ingestion/purge HTTP/1.1
@@ -282,16 +282,16 @@ Content-Type: application/json
 }
 ```
 
-**Body schema**
+#### Body schema
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `container` | string | Yes | One of: `ingestion-runs`, `source-documents`, `search-chunks` |
-| `ids` | array<string> | Conditional | List of item IDs (max 100). Required if `purgeAll` is not set. |
+| `ids` | `array<string>` | Conditional | List of item IDs (max 100). Required if `purgeAll` is not set. |
 | `purgeAll` | boolean | Conditional | If `true`, delete all items in the container |
 | `confirm` | string | Required if `purgeAll` | Must equal `"yes"` — safety guard |
 
-**Response — 200 OK**
+#### Response — 200 OK
 
 ```json
 {
@@ -301,7 +301,7 @@ Content-Type: application/json
 }
 ```
 
-**Error responses**
+#### Error responses
 
 | Status | Body | Reason |
 |---|---|---|
@@ -322,7 +322,7 @@ Content-Type: application/json
 
 RAG query. The Function validates the EasyAuth user claims (`tid`, exact `aud`, `oid`, `user_impersonation`, and optional `idtyp=user`), creates a bounded gateway context, obtains a Function-UAMI service token, and calls Azure Container Apps with a Function-owned request ID.
 
-**Request**
+#### Request
 
 ```http
 POST /api/query HTTP/1.1
@@ -339,13 +339,13 @@ Content-Type: application/json
 }
 ```
 
-**Body schema**
+#### Body schema
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `question` | string | Yes | — | 1–4000 characters |
 | `mode` | string | No | `"hybrid"` | One of: `hybrid`, `vector`, `full_text` |
-| `history` | array<object> | No | `[]` | Conversation history for multi-turn queries. Each item: `{role: "user"\|"assistant", content: "..."}`. Bounded to last 10 messages. |
+| `history` | `array<object>` | No | `[]` | Conversation history for multi-turn queries. Each item: `{role: "user"\|"assistant", content: "..."}`. Bounded to last 10 messages. |
 | `top_k` | integer | No | `MAX_EVIDENCE_CHUNKS` env var (default 5) | Chunks to retrieve (1–20) |
 | `scoring_profile` | string \| null | No | Pinned catalog's `defaultProfile` | Name of a profile in the pinned catalog. Omitted or `null` selects the catalog default. Unknown names are rejected. |
 | `expand_synonyms` | boolean \| null | No | `null` | `false` disables expansion. `true` or `null` expands only when catalog synonyms are enabled and the selected profile references a loaded map. See [Synonym enablement truth table](#synonym-enablement-truth-table). |
@@ -366,7 +366,7 @@ The deployed example catalog defines:
 - 1 planned query → **Standard RAG path**
 - 2–3 planned queries → **Agentic RAG path**, with automatic fallback to standard on timeout or agent failure
 
-**Response — 200 OK**
+#### Response — 200 OK
 
 ```json
 {
@@ -387,18 +387,18 @@ The deployed example catalog defines:
 }
 ```
 
-**Response schema**
+#### Response schema
 
 | Field | Type | Description |
 |---|---|---|
 | `answer` | string | Grounded answer with `[S#]` citation markers |
-| `citations` | array<object> | One per unique source chunk. Empty when `INCLUDE_CITATIONS=false`. |
+| `citations` | `array<object>` | One per unique source chunk. Empty when `INCLUDE_CITATIONS=false`. |
 | `citations[].ref` | string | Matches `[S#]` markers in `answer` |
 | `citations[].source_name` | string | Original file name |
 | `citations[].url` | string | SharePoint URL with `#page=N` fragment |
 | `request_id` | string | UUID for log correlation |
 
-**Error responses**
+#### Error responses
 
 | Status | Body | Reason |
 |---|---|---|
@@ -411,7 +411,7 @@ The deployed example catalog defines:
 | 503 | `gateway_not_configured` or `service_unavailable` Function envelope | Gateway settings are invalid or the proxy failed |
 | 504 | `retrieval_timeout` Function envelope | Function-to-retrieval call exceeded `QUERY_PROXY_TIMEOUT_SECONDS` |
 
-**Notes**
+#### Notes
 
 - The Function does not forward the user's `X-MS-CLIENT-PRINCIPAL`. It sends a managed-identity token, `X-RAG-GATEWAY-CONTEXT`, and `X-RAG-REQUEST-ID`.
 - Answer generation timeout is controlled by `GENERATION_TIMEOUT_SECONDS` (retrieval service).
@@ -437,7 +437,7 @@ POST /api/webhook/sharepoint?validationToken=<opaque-token> HTTP/1.1
 
 Response — echo the token as `text/plain`:
 
-```
+```text
 200 OK
 Content-Type: text/plain
 
@@ -466,7 +466,7 @@ Content-Type: application/json
 
 **Response — 200 OK** (empty body)
 
-**Error responses**
+#### Error responses
 
 | Status | Body | Reason |
 |---|---|---|
@@ -513,7 +513,7 @@ The retrieval service runs in an internal ACA managed environment and is reached
 
 Base URL: `RETRIEVAL_SERVICE_URL` (from Bicep output)
 
-### `POST /api/query`
+### `POST /api/query` (retrieval service)
 
 Same request schema and success response as the Function endpoint, but this is an internal service-to-service contract. Delegated callers and manually supplied user headers are not supported.
 
@@ -546,7 +546,7 @@ The Function normalizes downstream failures, so direct retrieval error bodies ar
 
 Liveness probe. Always returns 200 if the process is alive.
 
-**Response — 200 OK**
+#### Response — 200 OK
 
 ```json
 {"status": "alive"}
@@ -558,13 +558,13 @@ Liveness probe. Always returns 200 if the process is alive.
 
 Readiness probe. Executes `SELECT TOP 1 c.id` against the first configured chunks container.
 
-**Response — 200 OK**
+#### Response — 200 OK
 
 ```json
 {"status": "ready"}
 ```
 
-**Response — 503 Service Unavailable**
+#### Response — 503 Service Unavailable
 
 ```json
 {"detail": "cosmos_unavailable"}
@@ -695,7 +695,7 @@ python tools/publish_retrieval_catalog.py validate `
   --deployment-instance-id <deployment-instance-id>
 ```
 
-The command prints `catalogId` and `catalogDigest`. The guarded deployment controller publishes and verifies the immutable item through its `Operations`, `Catalog`, and `CatalogVerify` phases, then deploys serving resources through `Final` with `RETRIEVAL_CATALOG_DIGEST`. After E2E validation and explicit approval, `OperationsCleanup` removes the temporary publisher job. Rollback requires a reviewed deployment that pins the previous compatible catalog digest and image/Function release tuple; changing only the publication pointer does not change runtime selection.
+The command prints `catalogId` and `catalogDigest`. The guarded deployment controller publishes and verifies the immutable item through its `Operations`, `Catalog`, and `CatalogVerify` phases, then deploys serving resources through `Final` with `RETRIEVAL_CATALOG_DIGEST`. After E2E validation and explicit approval, `OperationsCleanup` removes the temporary publisher job. Rollback requires a reviewed deployment that pins the previous compatible catalog digest and image/Function release tuple; changing only the publication pointer does not change runtime selection. See the [private catalog publication decision](decisions/0001-private-catalog-publication.md) for the existing rationale.
 
 ### Synonym enablement truth table
 
@@ -748,7 +748,6 @@ The Function query gateway uses this shape:
 ```
 
 Registered retrieval handlers use the same shape. EasyAuth and ACA Authentication can reject a request before application code and may return platform-defined bodies. Some ingestion endpoints retain their older compact `{"error":"<code>"}` response.
-
 
 ### HTTP Status Meanings
 

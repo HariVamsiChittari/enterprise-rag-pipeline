@@ -31,7 +31,8 @@ do {
 $r.output | ConvertTo-Json
 ```
 
-**Result: PASS**
+### Result: PASS
+
 ```json
 {
   "status": "completed",
@@ -43,6 +44,7 @@ $r.output | ConvertTo-Json
 ```
 
 **Verify documents in Cosmos:**
+
 ```powershell
 $r = Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&limit=50" -Headers $authH
 $ready = $r.rows | Where-Object { $_.status -eq "ready" }
@@ -51,6 +53,7 @@ $ready | ForEach-Object { "$($_.sourceName) | groups=$($_.allowedGroupIds -join 
 ```
 
 **Verify search chunks:**
+
 ```powershell
 $r = Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=search-chunks&limit=5" -Headers $authH
 Write-Host "Total chunks: $($r.count)"
@@ -65,7 +68,8 @@ $r = Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=ingestion-run
 $r.rows | Where-Object { $_.id -eq "webhook-subscription" } | ConvertTo-Json -Depth 3
 ```
 
-**Result: PASS**
+### Result: PASS
+
 ```json
 {
   "id": "webhook-subscription",
@@ -86,8 +90,9 @@ Invoke-WebRequest `
   | Select-Object StatusCode, Content
 ```
 
-**Result: PASS**
-```
+### Result: PASS
+
+```text
 StatusCode Content
 ---------- -------
        200 e2e-test-token-123
@@ -111,13 +116,15 @@ $r.rows | Where-Object { $_.id -eq "delta-control" } | ConvertTo-Json -Depth 3
 **SharePoint action:** Upload `sample doc car - V1.pdf` (renamed from `sample doc car - Copy.pdf`).
 
 **Verification:**
+
 ```powershell
 # Check delta-sync status (webhook triggers automatically)
 Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=delta-sync-sharepoint-drive" `
   -Headers $authH | ConvertTo-Json -Depth 3
 ```
 
-**Result: PASS**
+### Result: PASS
+
 ```json
 {
   "status": "completed",
@@ -131,20 +138,22 @@ Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=delta-sync-sharepo
 ```
 
 **Verify document in Cosmos:**
+
 ```powershell
 $r = Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&limit=50" -Headers $authH
 $r.rows | Where-Object { $_.sourceName -like "*V1*" } | ConvertTo-Json -Depth 4
 ```
 
 **Key fields:**
-```
+
+```text
 sourceName:        sample doc car - V1.pdf
 status:            ready
 stage:             terminal
 ingestionMode:     delta-sync
 pageCount:         2
 writtenChunkCount: 12
-allowedGroupIds:   4eac97d2..., ba671fcb...
+allowedGroupIds:   <security-group-id-1>, <security-group-id-2>
 ```
 
 ---
@@ -153,7 +162,8 @@ allowedGroupIds:   4eac97d2..., ba671fcb...
 
 **SharePoint action:** Re-upload `sample doc car - Copy.pdf` with different content.
 
-**Result: PASS**
+### Result: PASS
+
 ```json
 {
   "status": "completed",
@@ -167,13 +177,14 @@ allowedGroupIds:   4eac97d2..., ba671fcb...
 ```
 
 **Verify both versions:**
+
 ```powershell
 $r = Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&limit=50" -Headers $authH
 $r.rows | Where-Object { $_.sourceName -like "*car*" -or $_.sourceName -like "*copy*" } `
   | ForEach-Object { "$($_.sourceName) | status=$($_.status) | mode=$($_.ingestionMode) | retired=$($_.retiredReason)" }
 ```
 
-```
+```text
 sample doc car - V1.pdf  | status=retired | mode=delta-sync | retired=deleted
 sample doc car - Copy.pdf | status=ready   | mode=delta-sync | retired=
 ```
@@ -185,13 +196,15 @@ sample doc car - Copy.pdf | status=ready   | mode=delta-sync | retired=
 **SharePoint action:** Delete `sample doc car - V1.pdf` from the library.
 
 **Verification (check document record):**
+
 ```powershell
 $r = Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&limit=50" -Headers $authH
 $r.rows | Where-Object { $_.sourceName -like "*V1*" } `
   | Select-Object sourceName, status, stage, retiredAt, retiredReason | ConvertTo-Json
 ```
 
-**Result: PASS**
+### Result: PASS
+
 ```json
 {
   "sourceName": "sample doc car - V1.pdf",
@@ -203,12 +216,13 @@ $r.rows | Where-Object { $_.sourceName -like "*V1*" } `
 ```
 
 **Confirmed via App Insights:**
+
 ```powershell
 az monitor app-insights query --app <application-insights-name> --resource-group <resource-group> `
   --analytics-query "traces | where timestamp between(datetime('2026-08-19T11:59:00Z') .. datetime('2026-08-19T12:01:00Z')) and message contains 'delta_sync_completed' | project timestamp, message"
 ```
 
-```
+```text
 12:00:05Z: delta_sync_completed bootstrapped=False created_or_updated=0 deleted=1 acl_resynced=0 failed=0 items_seen=2
 ```
 
@@ -221,6 +235,7 @@ az monitor app-insights query --app <application-insights-name> --resource-group
 **SharePoint action:** Remove Entra SG `<revoked-security-group-id>` from the library's direct permissions.
 
 **Trigger (ACL resync timer — safety-net that queries permissions directly):**
+
 ```powershell
 Invoke-WebRequest `
   -Uri "$base/admin/functions/acl_resync_timer" `
@@ -230,12 +245,14 @@ Invoke-WebRequest `
 ```
 
 **Check result:**
+
 ```powershell
 Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=acl-resync-sharepoint-drive" `
   -Headers $authH | ConvertTo-Json -Depth 3
 ```
 
-**Result: PASS**
+### Result: PASS
+
 ```json
 {
   "status": "completed",
@@ -246,6 +263,7 @@ Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=acl-resync-sharepo
 ```
 
 **Verify ACL on document:**
+
 ```powershell
 $r = Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&limit=50" -Headers $authH
 $doc = $r.rows | Where-Object { $_.sourceName -like "*Copy*" -and $_.status -eq "ready" }
@@ -253,7 +271,7 @@ Write-Host "ACL groups: $($doc.allowedGroupIds -join ', ')"
 Write-Host "ACL hash:   $($doc.aclHash)"
 ```
 
-```
+```text
 Before: ACL groups: <remaining-security-group-id>, <revoked-security-group-id>
 After:  ACL groups: <remaining-security-group-id>
 ```
@@ -266,7 +284,8 @@ After:  ACL groups: <remaining-security-group-id>
 
 **SharePoint action:** Upload `sample doc.docx` to the library.
 
-**Result: PASS**
+### Result: PASS
+
 ```json
 {
   "status": "completed",
@@ -293,8 +312,9 @@ Invoke-WebRequest `
   -SkipHttpErrorCheck | Select-Object StatusCode
 ```
 
-**Result: PASS**
-```
+### Result: PASS
+
+```text
 StatusCode
 ----------
        403
@@ -315,8 +335,9 @@ $r2 = Invoke-WebRequest -Uri "$base/api/webhook/sharepoint" -Method POST -Conten
 Write-Host "First: $($r1.StatusCode), Second: $($r2.StatusCode)"
 ```
 
-**Result: PASS**
-```
+### Result: PASS
+
+```text
 First: 200, Second: 200
 ```
 
@@ -334,10 +355,11 @@ Invoke-WebRequest `
   -Body '{}' -SkipHttpErrorCheck | Select-Object StatusCode
 ```
 
-**Result: PASS**
+### Result: PASS
 
 **App Insights confirmed:**
-```
+
+```text
 subscription_renewed: <graph-subscription-id> expires 2026-09-16T23:16:57Z
 ```
 
@@ -358,7 +380,8 @@ Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=delta-sync-sharepo
   -Headers $authH | ConvertTo-Json -Depth 3
 ```
 
-**Result: PASS**
+### Result: PASS
+
 ```json
 {
   "status": "completed",
@@ -384,6 +407,7 @@ No pending changes missed by webhooks.
 **Root cause:** Graph returned 410 on the stored cursor AND on both reset-location URLs. The code only handled one level of 410 reset.
 
 **Fix 1 — Double-410 handler** ([graph.py#L448-L458](../../app/ingestion/graph.py)):
+
 ```python
 except DeltaResetRequired as reset:
     if not allow_reset:
@@ -396,6 +420,7 @@ except DeltaResetRequired as reset:
 ```
 
 **Fix 2 — Catch-all re-bootstrap** ([services.py#L371-L376](../../app/ingestion/services.py)):
+
 ```python
 try:
     delta = connector.read_drive_delta(config.delta_max_pages, delta_link=cursor)
@@ -413,6 +438,7 @@ except DeltaResetRequired:
 **Root cause:** `bootstrap_delta_cursor()` did not send `Prefer: deltashowremovedasdeleted, deltatraversepermissiongaps, deltashowsharingchanges` headers. The token obtained without these headers was incompatible with delta reads that included them.
 
 **Fix** ([graph.py#L516](../../app/ingestion/graph.py)):
+
 ```python
 # Before:
 response = client.get(url)
@@ -437,13 +463,13 @@ All 5 delta tests pass: `python -m pytest tests/ingestion/test_graph_delta.py -v
 
 | # | Test | Result | Key Evidence |
 |---|---|---|---|
-| S1 | Subscription exists | PASS | ID `145a220f...` |
+| S1 | Subscription exists | PASS | Subscription record present |
 | W1 | Validation handshake | PASS | 200 + echo |
 | D1 | Delta cursor exists | PASS | `delta-control` record |
 | D2 | New file → ingested | PASS | 12 chunks, status=ready |
 | D3 | File updated → re-ingested | PASS | New version ready, old superseded |
 | D4 | File deleted → retired | PASS | status=retired, retiredReason=deleted |
-| D5 | Permission removed → ACL updated | PASS | `ba671fcb` removed, 21 docs updated |
+| D5 | Permission removed → ACL updated | PASS | Target group removed, 21 docs updated |
 | D7/D8 | Non-PDF → skipped | PASS | itemsSeen=2, createdOrUpdated=0 |
 | W3 | Invalid clientState | PASS | 403 |
 | W4 | Duplicate webhook | PASS | "delta-sync already running" |

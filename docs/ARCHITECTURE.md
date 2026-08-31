@@ -284,6 +284,7 @@ flowchart LR
 ```
 
 ### ingestion-runs (partition: /sourceId)
+
 - **source-control**: singleton pointer to `currentRunId`, `lastCompletedRunId`, and the current
   full-sync orchestration instance ID (randomly generated per run, never reused \u2014 Durable
   instance-ID reuse is best-effort/racy at the storage layer,
@@ -296,12 +297,14 @@ flowchart LR
 - **run records**: `ingestionMode`, status, stage, counters, `ProfileSnapshot` (extraction/chunking/enrichment/embedding config), timestamps
 
 ### source-documents (partition: /sourceRunId)
+
 - One record per discovered file per run
 - Tracks: status and stage, ACL (`allowedGroupIds`, `aclHash`), source `eTag`, `contentHash`, `ingestionMode` (`full-sync` | `delta-sync`), attempts, expected/written chunk counts, processing timestamps, `retriedAt`, `sourceModifiedAt`, and `lifecycleGeneration`
 - Lifecycle states include `admitting`, `acl_refreshing`, `retiring`, and `deleting`; pending transition fields are persisted by lifecycle patch operations so the reconciliation timer can resume interrupted work
 - Composite index: `[status ASC, discoveryOrdinal ASC]`
 
 ### search-chunks (partition: /documentKey)
+
 - One record per chunk with: content, searchable text, embedding (3072-dim), ACL, enrichment status per module, key phrases, entities, `isRetrievable`, and `lifecycleGeneration`
 - Citation fields: `sourceName`, `sourceUrl`, `pageStart`, `pageEnd`, `sectionPath`
 - Relevance signals: `sourceModifiedAt` — denormalized from the parent document when each chunk version is built, so client-side reranking reads it in the same projection; nullable legacy values are corrected by normal versioned reprocessing
@@ -489,7 +492,7 @@ Freshness uses only the configured `sourceModifiedAt` field (or its snake-case a
 
 **`full_text_score_scope` operator note** — Cosmos NoSQL supports `Local` and `Global` scope for BM25 statistics ([SDK reference](https://github.com/Azure/azure-sdk-for-python/blob/main/sdk/cosmos/azure-cosmos/azure/cosmos/container.py)). The pinned catalog supplies `fullTextScoreScope` and the example catalog uses **`Global`** for scoring consistency across cross-partition queries. `Local` computes statistics only within the queried partitions. The environment parser has a fallback value, but startup replaces it with the catalog value.
 
-**Versioned Cosmos catalog** — the `retrieval-config` container is partitioned by `/deploymentInstanceId`. Each published configuration is an immutable `catalog:<sha256>` item. Retrieval performs one point read of the item named by `RETRIEVAL_CATALOG_DIGEST`, then verifies the deployment instance, digest, schema, profile references, and synonym-map references. Missing or inconsistent pinned data fails startup. The ETag-protected `active` pointer is publication metadata; changing it does not change a running or newly starting replica until the deployment's pinned digest is updated.
+**Versioned Cosmos catalog** — the `retrieval-config` container is partitioned by `/deploymentInstanceId`. Each published configuration is an immutable `catalog:<sha256>` item. Retrieval performs one point read of the item named by `RETRIEVAL_CATALOG_DIGEST`, then verifies the deployment instance, digest, schema, profile references, and synonym-map references. Missing or inconsistent pinned data fails startup. The ETag-protected `active` pointer is publication metadata; changing it does not change a running or newly starting replica until the deployment's pinned digest is updated. See the [private catalog publication decision](decisions/0001-private-catalog-publication.md) for the existing network and identity rationale.
 
 **Solr synonym expansion** — [app/retrieval/synonyms.py](../app/retrieval/synonyms.py) parses equivalency and explicit replacement rules, including escaped commas/backslashes. Rewritten query variants are capped at eight, with five additions per matched rule. Cosmos receives one parameterized `FullTextScore(c.searchableText, @t0, ...)` and the hybrid RRF weights remain the stable two-component vector/text pair. No synonym value is concatenated into SQL.
 

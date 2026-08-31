@@ -4,16 +4,17 @@ This document separates verified release evidence from production-scale work tha
 
 ## Current Verified Baseline
 
-The latest E2E validation was completed on 2026-08-30. Its detailed report is retained outside source control because it contains deployment identifiers; the non-sensitive results are summarized below.
+The current release deployment validation was completed on 2026-08-31. Detailed environment-specific evidence is retained outside source control; the non-sensitive results are summarized below.
 
 Verified against the reviewed non-production deployment:
 
 - ACA revision and immutable image digest remained stable through validation.
 - Immutable retrieval catalog digest was used by all audited scenarios.
-- Four scoring aggregation profiles passed 24 standard/agentic and mode combinations.
-- Synonym enabled/disabled behavior passed with a term-isolated fixture.
-- Freshness arithmetic passed focused tests; the live exact-copy ranking smoke put the newer source first, with the documented reciprocal-rank causality limitation.
-- Delta fixture ingestion/deletion, post-cleanup retrieval, and fixture cleanup were exercised in the cited report. Full sync, denied-principal behavior, and restart recovery require separate same-release evidence before they can be claimed for this release.
+- The primary scoring profile returned a grounded answer with citations through the Function gateway.
+- A no-change full sync completed successfully with no failed documents; sampled ready manifests and retrievable chunks satisfied lifecycle invariants.
+- Synonym enabled/disabled requests selected the expected map state with no degraded retrieval.
+- The complete local suite passed. Opt-in live-Cosmos integration tests remained skipped.
+- Complete four-profile, denied-principal, freshness-fixture, delta update/delete, restart, and recovery evidence was not repeated against the final release artifact and remains required before those behaviors can be claimed for this release.
 - The temporary catalog publisher job was removed after explicit approval.
 
 These results prove functional behavior for the tested corpus and target. They do not prove production capacity, SLOs, disaster recovery, or multi-region behavior.
@@ -103,6 +104,7 @@ The evaluator verifies ranking/ground-truth hashes bound by the manifest. Source
 
 ## Readiness Verdict
 
-- **Functional E2E for the tested ACA environment:** passed with documented freshness limitation.
+- **Current-release deployment smoke:** passed.
+- **Complete same-release functional E2E:** pending the unrepeated gates identified above.
 - **General production readiness:** conditional.
 - **Blocking evidence for production scale:** workload requirements, capacity/load evidence, recovery objectives/tests, and acceptance of or fixes for the listed security gaps.

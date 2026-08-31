@@ -15,10 +15,10 @@ contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additio
 ## Development
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+python -m venv .venv-py312
+.\.venv-py312\Scripts\Activate.ps1
 python -m pip install -r requirements-dev.txt
-python -m pytest
+python -m pytest -q
 ```
 
 ## Pull Requests

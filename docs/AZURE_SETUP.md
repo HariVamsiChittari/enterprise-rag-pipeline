@@ -213,7 +213,7 @@ $publication = .\scripts\deploy.ps1 -Phase Catalog @target -Execute | ConvertFro
 .\scripts\deploy.ps1 -Phase CatalogVerify @target -JobExecutionName $publication.executionName
 ```
 
-The temporary job runs inside the private ACA environment with a dedicated operations UAMI.
+The temporary job runs inside the private ACA environment with a dedicated operations UAMI. The existing rationale and consequences are recorded in the [private catalog publication decision](decisions/0001-private-catalog-publication.md).
 
 ### 5. Deploy Serving Resources
 
@@ -284,9 +284,13 @@ Local Function execution does not reproduce EasyAuth or the managed-identity gat
 
 ## Related Documentation
 
+- [Documentation index](README.md)
+- [Configuration reference](CONFIGURATION.md)
 - [Architecture](ARCHITECTURE.md)
 - [API reference](API_REFERENCE.md)
 - [Azure resource inventory](AZURE_RESOURCES.md)
 - [Demo and E2E runbook](DEMO_RUNBOOK.md)
+- [Cloud operations request](INFRASTRUCTURE_REQUEST.md)
 - [Production readiness](PRODUCTION_READINESS.md)
 - [Troubleshooting](TROUBLESHOOTING.md)
+- [Protected evaluation](../evaluation/README.md)

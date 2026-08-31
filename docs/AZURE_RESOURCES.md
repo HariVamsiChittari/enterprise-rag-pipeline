@@ -27,7 +27,7 @@ This document describes the resources created or consumed by the active Bicep de
 | Operations UAMI | `identity.bicep` | Temporary private catalog-publisher job |
 | Function App | `functions.bicep` | Python 3.12 Flex Consumption API and Durable activities; created in `Final` |
 | Retrieval Container App | `aca.bicep` | FastAPI service, single active revision, authenticated Function-only ingress; created in `Final` |
-| Temporary catalog job | `aca-operations-job.bicep` | Publishes the reviewed immutable catalog; removed by `OperationsCleanup` |
+| Temporary catalog job | `aca-operations-job.bicep` | Publishes the reviewed immutable catalog; removed by `OperationsCleanup`. See [private catalog publication decision](decisions/0001-private-catalog-publication.md). |
 
 ## Cosmos DB Containers
 
