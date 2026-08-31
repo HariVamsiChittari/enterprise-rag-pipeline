@@ -25,6 +25,7 @@ from ingestion.graph import (
 from ingestion.lifecycle_repository import (
     DocumentLifecycleRepository,
     LifecycleConflictError,
+    LifecycleDocumentRef,
     ReadyDocumentRef,
 )
 from ingestion.models import (
@@ -36,6 +37,7 @@ from ingestion.models import (
     EnrichmentProfile,
     IngestionRunRecord,
     ProfileSnapshot,
+    RETIRED_REASONS,
     RunCounters,
     RunStage,
     RunStatus,
@@ -133,8 +135,10 @@ def discover_all(
                     logger.warning("Skip-if-ready lookup failed for %s", doc_id, exc_info=True)
                     prev = None
                 if prev and prev.record.status is DocumentStatus.READY and prev.record.e_tag == pdf.e_tag:
-                    skipped += 1
-                    continue
+                    discovered_modified = getattr(pdf, "last_modified_date_time", None)
+                    if discovered_modified is None or prev.record.source_modified_at == discovered_modified:
+                        skipped += 1
+                        continue
             doc = _pdf_to_document(pdf, config, run_id)
             stored = repository.create_discovered_document(doc)
             documents.append(stored.record)
@@ -148,6 +152,7 @@ def process_document(
     document: SourceDocumentRecord,
     document_etag: str,
     repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
     connector: SourceConnector,
     di_client: Any | None,
     language_client: Any | None,
@@ -235,12 +240,31 @@ def process_document(
 
         written = repository.write_chunks(chunk_records)
 
+        admitting_doc = replace(
+            current_doc,
+            status=DocumentStatus.ADMITTING,
+            stage=DocumentStage.VERIFYING,
+            allowed_group_ids=acl.allowed_group_ids,
+            acl_hash=acl.acl_hash,
+            acl_evaluated_at=_fmt(_utc_now()),
+            expected_chunk_count=len(chunk_records),
+            written_chunk_count=written,
+            updated_at=_fmt(_utc_now()),
+        )
+        admitting = repository.begin_document_admission(admitting_doc, current_etag)
+        current_doc, current_etag = admitting.record, admitting.etag
+
+        lifecycle_repository.set_document_chunks_retrievable(
+            document_key=current_doc.document_key,
+            lifecycle_generation=current_doc.lifecycle_generation,
+            is_retrievable=True,
+            allowed_group_ids=acl.allowed_group_ids,
+            expected_count=written,
+        )
+
         ready_doc = replace(
             current_doc,
             status=DocumentStatus.READY, stage=DocumentStage.TERMINAL,
-            allowed_group_ids=acl.allowed_group_ids, acl_hash=acl.acl_hash,
-            acl_evaluated_at=_fmt(_utc_now()), expected_chunk_count=len(chunk_records),
-            written_chunk_count=written,
             ready_at=_fmt(_utc_now()), updated_at=_fmt(_utc_now()),
         )
         repository.verify_and_mark_document_ready(ready_doc, current_etag)
@@ -255,8 +279,6 @@ def process_document(
     except Exception as error:
         logger.error("Document %s failed at stage=%s: %s", document.document_id, current_doc.stage.value, error, exc_info=True)
         safe = safe_error_from_exception(error, current_doc.stage.value)
-        if safe.retryable:
-            raise
         _fail_document(current_doc, current_etag, error, repository)
         return ActivityOutcome(document_id=document.document_id, status=ActivityStatus.FAILED, chunks_written=0, retry_count=document.attempt_count, error=safe)
 
@@ -417,21 +439,28 @@ def run_delta_sync(
         # library-level permission changes are caught by the zero-delta ACL resync path.
         if item.get("@microsoft.graph.sharedChanged") is True:
             ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
-            if ref is not None:
-                try:
-                    old_groups = list(ref.allowed_group_ids)
-                    result = resync_document_acl(config, ref, lifecycle_repository, connector)
-                    acl_resynced += 1
-                    if audit_container is not None:
-                        write_audit_record(audit_container, config.source_id, run_id, {
-                            "operation": "acl_resynced", "documentId": document_id,
-                            "result": result, "method": "delta_sync",
-                            "previousGroupIds": old_groups,
-                        })
-                except Exception:
-                    logger.error("delta_sync acl_resync failed for item %s", item_id, exc_info=True)
-                    failed += 1
-            continue
+            if ref is None:
+                ref = lifecycle_repository.find_acl_revoked_document_by_document_id(
+                    document_id
+                )
+            if ref is None:
+                continue
+            try:
+                old_groups = list(ref.allowed_group_ids)
+                result = resync_document_acl(config, ref, lifecycle_repository, connector)
+                acl_resynced += 1
+                if audit_container is not None:
+                    write_audit_record(audit_container, config.source_id, run_id, {
+                        "operation": "acl_resynced", "documentId": document_id,
+                        "result": result, "method": "delta_sync",
+                        "previousGroupIds": old_groups,
+                    })
+            except Exception:
+                logger.error("delta_sync acl_resync failed for item %s", item_id, exc_info=True)
+                failed += 1
+                continue
+            if result == "retired" or not _source_etag_changed(item, ref.source_etag):
+                continue
 
         try:
             document = _delta_item_to_document(item, config, run_id, ordinal)
@@ -440,7 +469,7 @@ def run_delta_sync(
             prev_ref = lifecycle_repository.find_ready_document_by_document_id(document_id)
             stored = repository.create_discovered_document(document)
             outcome = process_document(
-                config, stored.record, stored.etag, repository,
+                config, stored.record, stored.etag, repository, lifecycle_repository,
                 connector, di_client, language_client, openai_client,
                 audit_container=audit_container,
             )
@@ -480,7 +509,8 @@ def run_delta_sync(
                         "sourceName": document.source_name,
                     })
 
-    lifecycle_repository.save_delta_cursor(config.source_id, delta.delta_link)
+    if failed == 0:
+        lifecycle_repository.save_delta_cursor(config.source_id, delta.delta_link)
     return DeltaSyncOutcome(
         created_or_updated=created_or_updated,
         deleted=deleted,
@@ -508,12 +538,215 @@ def _delta_item_to_document(
     return _pdf_to_document(pdf, config, run_id, ingestion_mode="delta-sync")
 
 
+def _source_etag_changed(item: dict[str, Any], persisted_etag: str | None) -> bool:
+    source_etag = item.get("eTag")
+    return isinstance(source_etag, str) and bool(source_etag) and source_etag != persisted_etag
+
+
 @dataclass(frozen=True)
 class AclResyncOutcome:
     checked: int = 0
     unchanged: int = 0
     updated: int = 0
     retired: int = 0
+
+
+@dataclass(frozen=True)
+class LifecycleReconciliationOutcome:
+    checked: int = 0
+    repaired: int = 0
+    failed: int = 0
+
+
+def run_lifecycle_reconciliation_page(
+    repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
+    *,
+    page_size: int,
+    continuation_token: str | None = None,
+) -> tuple[LifecycleReconciliationOutcome, str | None]:
+    page = lifecycle_repository.list_lifecycle_transitions_page(
+        page_size=page_size,
+        continuation_token=continuation_token,
+    )
+    repaired = 0
+    failed = 0
+    for ref in page.items:
+        try:
+            _reconcile_lifecycle_document(repository, lifecycle_repository, ref)
+            repaired += 1
+        except Exception:
+            failed += 1
+            logger.warning(
+                "Lifecycle reconciliation failed for document %s",
+                ref.document_id,
+                exc_info=True,
+            )
+    return (
+        LifecycleReconciliationOutcome(
+            checked=len(page.items),
+            repaired=repaired,
+            failed=failed,
+        ),
+        page.continuation_token,
+    )
+
+
+def run_duplicate_version_reconciliation_page(
+    config: IngestionConfig,
+    repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
+    *,
+    page_size: int,
+    continuation_token: str | None = None,
+) -> tuple[LifecycleReconciliationOutcome, str | None]:
+    page = lifecycle_repository.list_duplicate_ready_document_ids_page(
+        page_size=page_size,
+        continuation_token=continuation_token,
+    )
+    control = repository.get_source_control(config.source_id)
+    current_source_run_id = (
+        create_source_run_id(config.source_id, control.record.current_run_id)
+        if control is not None
+        else None
+    )
+    repaired = 0
+    failed = 0
+    for document_id in page.document_ids:
+        try:
+            versions = lifecycle_repository.list_ready_document_versions(document_id)
+            if current_source_run_id is None or not any(
+                ref.source_run_id == current_source_run_id for ref in versions
+            ):
+                continue
+            for ref in versions:
+                if ref.source_run_id == current_source_run_id:
+                    continue
+                lifecycle_repository.delete_document_and_chunks(
+                    source_run_id=ref.source_run_id,
+                    document_id=ref.document_id,
+                    document_key=ref.document_key,
+                    etag=ref.etag,
+                )
+                repaired += 1
+        except Exception:
+            failed += 1
+            logger.warning(
+                "Duplicate-version reconciliation failed for document %s",
+                document_id,
+                exc_info=True,
+            )
+    return (
+        LifecycleReconciliationOutcome(
+            checked=len(page.document_ids),
+            repaired=repaired,
+            failed=failed,
+        ),
+        page.continuation_token,
+    )
+
+
+def run_orphan_chunk_reconciliation_page(
+    repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
+    *,
+    page_size: int,
+    continuation_token: str | None = None,
+) -> tuple[LifecycleReconciliationOutcome, str | None]:
+    page = lifecycle_repository.list_chunk_manifest_refs_page(
+        page_size=page_size,
+        continuation_token=continuation_token,
+    )
+    repaired = 0
+    failed = 0
+    for ref in page.items:
+        try:
+            manifest = repository.get_document(ref.source_run_id, ref.document_id)
+            if manifest is None:
+                lifecycle_repository.delete_orphan_chunk(
+                    chunk_id=ref.chunk_id,
+                    document_key=ref.document_key,
+                )
+                repaired += 1
+        except Exception:
+            failed += 1
+            logger.warning(
+                "Orphan-chunk reconciliation failed for chunk %s",
+                ref.chunk_id,
+                exc_info=True,
+            )
+    return (
+        LifecycleReconciliationOutcome(
+            checked=len(page.items),
+            repaired=repaired,
+            failed=failed,
+        ),
+        page.continuation_token,
+    )
+
+
+def _reconcile_lifecycle_document(
+    repository: IngestionRepository,
+    lifecycle_repository: DocumentLifecycleRepository,
+    ref: LifecycleDocumentRef,
+) -> None:
+    if ref.status is DocumentStatus.ADMITTING:
+        stored = repository.get_document(ref.source_run_id, ref.document_id)
+        if stored is None or stored.record.status is not DocumentStatus.ADMITTING:
+            raise RepositoryConflictError("admitting document changed during reconciliation")
+        expected_count = stored.record.expected_chunk_count
+        if expected_count is None:
+            raise RepositoryConflictError("admitting document has no expected chunk count")
+        lifecycle_repository.set_document_chunks_retrievable(
+            document_key=stored.record.document_key,
+            lifecycle_generation=stored.record.lifecycle_generation,
+            is_retrievable=True,
+            allowed_group_ids=stored.record.allowed_group_ids,
+            expected_count=expected_count,
+        )
+        repository.verify_and_mark_document_ready(
+            replace(
+                stored.record,
+                status=DocumentStatus.READY,
+                stage=DocumentStage.TERMINAL,
+                ready_at=_fmt(_utc_now()),
+                updated_at=_fmt(_utc_now()),
+            ),
+            stored.etag,
+        )
+        return
+    if ref.status is DocumentStatus.ACL_REFRESHING:
+        if ref.pending_allowed_group_ids is None or not ref.pending_acl_hash:
+            raise RepositoryConflictError("ACL refresh intent is incomplete")
+        lifecycle_repository.refresh_document_acl(
+            source_run_id=ref.source_run_id,
+            document_id=ref.document_id,
+            document_key=ref.document_key,
+            etag=ref.etag,
+            allowed_group_ids=ref.pending_allowed_group_ids,
+            acl_hash=ref.pending_acl_hash,
+        )
+        return
+    if ref.status is DocumentStatus.RETIRING:
+        if ref.pending_retired_reason not in RETIRED_REASONS:
+            raise RepositoryConflictError("retirement intent is incomplete")
+        lifecycle_repository.retire_document(
+            source_run_id=ref.source_run_id,
+            document_id=ref.document_id,
+            document_key=ref.document_key,
+            etag=ref.etag,
+            reason=ref.pending_retired_reason,
+        )
+        return
+    if ref.status is DocumentStatus.DELETING:
+        lifecycle_repository.delete_document_and_chunks(
+            source_run_id=ref.source_run_id,
+            document_id=ref.document_id,
+            document_key=ref.document_key,
+            etag=ref.etag,
+        )
+        return
+    raise RepositoryConflictError("unsupported lifecycle transition")
 
 
 def resync_document_acl(
@@ -523,14 +756,17 @@ def resync_document_acl(
     connector: SourceConnector,
     audit_container: Any | None = None,
 ) -> str:
-    """Re-verify one ready document's ACL. Returns 'unchanged' | 'updated' | 'retired'."""
+    """Re-verify one ACL-eligible document. Returns unchanged, updated, or retired."""
     try:
         acl = connector.read_verified_acl(ref.item_id, config.acl_max_pages)
     except TerminalDocumentError:
+        if ref.status is DocumentStatus.RETIRED:
+            return "unchanged"
         try:
             lifecycle_repository.retire_document(
                 source_run_id=ref.source_run_id,
                 document_id=ref.document_id,
+                document_key=ref.document_key,
                 etag=ref.etag,
                 reason="acl_revoked",
             )
@@ -546,8 +782,19 @@ def resync_document_acl(
                 })
         return "retired"
 
-    if acl.acl_hash == ref.acl_hash:
+    if acl.acl_hash == ref.acl_hash and ref.status is DocumentStatus.READY:
         return "unchanged"
+    if ref.status is DocumentStatus.RETIRED:
+        source_item = connector.read_item(ref.item_id)
+        source_etag = source_item.get("eTag") if source_item is not None else None
+        if not isinstance(source_etag, str) or source_etag != ref.source_etag:
+            return "unchanged"
+        if not lifecycle_repository.is_authoritative_document_version(
+            document_id=ref.document_id,
+            source_run_id=ref.source_run_id,
+            source_etag=source_etag,
+        ):
+            return "unchanged"
     try:
         lifecycle_repository.refresh_document_acl(
             source_run_id=ref.source_run_id,
@@ -626,6 +873,7 @@ def _pdf_to_document(pdf: Any, config: IngestionConfig, run_id: str, ingestion_m
         acl_evaluated_at=now,
         status=DocumentStatus.DISCOVERED, stage=DocumentStage.DISCOVERED,
         attempt_count=0, discovered_at=now, updated_at=now,
+        source_modified_at=getattr(pdf, "last_modified_date_time", None),
         ingestion_mode=ingestion_mode,
         id=document_id, document_id=document_id,
         source_run_id=create_source_run_id(config.source_id, run_id),
@@ -662,6 +910,9 @@ def _build_chunk_records(
             language_code="en",
             embedding=embeddings[i],
             embedded_at=now,
+            source_modified_at=document.source_modified_at,
+            is_retrievable=False,
+            lifecycle_generation=document.lifecycle_generation,
             id=create_chunk_id(chunk.ordinal),
             source_run_id=create_source_run_id(document.source_id, document.run_id),
         ))

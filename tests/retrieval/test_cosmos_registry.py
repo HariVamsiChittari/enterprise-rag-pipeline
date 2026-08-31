@@ -7,7 +7,7 @@ import pytest
 from retrieval.cosmos_registry import CosmosRegistry, load_cosmos_instance_configs
 
 
-def test_defaults_to_single_instance_from_legacy_values_when_registry_json_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_defaults_to_single_instance_from_current_settings_when_registry_json_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("COSMOS_REGISTRY_JSON", raising=False)
 
     configs = load_cosmos_instance_configs(

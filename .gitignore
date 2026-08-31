@@ -70,6 +70,7 @@ infra/modules/*.json
 htmlcov/
 *.cover
 stage0-*-report.json
+demo-output/
 
 # Protected RAG evaluation data and per-query results
 evaluation/private/

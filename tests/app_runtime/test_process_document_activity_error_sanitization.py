@@ -1,8 +1,4 @@
-"""Regression test for process_document_activity's retryable-error re-raise: must not
-propagate the original exception's raw message, which could embed a signed
-SharePoint/Graph download URL and trip a known Azure Functions host bug that corrupts
-Durable's replay state for exceptions containing credential-like tokens
-(https://github.com/Azure/azure-functions-durable-python/issues/600).
+"""Regression tests for process_document_activity error sanitization and retry boundaries.
 
 Monkeypatches only the dependency-construction points (_build_repository,
 _build_graph_client, etc.) and ingestion.services.process_document — the same
@@ -51,7 +47,7 @@ SIGNED_URL_MESSAGE = (
 )
 
 
-def test_retryable_error_reraises_sanitized_exception_without_raw_url(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unexpected_retryable_error_returns_safe_code_without_raw_url(monkeypatch: pytest.MonkeyPatch) -> None:
     import ingestion.services as services
 
     def _raise_timeout(*args: Any, **kwargs: Any) -> None:
@@ -59,12 +55,14 @@ def test_retryable_error_reraises_sanitized_exception_without_raw_url(monkeypatc
 
     monkeypatch.setattr(services, "process_document", _raise_timeout)
 
-    with pytest.raises(Exception) as exc_info:
-        function_app.process_document_activity({"document": {"sourceRunId": "run-1", "documentId": "doc-1"}})
+    result = function_app.process_document_activity(
+        {"document": {"sourceRunId": "run-1", "documentId": "doc-1"}}
+    )
 
-    assert "sig=" not in str(exc_info.value)
-    assert "tempauth" not in str(exc_info.value)
-    assert SIGNED_URL_MESSAGE not in str(exc_info.value)
+    assert result["status"] == "failed"
+    assert "sig=" not in result["error"]
+    assert "tempauth" not in result["error"]
+    assert SIGNED_URL_MESSAGE not in result["error"]
 
 
 def test_nonretryable_error_returns_safe_code_without_raw_url(monkeypatch: pytest.MonkeyPatch) -> None:

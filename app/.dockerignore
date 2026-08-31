@@ -1,0 +1,24 @@
+# app/ is the ACR retrieval build context. This is an allowlist: exclude every
+# file by default, then re-include only the exact files the retrieval container
+# image must consume. Do not add ingestion source, local settings, protected
+# data, certificates, tests, caches, Kubernetes manifests, or documentation.
+
+*
+
+# Required retrieval image inputs.
+!retrieval/
+!retrieval/*.py
+!retrieval/catalog.example.json
+!retrieval/requirements.txt
+!retrieval/Dockerfile
+
+# Explicit re-excludes for files that must never enter the ACR build context.
+retrieval/.dockerignore
+retrieval/kubernetes/
+retrieval/kubernetes/**
+retrieval/*.md
+**/__pycache__/
+**/__pycache__/**
+**/*.pyc
+**/*.pyo
+**/*.pyi

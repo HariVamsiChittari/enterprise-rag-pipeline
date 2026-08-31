@@ -7,13 +7,13 @@ param location string = resourceGroup().location
 @description('AKS kubelet identity principal ID for AcrPull')
 param kubeletPrincipalId string
 
-@description('Functions/ACA managed identity principal ID for AcrPull')
-param appIdentityPrincipalId string = ''
+@description('Application managed identity principal IDs for AcrPull')
+param appIdentityPrincipalIds array = []
 
 @description('Resource tags')
 param tags object = {}
 
-resource acr 'Microsoft.ContainerRegistry/registries@2023-11-01-preview' = {
+resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
   name: registryName
   location: location
   tags: tags
@@ -40,15 +40,17 @@ resource kubeletAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = i
   }
 }
 
-resource appAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(appIdentityPrincipalId)) {
-  name: guid(acr.id, appIdentityPrincipalId, acrPullRole)
-  scope: acr
-  properties: {
-    roleDefinitionId: acrPullRole
-    principalId: appIdentityPrincipalId
-    principalType: 'ServicePrincipal'
+resource appAcrPull 'Microsoft.Authorization/roleAssignments@2022-04-01' = [
+  for principalId in appIdentityPrincipalIds: if (!empty(principalId)) {
+    name: guid(acr.id, principalId, acrPullRole)
+    scope: acr
+    properties: {
+      roleDefinitionId: acrPullRole
+      principalId: principalId
+      principalType: 'ServicePrincipal'
+    }
   }
-}
+]
 
 output registryName string = acr.name
 output loginServer string = acr.properties.loginServer

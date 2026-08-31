@@ -38,6 +38,10 @@ class RunStage(str, Enum):
 class DocumentStatus(str, Enum):
     DISCOVERED = "discovered"
     PROCESSING = "processing"
+    ADMITTING = "admitting"
+    ACL_REFRESHING = "acl_refreshing"
+    RETIRING = "retiring"
+    DELETING = "deleting"
     READY = "ready"
     FAILED = "failed"
     RETIRED = "retired"
@@ -315,6 +319,8 @@ class SourceDocumentRecord:
     retired_at: str | None = None
     retired_reason: str | None = None
     retried_at: str | None = None
+    source_modified_at: str | None = None
+    lifecycle_generation: int = 0
     ingestion_mode: str = "full-sync"
     id: str = ""
     document_id: str = ""
@@ -394,6 +400,9 @@ class SearchChunkRecord:
     language_code: str
     embedding: tuple[float, ...]
     embedded_at: str
+    source_modified_at: str | None = None
+    is_retrievable: bool = False
+    lifecycle_generation: int = 0
     id: str = ""
     source_run_id: str = ""
     schema_version: int = SCHEMA_VERSION
@@ -582,6 +591,10 @@ def _validate_document_fields(record: SourceDocumentRecord) -> None:
         raise ValueError("only PDF documents are supported")
     if record.size_bytes < 0 or record.discovery_ordinal < 0 or record.attempt_count < 0:
         raise ValueError("document counters cannot be negative")
+    if isinstance(record.lifecycle_generation, bool) or not isinstance(
+        record.lifecycle_generation, int
+    ) or record.lifecycle_generation < 0:
+        raise ValueError("lifecycle_generation must be a non-negative integer")
     for count_name in ("page_count", "expected_chunk_count", "written_chunk_count"):
         count = getattr(record, count_name)
         if count is not None and count < 0:
@@ -592,7 +605,7 @@ def _validate_optional_utc_fields(record: SourceDocumentRecord) -> None:
     _require_utc("acl_evaluated_at", record.acl_evaluated_at)
     _require_utc("discovered_at", record.discovered_at)
     _require_utc("updated_at", record.updated_at)
-    for field_name in ("processing_started_at", "ready_at", "failed_at", "retired_at"):
+    for field_name in ("processing_started_at", "ready_at", "failed_at", "retired_at", "source_modified_at"):
         value = getattr(record, field_name)
         if value is not None:
             _require_utc(field_name, value)
@@ -614,6 +627,12 @@ def _validate_retirement(record: SourceDocumentRecord) -> None:
 def _validate_chunk_fields(record: SearchChunkRecord) -> None:
     _validate_sorted_unique("allowed_group_ids", record.allowed_group_ids, require_nonempty=True)
     _validate_sorted_unique("key_phrases", record.key_phrases)
+    if not isinstance(record.is_retrievable, bool):
+        raise ValueError("is_retrievable must be boolean")
+    if isinstance(record.lifecycle_generation, bool) or not isinstance(
+        record.lifecycle_generation, int
+    ) or record.lifecycle_generation < 0:
+        raise ValueError("lifecycle_generation must be a non-negative integer")
     if record.page_start < 1 or record.page_end < record.page_start:
         raise ValueError("chunk page range is invalid")
     if record.token_count <= 0:
@@ -636,6 +655,8 @@ def _validate_chunk_fields(record: SearchChunkRecord) -> None:
     _require_sha256("content_hash", record.content_hash)
     _require_utc("created_at", record.created_at)
     _require_utc("embedded_at", record.embedded_at)
+    if record.source_modified_at is not None:
+        _require_utc("source_modified_at", record.source_modified_at)
 
 
 @dataclass(frozen=True)

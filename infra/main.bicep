@@ -1,15 +1,15 @@
 targetScope = 'resourceGroup'
 
-@description('Environment name')
+@description('Unique deployment instance identifier')
 @minLength(1)
-param environmentName string
+param deploymentInstanceId string
 
 @description('Azure region')
 param location string = resourceGroup().location
 
 @description('Existing Azure OpenAI account name')
 @minLength(1)
-param openAiAccountName string = 'ragpg-dev-split-k6ex5fnwyrghq-openai'
+param openAiAccountName string
 
 @description('Resource group containing the existing Azure OpenAI account')
 @minLength(1)
@@ -31,8 +31,9 @@ param sharePointAppClientId string
 @description('Assigned SharePoint document-library drive ID')
 param sharePointDriveId string
 
-@description('SharePoint site URL for site group ACL resolution via REST API (leave empty to disable site group resolution)')
-param sharePointSiteUrl string = ''
+@description('SharePoint site URL for site group ACL resolution via REST API')
+@minLength(1)
+param sharePointSiteUrl string
 
 @description('Stable source registration ID')
 param ingestionSourceId string
@@ -40,18 +41,34 @@ param ingestionSourceId string
 @description('Key Vault secret containing the exportable SharePoint PFX')
 param sharePointCertificateSecretName string = 'sharepoint-app-cert'
 
+@description('Existing Key Vault containing the SharePoint certificate')
+param sharePointKeyVaultName string
+
+@description('Resource group containing the existing SharePoint certificate Key Vault')
+param sharePointKeyVaultResourceGroupName string
+
 @description('Microsoft Entra application client ID protecting operator and query endpoints')
 param adminApiClientId string
+
+@description('Function API audience required in delegated user tokens')
+param functionApiAudience string
+
+@description('Retrieval API application/client ID')
+param retrievalApiClientId string
+
+@description('Retrieval API audience')
+param retrievalApiAudience string
+
+@description('Retrieval API service-principal object ID for external role-assignment validation')
+param retrievalApiServicePrincipalId string
 
 @secure()
 @description('Shared secret for Microsoft Graph webhook clientState validation')
 param webhookClientState string
 
-@description('Entra app client IDs allowed to call the Function App API. Empty = any tenant app (dev default). Set the frontend client ID here to restrict callers in hardened deployments.')
-param allowedApplicationClientIds array = []
-
-@description('Microsoft Graph service principal object ID (tenant-specific, from az ad sp show --id 00000003-0000-0000-c000-000000000000 --query id)')
-param graphServicePrincipalId string
+@description('Entra app client IDs allowed to call the Function App API')
+@minLength(1)
+param allowedApplicationClientIds array
 
 @description('Cosmos DB mode')
 @allowed(['serverless', 'provisioned'])
@@ -75,8 +92,11 @@ param useDocumentIntelligenceFreeTier bool = false
 @description('Use Azure AI Language F0 for development')
 param useLanguageFreeTier bool = false
 
-@description('Deploy AKS cluster (true for prod, false for dev/ACA)')
-param deployAks bool = false
+@description('Create serving ACA and Function resources after immutable artifacts exist')
+param deployServing bool = false
+
+@description('Create the temporary private catalog publication job')
+param deployOperations bool = false
 
 @description('Application Insights daily cap in GB; -1 means unlimited')
 param applicationInsightsDailyCapGb int = -1
@@ -84,17 +104,41 @@ param applicationInsightsDailyCapGb int = -1
 @description('Enable ACL filtering in the retrieval service')
 param aclEnabled bool = true
 
+@description('Immutable retrieval image reference repository@sha256:<digest>; required when deployServing=true')
+param retrievalImageReference string = ''
+
+@description('Immutable retrieval catalog sha256:<digest>; required when deployServing=true')
+param retrievalCatalogDigest string = ''
+
+@description('ACA minimum replicas')
+@minValue(1)
+param retrievalMinReplicas int = 1
+
+@description('ACA maximum replicas')
+@minValue(1)
+param retrievalMaxReplicas int = 5
+
+@description('ACA zone redundancy creation-time setting')
+param retrievalZoneRedundant bool = false
+
 @description('Resource tags')
 param tags object = {
-  Environment: environmentName
+  DeploymentInstance: deploymentInstanceId
   Project: 'RAG-SharePoint'
   ManagedBy: 'azd'
 }
 
-var suffix = take(uniqueString(resourceGroup().id, environmentName), 8)
-var prefix = 'rag-${environmentName}'
+var suffix = take(uniqueString(resourceGroup().id, deploymentInstanceId), 8)
+var prefix = 'rag-${deploymentInstanceId}'
 var storageName = take('st${replace(prefix, '-', '')}${suffix}', 24)
 var openAiEndpoint = 'https://${openAiAccountName}.openai.azure.com/'
+var sharePointKeyVaultId = resourceId(
+  subscription().subscriptionId,
+  sharePointKeyVaultResourceGroupName,
+  'Microsoft.KeyVault/vaults',
+  sharePointKeyVaultName
+)
+var sharePointKeyVaultUri = 'https://${sharePointKeyVaultName}${environment().suffixes.keyvaultDns}'
 
 module monitoring './modules/monitoring.bicep' = {
   name: 'monitoring'
@@ -113,20 +157,6 @@ module storage './modules/storage.bicep' = {
     storageAccountName: storageName
     location: location
     redundancy: storageRedundancy
-    tags: tags
-  }
-}
-
-module keyVault './modules/keyvault.bicep' = {
-  name: 'key-vault'
-  params: {
-    keyVaultName: take('${prefix}-kv2-${suffix}', 24)
-    location: location
-    // Purge protection uses the module's secure default (true). Once enabled it
-    // cannot be disabled; a deleted vault must complete soft-delete retention
-    // before the name is reusable. If a fast dev teardown is required, set
-    // softDeleteRetentionDays: 7 on the keyvault module instead of disabling
-    // purge protection.
     tags: tags
   }
 }
@@ -209,7 +239,7 @@ module networking './modules/networking.bicep' = {
       }
       {
         name: 'key-vault'
-        resourceId: keyVault.outputs.keyVaultId
+        resourceId: sharePointKeyVaultId
         groupId: 'vault'
         dnsZoneName: 'privatelink.vaultcore.azure.net'
       }
@@ -230,7 +260,18 @@ module networking './modules/networking.bicep' = {
   }
 }
 
-module functions './modules/functions.bicep' = {
+module acaEnvironment './modules/aca-environment.bicep' = {
+  params: {
+    environmentName: '${prefix}-retrieval-${suffix}-env'
+    location: location
+    infrastructureSubnetId: networking.outputs.acaSubnetId
+    logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsId
+    zoneRedundant: retrievalZoneRedundant
+    tags: tags
+  }
+}
+
+module functions './modules/functions.bicep' = if (deployServing) {
   name: 'functions'
   params: {
     functionAppName: '${prefix}-func-${suffix}'
@@ -255,7 +296,7 @@ module functions './modules/functions.bicep' = {
     chatDeploymentName: chatDeploymentName
     documentIntelligenceEndpoint: documentIntelligence.outputs.documentIntelligenceEndpoint
     languageEndpoint: documentIntelligence.outputs.languageServiceEndpoint
-    keyVaultUri: keyVault.outputs.keyVaultUri
+    keyVaultUri: sharePointKeyVaultUri
     entraTenantId: sharePointTenantId
     sharePointAppClientId: sharePointAppClientId
     ingestionSourceId: ingestionSourceId
@@ -263,9 +304,11 @@ module functions './modules/functions.bicep' = {
     sharePointSiteUrl: sharePointSiteUrl
     sharePointCertificateSecretName: sharePointCertificateSecretName
     adminApiClientId: adminApiClientId
+    functionApiAudience: functionApiAudience
+    retrievalServiceScope: '${retrievalApiAudience}/.default'
     webhookClientState: webhookClientState
     allowedApplicationClientIds: allowedApplicationClientIds
-    retrievalServiceUrl: deployAks ? '' : aca.outputs.internalUrl
+    retrievalServiceUrl: aca.?outputs.?internalUrl ?? ''
     tags: tags
   }
 }
@@ -276,10 +319,17 @@ module rbac './modules/rbac.bicep' = {
     principalId: identity.outputs.identityPrincipalId
     cosmosAccountId: cosmos.outputs.cosmosAccountId
     storageAccountId: storage.outputs.storageAccountId
-    keyVaultId: keyVault.outputs.keyVaultId
     documentIntelligenceId: documentIntelligence.outputs.documentIntelligenceId
     languageServiceId: documentIntelligence.outputs.languageServiceId
     applicationInsightsId: monitoring.outputs.applicationInsightsId
+  }
+}
+
+module sharePointKeyVaultRbac './modules/keyvault-secrets-user-rbac.bicep' = {
+  scope: resourceGroup(sharePointKeyVaultResourceGroupName)
+  params: {
+    principalId: identity.outputs.identityPrincipalId
+    keyVaultName: sharePointKeyVaultName
   }
 }
 
@@ -292,57 +342,88 @@ module openAiRbac './modules/openai-rbac.bicep' = {
   }
 }
 
-module graphRbac './modules/graph-rbac.bicep' = {
-  name: 'graph-rbac'
-  params: {
-    principalId: identity.outputs.identityPrincipalId
-    graphServicePrincipalId: graphServicePrincipalId
-  }
-}
-
-// --- AKS Retrieval Agent (prod only) ---
-
-module aks './modules/aks.bicep' = if (deployAks) {
-  name: 'aks'
-  params: {
-    clusterName: '${prefix}-aks-${suffix}'
-    location: location
-    vnetId: networking.outputs.virtualNetworkId
-    logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsId
-    tags: tags
-  }
-}
-
 module acr './modules/acr.bicep' = {
   name: 'acr'
   params: {
     registryName: take('${replace(prefix, '-', '')}acr${suffix}', 50)
     location: location
-    kubeletPrincipalId: deployAks ? aks.outputs.kubeletIdentityObjectId : ''
-    appIdentityPrincipalId: identity.outputs.identityPrincipalId
+    kubeletPrincipalId: ''
+    appIdentityPrincipalIds: [
+      acaRetrievalIdentity.outputs.identityPrincipalId
+      operationsIdentity.outputs.identityPrincipalId
+    ]
     tags: tags
   }
 }
 
-module aksIdentity './modules/aks-identity.bicep' = if (deployAks) {
-  name: 'aks-identity'
+module acaRetrievalIdentity './modules/identity.bicep' = {
+  name: 'aca-retrieval-identity'
   params: {
-    identityName: '${prefix}-aks-retrieval-mi'
+    identityName: '${prefix}-aca-retrieval-mi'
     location: location
-    oidcIssuerUrl: aks.outputs.oidcIssuerUrl
+    tags: tags
+  }
+}
+
+module operationsIdentity './modules/identity.bicep' = {
+  params: {
+    identityName: '${prefix}-operations-mi'
+    location: location
+    tags: tags
+  }
+}
+
+module acaRetrievalCosmosRbac './modules/retrieval-cosmos-rbac.bicep' = {
+  name: 'aca-retrieval-cosmos-rbac'
+  params: {
+    principalId: acaRetrievalIdentity.outputs.identityPrincipalId
     cosmosAccountId: cosmos.outputs.cosmosAccountId
     cosmosDatabaseName: cosmos.outputs.databaseName
     serviceAuditContainerName: cosmos.outputs.serviceAuditContainerName
+    searchChunksContainerName: cosmos.outputs.searchChunksContainerName
+    sourceDocumentsContainerName: cosmos.outputs.sourceDocumentsContainerName
+    retrievalConfigContainerName: cosmos.outputs.retrievalConfigContainerName
+  }
+}
+
+module acaRetrievalOpenAiRbac './modules/openai-rbac.bicep' = {
+  name: 'aca-retrieval-openai-rbac'
+  scope: resourceGroup(openAiResourceGroupName)
+  params: {
+    principalId: acaRetrievalIdentity.outputs.identityPrincipalId
     openAiAccountName: openAiAccountName
-    openAiResourceGroupName: openAiResourceGroupName
-    graphServicePrincipalId: graphServicePrincipalId
+  }
+}
+
+module retrievalConfigPublisherRbac './modules/retrieval-config-publisher-rbac.bicep' = {
+  name: 'retrieval-config-publisher-rbac'
+  params: {
+    publisherPrincipalId: operationsIdentity.outputs.identityPrincipalId
+    cosmosAccountId: cosmos.outputs.cosmosAccountId
+    cosmosDatabaseName: cosmos.outputs.databaseName
+    retrievalConfigContainerName: cosmos.outputs.retrievalConfigContainerName
+  }
+}
+
+module operationsJob './modules/aca-operations-job.bicep' = if (deployOperations) {
+  params: {
+    jobName: '${take(replace(prefix, '-', ''), 19)}-catalog-job'
+    location: location
+    managedEnvironmentId: acaEnvironment.outputs.environmentId
+    acrLoginServer: acr.outputs.loginServer
+    imageReference: retrievalImageReference
+    managedIdentityId: operationsIdentity.outputs.identityId
+    managedIdentityClientId: operationsIdentity.outputs.identityClientId
+    cosmosEndpoint: cosmos.outputs.endpoint
+    cosmosDatabaseName: cosmos.outputs.databaseName
+    retrievalConfigContainerName: cosmos.outputs.retrievalConfigContainerName
+    deploymentInstanceId: deploymentInstanceId
+    catalogDigest: retrievalCatalogDigest
     tags: tags
   }
 }
 
-// --- ACA Retrieval Agent (dev, when AKS not deployed) ---
-
-module retrievalConfig './modules/retrieval-config.bicep' = {
+module retrievalConfig './modules/retrieval-config.bicep' = if (deployServing) {
   name: 'retrieval-config'
   params: {
     cosmosEndpoint: cosmos.outputs.endpoint
@@ -351,46 +432,65 @@ module retrievalConfig './modules/retrieval-config.bicep' = {
     chatDeploymentName: chatDeploymentName
     embeddingDeploymentName: embeddingDeploymentName
     tenantId: sharePointTenantId
-    managedIdentityClientId: deployAks ? aksIdentity.outputs.identityClientId : identity.outputs.identityClientId
+    managedIdentityClientId: acaRetrievalIdentity.outputs.identityClientId
+    retrievalApiAudience: retrievalApiClientId
+    gatewayClientId: identity.outputs.identityClientId
+    gatewayPrincipalId: identity.outputs.identityPrincipalId
+    deploymentInstanceId: deploymentInstanceId
+    catalogDigest: retrievalCatalogDigest
     aclEnabled: aclEnabled
     appInsightsConnectionString: monitoring.outputs.connectionString
+    retrievalConfigContainer: cosmos.outputs.retrievalConfigContainerName
   }
 }
 
-module aca './modules/aca.bicep' = if (!deployAks) {
+module aca './modules/aca.bicep' = if (deployServing) {
   name: 'aca'
   params: {
-    containerAppName: '${prefix}-retrieval-${suffix}'
+    containerAppName: '${take(replace(prefix, '-', ''), 18)}-retr-${suffix}'
     location: location
     acrLoginServer: acr.outputs.loginServer
-    managedIdentityId: identity.outputs.identityId
-    infrastructureSubnetId: networking.outputs.acaSubnetId
-    logAnalyticsWorkspaceId: monitoring.outputs.logAnalyticsId
-    retrievalEnvVars: retrievalConfig.outputs.envVars
+    imageName: retrievalImageReference
+    managedIdentityId: acaRetrievalIdentity.outputs.identityId
+    managedEnvironmentId: acaEnvironment.outputs.environmentId
+    retrievalEnvVars: retrievalConfig.?outputs.?envVars ?? []
+    retrievalApiClientId: retrievalApiClientId
+    retrievalApiAudience: retrievalApiClientId
+    entraIssuer: '${environment().authentication.loginEndpoint}${sharePointTenantId}/v2.0'
+    gatewayClientId: identity.outputs.identityClientId
+    gatewayPrincipalId: identity.outputs.identityPrincipalId
+    minReplicas: retrievalMinReplicas
+    maxReplicas: retrievalMaxReplicas
     tags: tags
   }
 }
 
-module acaDns './modules/aca-dns.bicep' = if (!deployAks) {
+module acaDns './modules/aca-dns.bicep' = if (deployServing) {
   name: 'aca-dns'
   params: {
-    domainName: aca.outputs.environmentDefaultDomain
-    staticIp: aca.outputs.environmentStaticIp
+    domainName: acaEnvironment.outputs.defaultDomain
+    staticIp: acaEnvironment.outputs.staticIp
     virtualNetworkId: networking.outputs.virtualNetworkId
     tags: tags
   }
 }
 
-output functionAppName string = functions.outputs.functionAppName
-output functionAppUrl string = functions.outputs.functionAppUrl
+output functionAppName string = functions.?outputs.?functionAppName ?? ''
+output functionAppUrl string = functions.?outputs.?functionAppUrl ?? ''
 output managedIdentityClientId string = identity.outputs.identityClientId
-output keyVaultName string = keyVault.outputs.keyVaultName
+output managedIdentityPrincipalId string = identity.outputs.identityPrincipalId
+output retrievalIdentityClientId string = acaRetrievalIdentity.outputs.identityClientId
+output retrievalIdentityPrincipalId string = acaRetrievalIdentity.outputs.identityPrincipalId
+output operationsIdentityClientId string = operationsIdentity.outputs.identityClientId
+output operationsIdentityPrincipalId string = operationsIdentity.outputs.identityPrincipalId
+output operationsJobName string = operationsJob.?outputs.?jobName ?? ''
+output retrievalApiServicePrincipalId string = retrievalApiServicePrincipalId
+output keyVaultName string = sharePointKeyVaultName
 output cosmosDbEndpoint string = cosmos.outputs.endpoint
 output cosmosDbDatabaseName string = cosmos.outputs.databaseName
 output documentIntelligenceEndpoint string = documentIntelligence.outputs.documentIntelligenceEndpoint
 output openAiEndpoint string = openAiEndpoint
 output acrLoginServer string = acr.outputs.loginServer
-output aksClusterName string = deployAks ? aks.outputs.clusterName : ''
-output aksRetrievalIdentityClientId string = deployAks ? aksIdentity.outputs.identityClientId : ''
-output retrievalServiceUrl string = deployAks ? '' : aca.outputs.internalUrl
-output retrievalConfigMap object = retrievalConfig.outputs.configMap
+output retrievalServiceUrl string = aca.?outputs.?internalUrl ?? ''
+output retrievalContainerAppName string = aca.?outputs.?containerAppName ?? ''
+output retrievalConfigMap object = retrievalConfig.?outputs.?configMap ?? {}

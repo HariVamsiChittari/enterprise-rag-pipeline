@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "config": {
+    "retrieval": {
+      "overFetchFactor": 3,
+      "hybridWeights": {
+        "vector": 2.0,
+        "text": 1.0
+      },
+      "fullTextScoreScope": "Global"
+    },
+    "defaultProfile": "hr-relevance",
+    "synonymsEnabled": true,
+    "profiles": [
+      {
+        "name": "hr-relevance",
+        "synonymMap": "hr-en",
+        "textWeights": {
+          "sourceName": 1.5,
+          "sectionPath": 1.2,
+          "keyPhrases": 1.1,
+          "content": 1.0
+        },
+        "functionAggregation": "sum",
+        "functions": [
+          {
+            "type": "freshness",
+            "fieldName": "sourceModifiedAt",
+            "boost": 0.15,
+            "interpolation": "linear",
+            "freshness": {
+              "boostingDuration": "P180D"
+            }
+          },
+          {
+            "type": "freshness",
+            "fieldName": "sourceModifiedAt",
+            "boost": 0.05,
+            "interpolation": "quadratic",
+            "freshness": {
+              "boostingDuration": "P30D"
+            }
+          }
+        ]
+      },
+      {
+        "name": "hr-relevance-average",
+        "synonymMap": "hr-en",
+        "textWeights": {
+          "sourceName": 1.5,
+          "content": 1.0
+        },
+        "functionAggregation": "average",
+        "functions": [
+          {
+            "type": "freshness",
+            "fieldName": "sourceModifiedAt",
+            "boost": 0.2,
+            "interpolation": "linear",
+            "freshness": {
+              "boostingDuration": "P180D"
+            }
+          },
+          {
+            "type": "freshness",
+            "fieldName": "sourceModifiedAt",
+            "boost": 0.1,
+            "interpolation": "quadratic",
+            "freshness": {
+              "boostingDuration": "P30D"
+            }
+          }
+        ]
+      },
+      {
+        "name": "hr-relevance-minimum",
+        "textWeights": {
+          "sourceName": 1.5
+        },
+        "functionAggregation": "minimum",
+        "functions": [
+          {
+            "type": "freshness",
+            "fieldName": "sourceModifiedAt",
+            "boost": 0.25,
+            "interpolation": "quadratic",
+            "freshness": {
+              "boostingDuration": "P90D"
+            }
+          },
+          {
+            "type": "freshness",
+            "fieldName": "sourceModifiedAt",
+            "boost": 0.1,
+            "interpolation": "linear",
+            "freshness": {
+              "boostingDuration": "P30D"
+            }
+          }
+        ]
+      },
+      {
+        "name": "hr-relevance-maximum",
+        "textWeights": {
+          "sourceName": 1.5,
+          "keyPhrases": 1.0
+        },
+        "functionAggregation": "maximum",
+        "functions": [
+          {
+            "type": "freshness",
+            "fieldName": "sourceModifiedAt",
+            "boost": 0.3,
+            "interpolation": "linear",
+            "freshness": {
+              "boostingDuration": "P180D"
+            }
+          },
+          {
+            "type": "freshness",
+            "fieldName": "sourceModifiedAt",
+            "boost": 0.1,
+            "interpolation": "quadratic",
+            "freshness": {
+              "boostingDuration": "P30D"
+            }
+          }
+        ]
+      }
+    ],
+    "synonymMaps": [
+      {
+        "name": "hr-en",
+        "format": "solr",
+        "rules": [
+          "annual leave, vacation, paid time off",
+          "pension, retirement plan",
+          "Washington, Wash., WA => WA"
+        ]
+      }
+    ]
+  }
+}

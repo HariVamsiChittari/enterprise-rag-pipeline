@@ -11,6 +11,7 @@ every Cosmos Patch API call and the delta-sync cursor.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -25,7 +26,11 @@ DELTA_CONTROL_ID = "delta-control"
 WEBHOOK_CONTROL_ID = "webhook-subscription"
 DELTA_SYNC_TRIGGER_ID = "delta-sync-trigger"
 ACL_RESYNC_TRIGGER_ID = "acl-resync-trigger"
+LIFECYCLE_RECONCILE_TRIGGER_ID = "lifecycle-reconcile-trigger"
 MAX_PATCH_BATCH_OPERATIONS = 100
+MAX_PATCH_BATCH_ATTEMPTS = 3
+PATCH_RETRY_BASE_SECONDS = 0.25
+TRANSIENT_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 INTERNAL_PAGE_SIZE = 100
 
 
@@ -49,11 +54,56 @@ class ReadyDocumentRef:
     allowed_group_ids: tuple[str, ...]
     acl_hash: str
     etag: str
+    source_etag: str | None = None
+    lifecycle_generation: int = 0
+    status: DocumentStatus = DocumentStatus.READY
 
 
 @dataclass(frozen=True)
 class ReadyDocumentPage:
     items: tuple[ReadyDocumentRef, ...]
+    continuation_token: str | None
+
+
+@dataclass(frozen=True)
+class LifecycleDocumentRef:
+    document_id: str
+    source_run_id: str
+    document_key: str
+    status: DocumentStatus
+    lifecycle_generation: int
+    etag: str
+    allowed_group_ids: tuple[str, ...]
+    acl_hash: str
+    expected_chunk_count: int | None = None
+    pending_allowed_group_ids: tuple[str, ...] | None = None
+    pending_acl_hash: str | None = None
+    pending_retired_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class LifecycleDocumentPage:
+    items: tuple[LifecycleDocumentRef, ...]
+    continuation_token: str | None
+
+
+@dataclass(frozen=True)
+class DuplicateDocumentPage:
+    document_ids: tuple[str, ...]
+    continuation_token: str | None
+
+
+@dataclass(frozen=True)
+class ChunkManifestRef:
+    chunk_id: str
+    document_key: str
+    source_run_id: str
+    document_id: str
+
+
+@dataclass(frozen=True)
+class ChunkManifestPage:
+    items: tuple[ChunkManifestRef, ...]
     continuation_token: str | None
 
 
@@ -75,9 +125,19 @@ class DocumentLifecycleRepository:
         _validate_page_size(page_size)
         query = (
             "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c._etag FROM c WHERE c.status = @status"
+            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "c.lifecycleGeneration, c._etag FROM c "
+            "WHERE ARRAY_CONTAINS(@statuses, c.status) OR "
+            "(c.status = @retiredStatus AND c.retiredReason = @retiredReason)"
         )
-        parameters = [{"name": "@status", "value": DocumentStatus.READY.value}]
+        parameters = [
+            {
+                "name": "@statuses",
+                "value": [DocumentStatus.READY.value, DocumentStatus.ACL_REFRESHING.value],
+            },
+            {"name": "@retiredStatus", "value": DocumentStatus.RETIRED.value},
+            {"name": "@retiredReason", "value": "acl_revoked"},
+        ]
         try:
             iterator = self._source_documents.query_items(
                 query=query,
@@ -85,9 +145,7 @@ class DocumentLifecycleRepository:
                 enable_cross_partition_query=True,
                 max_item_count=page_size,
             )
-            pager = iterator.by_page(continuation_token)
-            page = list(next(pager, []))
-            token = pager.continuation_token
+            page, token = _read_resumable_query_page(iterator, continuation_token)
         except Exception:
             raise LifecycleRepositoryError("Cosmos ready-document scan failed") from None
         return ReadyDocumentPage(tuple(_ready_ref_from_row(row) for row in page), token)
@@ -95,11 +153,15 @@ class DocumentLifecycleRepository:
     def find_ready_document_by_document_id(self, document_id: str) -> ReadyDocumentRef | None:
         query = (
             "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
-            "c.allowedGroupIds, c.aclHash, c._etag FROM c "
-            "WHERE c.status = @status AND c.documentId = @documentId"
+            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "c.lifecycleGeneration, c._etag FROM c "
+            "WHERE ARRAY_CONTAINS(@statuses, c.status) AND c.documentId = @documentId"
         )
         parameters = [
-            {"name": "@status", "value": DocumentStatus.READY.value},
+            {
+                "name": "@statuses",
+                "value": [DocumentStatus.READY.value, DocumentStatus.ACL_REFRESHING.value],
+            },
             {"name": "@documentId", "value": document_id},
         ]
         try:
@@ -117,36 +179,278 @@ class DocumentLifecycleRepository:
             return None
         return _ready_ref_from_row(rows[0])
 
+    def find_acl_revoked_document_by_document_id(
+        self,
+        document_id: str,
+    ) -> ReadyDocumentRef | None:
+        query = (
+            "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
+            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "c.lifecycleGeneration, c._etag, c._ts FROM c "
+            "WHERE c.status = @retiredStatus AND c.retiredReason = @retiredReason "
+            "AND c.documentId = @documentId"
+        )
+        parameters = [
+            {"name": "@retiredStatus", "value": DocumentStatus.RETIRED.value},
+            {"name": "@retiredReason", "value": "acl_revoked"},
+            {"name": "@documentId", "value": document_id},
+        ]
+        try:
+            rows = list(self._source_documents.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True,
+                max_item_count=INTERNAL_PAGE_SIZE,
+            ))
+        except Exception:
+            raise LifecycleRepositoryError(
+                "Cosmos ACL-revoked document lookup failed"
+            ) from None
+        if not rows:
+            return None
+        latest = max(rows, key=_document_version_order)
+        return _ready_ref_from_row(latest)
+
+    def is_authoritative_document_version(
+        self,
+        *,
+        document_id: str,
+        source_run_id: str,
+        source_etag: str,
+    ) -> bool:
+        query = (
+            "SELECT c.sourceRunId, c.eTag, c.status, c._ts FROM c "
+            "WHERE c.documentId = @documentId"
+        )
+        try:
+            rows = list(self._source_documents.query_items(
+                query=query,
+                parameters=[{"name": "@documentId", "value": document_id}],
+                enable_cross_partition_query=True,
+                max_item_count=INTERNAL_PAGE_SIZE,
+            ))
+        except Exception:
+            raise LifecycleRepositoryError(
+                "Cosmos document-version authority lookup failed"
+            ) from None
+        if any(
+            row.get("status") in {
+                DocumentStatus.READY.value,
+                DocumentStatus.ACL_REFRESHING.value,
+            }
+            for row in rows
+        ):
+            return False
+        matching = [row for row in rows if row.get("eTag") == source_etag]
+        if not matching:
+            return False
+        latest = max(matching, key=_document_version_order)
+        return latest.get("sourceRunId") == source_run_id
+
+    def list_lifecycle_transitions_page(
+        self,
+        *,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> LifecycleDocumentPage:
+        _validate_page_size(page_size)
+        query = (
+            "SELECT c.documentId, c.sourceRunId, c.documentKey, c.status, "
+            "c.lifecycleGeneration, c.allowedGroupIds, c.aclHash, "
+            "c.expectedChunkCount, c.pendingAllowedGroupIds, c.pendingAclHash, "
+            "c.pendingRetiredReason, c._etag FROM c "
+            "WHERE ARRAY_CONTAINS(@statuses, c.status)"
+        )
+        parameters = [{
+            "name": "@statuses",
+            "value": [
+                DocumentStatus.ADMITTING.value,
+                DocumentStatus.ACL_REFRESHING.value,
+                DocumentStatus.RETIRING.value,
+                DocumentStatus.DELETING.value,
+            ],
+        }]
+        try:
+            iterator = self._source_documents.query_items(
+                query=query,
+                parameters=parameters,
+                enable_cross_partition_query=True,
+                max_item_count=page_size,
+            )
+            page, token = _read_resumable_query_page(iterator, continuation_token)
+        except Exception:
+            raise LifecycleRepositoryError(
+                "Cosmos lifecycle-transition scan failed"
+            ) from None
+        return LifecycleDocumentPage(
+            tuple(_lifecycle_ref_from_row(row) for row in page),
+            token,
+        )
+
+    def list_duplicate_ready_document_ids_page(
+        self,
+        *,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> DuplicateDocumentPage:
+        _validate_page_size(page_size)
+        query = (
+            "SELECT c.documentId FROM c "
+            "WHERE c.status = 'ready'"
+        )
+        try:
+            iterator = self._source_documents.query_items(
+                query=query,
+                parameters=[],
+                enable_cross_partition_query=True,
+                max_item_count=page_size,
+            )
+            page, token = _read_resumable_query_page(iterator, continuation_token)
+        except Exception:
+            raise LifecycleRepositoryError(
+                "Cosmos duplicate-ready scan failed"
+            ) from None
+        document_ids: list[str] = []
+        seen_document_ids: set[str] = set()
+        for row in page:
+            document_id = row.get("documentId")
+            if not isinstance(document_id, str) or not document_id:
+                raise LifecycleRepositoryError(
+                    "Cosmos duplicate-ready row is malformed"
+                )
+            if document_id not in seen_document_ids:
+                seen_document_ids.add(document_id)
+                document_ids.append(document_id)
+        return DuplicateDocumentPage(tuple(document_ids), token)
+
+    def list_ready_document_versions(
+        self,
+        document_id: str,
+    ) -> tuple[ReadyDocumentRef, ...]:
+        query = (
+            "SELECT c.documentId, c.sourceRunId, c.documentKey, c.itemId, "
+            "c.allowedGroupIds, c.aclHash, c.eTag, c.status, "
+            "c.lifecycleGeneration, c._etag FROM c "
+            "WHERE c.status = 'ready' AND c.documentId = @documentId"
+        )
+        try:
+            rows = list(self._source_documents.query_items(
+                query=query,
+                parameters=[{"name": "@documentId", "value": document_id}],
+                enable_cross_partition_query=True,
+                max_item_count=INTERNAL_PAGE_SIZE,
+            ))
+        except Exception:
+            raise LifecycleRepositoryError(
+                "Cosmos ready-version lookup failed"
+            ) from None
+        return tuple(_ready_ref_from_row(row) for row in rows)
+
+    def list_chunk_manifest_refs_page(
+        self,
+        *,
+        page_size: int,
+        continuation_token: str | None = None,
+    ) -> ChunkManifestPage:
+        _validate_page_size(page_size)
+        query = (
+            "SELECT c.id, c.documentKey, c.sourceRunId, c.documentId FROM c"
+        )
+        try:
+            iterator = self._search_chunks.query_items(
+                query=query,
+                parameters=[],
+                enable_cross_partition_query=True,
+                max_item_count=page_size,
+            )
+            page, token = _read_resumable_query_page(iterator, continuation_token)
+        except Exception:
+            raise LifecycleRepositoryError("Cosmos orphan-chunk scan failed") from None
+        refs: list[ChunkManifestRef] = []
+        for row in page:
+            try:
+                refs.append(ChunkManifestRef(
+                    chunk_id=row["id"],
+                    document_key=row["documentKey"],
+                    source_run_id=row["sourceRunId"],
+                    document_id=row["documentId"],
+                ))
+            except KeyError as error:
+                raise LifecycleRepositoryError(
+                    "Cosmos orphan-chunk row is malformed"
+                ) from error
+        return ChunkManifestPage(tuple(refs), token)
+
+    def delete_orphan_chunk(self, *, chunk_id: str, document_key: str) -> None:
+        self._delete_item(self._search_chunks, chunk_id, document_key)
+
     def retire_document(
         self,
         *,
         source_run_id: str,
         document_id: str,
+        document_key: str,
         etag: str,
         reason: str,
     ) -> None:
         if reason not in RETIRED_REASONS:
             raise ValueError("retired_reason must be one of the supported values")
         now = _now_iso()
-        patch_operations = [
-            {"op": "set", "path": "/status", "value": DocumentStatus.RETIRED.value},
-            {"op": "set", "path": "/retiredAt", "value": now},
-            {"op": "set", "path": "/retiredReason", "value": reason},
+        current = self._read_document(source_run_id, document_id)
+        generation = (
+            _require_generation(current)
+            if current.get("status") == DocumentStatus.RETIRING.value
+            else _require_generation(current) + 1
+        )
+        begin_operations = [
+            {"op": "set", "path": "/status", "value": DocumentStatus.RETIRING.value},
+            {"op": "set", "path": "/lifecycleGeneration", "value": generation},
+            {"op": "set", "path": "/pendingRetiredReason", "value": reason},
             {"op": "set", "path": "/updatedAt", "value": now},
         ]
         try:
-            self._source_documents.patch_item(
+            retiring = self._source_documents.patch_item(
                 item=document_id,
                 partition_key=source_run_id,
-                patch_operations=patch_operations,
-                filter_predicate="from c where c.status = 'ready'",
+                patch_operations=begin_operations,
+                filter_predicate=(
+                    "from c where c.status = 'ready' OR c.status = 'retiring'"
+                ),
                 etag=etag,
                 match_condition=MatchConditions.IfNotModified,
             )
         except Exception as error:
             if _error_status(error) in (404, 412):
                 raise LifecycleConflictError("document already retired or changed") from None
-            raise LifecycleRepositoryError("Cosmos document retirement failed") from None
+            raise LifecycleRepositoryError("Cosmos document retirement start failed") from None
+
+        self.set_document_chunks_retrievable(
+            document_key=document_key,
+            lifecycle_generation=generation,
+            is_retrievable=False,
+        )
+        complete_operations = [
+            {"op": "set", "path": "/status", "value": DocumentStatus.RETIRED.value},
+            {"op": "set", "path": "/retiredAt", "value": now},
+            {"op": "set", "path": "/retiredReason", "value": reason},
+            {"op": "set", "path": "/updatedAt", "value": now},
+            {"op": "remove", "path": "/pendingRetiredReason"},
+        ]
+        try:
+            self._source_documents.patch_item(
+                item=document_id,
+                partition_key=source_run_id,
+                patch_operations=complete_operations,
+                filter_predicate="from c where c.status = 'retiring'",
+                etag=_require_etag(retiring, "document retirement"),
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if _error_status(error) in (404, 412):
+                raise LifecycleConflictError("document already retired or changed") from None
+            raise LifecycleRepositoryError(
+                "Cosmos document retirement completion failed"
+            ) from None
 
     def refresh_document_acl(
         self,
@@ -159,54 +463,215 @@ class DocumentLifecycleRepository:
         acl_hash: str,
     ) -> None:
         now = _now_iso()
-        doc_patch = [
-            {"op": "set", "path": "/allowedGroupIds", "value": list(allowed_group_ids)},
-            {"op": "set", "path": "/aclHash", "value": acl_hash},
-            {"op": "set", "path": "/aclEvaluatedAt", "value": now},
+        current = self._read_document(source_run_id, document_id)
+        generation = (
+            _require_generation(current)
+            if current.get("status") == DocumentStatus.ACL_REFRESHING.value
+            else _require_generation(current) + 1
+        )
+        begin_patch = [
+            {"op": "set", "path": "/status", "value": DocumentStatus.ACL_REFRESHING.value},
+            {"op": "set", "path": "/lifecycleGeneration", "value": generation},
+            {
+                "op": "set",
+                "path": "/pendingAllowedGroupIds",
+                "value": list(allowed_group_ids),
+            },
+            {"op": "set", "path": "/pendingAclHash", "value": acl_hash},
             {"op": "set", "path": "/updatedAt", "value": now},
         ]
+        if (
+            current.get("status") == DocumentStatus.RETIRED.value
+            and current.get("retiredReason") == "acl_revoked"
+        ):
+            begin_patch.extend([
+                {"op": "remove", "path": "/retiredAt"},
+                {"op": "remove", "path": "/retiredReason"},
+            ])
         try:
-            self._source_documents.patch_item(
+            refreshing = self._source_documents.patch_item(
                 item=document_id,
                 partition_key=source_run_id,
-                patch_operations=doc_patch,
-                filter_predicate="from c where c.status = 'ready'",
+                patch_operations=begin_patch,
+                filter_predicate=(
+                    "from c where c.status = 'ready' OR c.status = 'acl_refreshing' OR "
+                    "(c.status = 'retired' AND c.retiredReason = 'acl_revoked')"
+                ),
                 etag=etag,
                 match_condition=MatchConditions.IfNotModified,
             )
         except Exception as error:
             if _error_status(error) in (404, 412):
                 raise LifecycleConflictError("document already changed or missing") from None
-            raise LifecycleRepositoryError("Cosmos document ACL patch failed") from None
-        self._patch_chunk_acl(document_key, allowed_group_ids)
+            raise LifecycleRepositoryError("Cosmos document ACL refresh start failed") from None
 
-    def _patch_chunk_acl(self, document_key: str, allowed_group_ids: tuple[str, ...]) -> None:
-        group_values = list(allowed_group_ids)
-        batch: list[str] = []
-        for chunk_id in self._list_chunk_ids(document_key):
-            batch.append(chunk_id)
-            if len(batch) == MAX_PATCH_BATCH_OPERATIONS:
-                self._patch_chunk_batch(document_key, batch, group_values)
-                batch = []
-        if batch:
-            self._patch_chunk_batch(document_key, batch, group_values)
+        refreshing_etag = refreshing.get("_etag") if isinstance(refreshing, Mapping) else None
+        if not isinstance(refreshing_etag, str) or not refreshing_etag:
+            raise LifecycleRepositoryError("Cosmos document ACL refresh returned no ETag")
 
-    def _patch_chunk_batch(
-        self, document_key: str, chunk_ids: list[str], group_values: list[str]
-    ) -> None:
-        operations = [
-            (
-                "patch",
-                (chunk_id, [{"op": "set", "path": "/allowedGroupIds", "value": group_values}]),
-            )
-            for chunk_id in chunk_ids
+        self.set_document_chunks_retrievable(
+            document_key=document_key,
+            lifecycle_generation=generation,
+            is_retrievable=False,
+            allowed_group_ids=allowed_group_ids,
+        )
+        self.set_document_chunks_retrievable(
+            document_key=document_key,
+            lifecycle_generation=generation,
+            is_retrievable=True,
+            allowed_group_ids=allowed_group_ids,
+        )
+
+        complete_patch = [
+            {"op": "set", "path": "/allowedGroupIds", "value": list(allowed_group_ids)},
+            {"op": "set", "path": "/aclHash", "value": acl_hash},
+            {"op": "set", "path": "/aclEvaluatedAt", "value": now},
+            {"op": "set", "path": "/status", "value": DocumentStatus.READY.value},
+            {"op": "set", "path": "/lifecycleGeneration", "value": generation},
+            {"op": "set", "path": "/updatedAt", "value": now},
+            {"op": "remove", "path": "/pendingAllowedGroupIds"},
+            {"op": "remove", "path": "/pendingAclHash"},
         ]
         try:
-            self._search_chunks.execute_item_batch(
-                batch_operations=operations, partition_key=document_key
+            self._source_documents.patch_item(
+                item=document_id,
+                partition_key=source_run_id,
+                patch_operations=complete_patch,
+                filter_predicate="from c where c.status = 'acl_refreshing'",
+                etag=refreshing_etag,
+                match_condition=MatchConditions.IfNotModified,
             )
-        except Exception:
-            raise LifecycleRepositoryError("Cosmos chunk ACL batch patch failed") from None
+        except Exception as error:
+            if _error_status(error) in (404, 412):
+                raise LifecycleConflictError("document changed during ACL refresh") from None
+            raise LifecycleRepositoryError("Cosmos document ACL refresh completion failed") from None
+
+    def set_document_chunks_retrievable(
+        self,
+        *,
+        document_key: str,
+        lifecycle_generation: int,
+        is_retrievable: bool,
+        allowed_group_ids: tuple[str, ...] | None = None,
+        expected_count: int | None = None,
+    ) -> int:
+        if (
+            isinstance(lifecycle_generation, bool)
+            or not isinstance(lifecycle_generation, int)
+            or lifecycle_generation < 0
+        ):
+            raise ValueError("lifecycle_generation must be a non-negative integer")
+        if not isinstance(is_retrievable, bool):
+            raise ValueError("is_retrievable must be boolean")
+        rows = self._list_chunk_rows(document_key)
+        if expected_count is not None and len(rows) != expected_count:
+            raise LifecycleRepositoryError("Cosmos chunk admission count mismatch")
+        batch: list[str] = []
+        for row in rows:
+            current_generation = row.get("lifecycleGeneration")
+            if (
+                isinstance(current_generation, bool)
+                or not isinstance(current_generation, int)
+                or current_generation < 0
+            ):
+                raise LifecycleRepositoryError(
+                    "Cosmos chunk lifecycle generation is malformed"
+                )
+            if current_generation > lifecycle_generation:
+                raise LifecycleConflictError(
+                    "newer chunk lifecycle generation already exists"
+                )
+            batch.append(row["id"])
+            if len(batch) == MAX_PATCH_BATCH_OPERATIONS:
+                self._patch_chunk_batch(
+                    document_key,
+                    batch,
+                    lifecycle_generation,
+                    is_retrievable,
+                    allowed_group_ids,
+                )
+                batch = []
+        if batch:
+            self._patch_chunk_batch(
+                document_key,
+                batch,
+                lifecycle_generation,
+                is_retrievable,
+                allowed_group_ids,
+            )
+
+        verified = self._list_chunk_rows(document_key)
+        if expected_count is not None and len(verified) != expected_count:
+            raise LifecycleRepositoryError("Cosmos chunk admission count mismatch")
+        expected_groups = list(allowed_group_ids) if allowed_group_ids is not None else None
+        for row in verified:
+            if (
+                row.get("lifecycleGeneration") != lifecycle_generation
+                or row.get("isRetrievable") is not is_retrievable
+                or (
+                    expected_groups is not None
+                    and row.get("allowedGroupIds") != expected_groups
+                )
+            ):
+                raise LifecycleRepositoryError(
+                    "Cosmos chunk admission verification failed"
+                )
+        return len(verified)
+
+    def _patch_chunk_batch(
+        self,
+        document_key: str,
+        chunk_ids: list[str],
+        lifecycle_generation: int,
+        is_retrievable: bool,
+        allowed_group_ids: tuple[str, ...] | None,
+    ) -> None:
+        patch_operations = [
+            {
+                "op": "set",
+                "path": "/lifecycleGeneration",
+                "value": lifecycle_generation,
+            },
+            {"op": "set", "path": "/isRetrievable", "value": is_retrievable},
+        ]
+        if allowed_group_ids is not None:
+            patch_operations.append({
+                "op": "set",
+                "path": "/allowedGroupIds",
+                "value": list(allowed_group_ids),
+            })
+        predicate = f"from c where c.lifecycleGeneration <= {lifecycle_generation}"
+        operations = [
+            ("patch", (chunk_id, patch_operations), {"filter_predicate": predicate})
+            for chunk_id in chunk_ids
+        ]
+        for attempt in range(MAX_PATCH_BATCH_ATTEMPTS):
+            try:
+                results = self._search_chunks.execute_item_batch(
+                    batch_operations=operations,
+                    partition_key=document_key,
+                    no_response=True,
+                )
+                failure = _batch_failure_status(results)
+            except Exception as error:
+                failure = _error_status(error)
+                if failure not in TRANSIENT_STATUS_CODES:
+                    raise LifecycleRepositoryError(
+                        "Cosmos chunk lifecycle batch patch failed"
+                    ) from None
+            if failure is None:
+                return
+            if failure == 412:
+                raise LifecycleConflictError("chunk lifecycle generation changed")
+            if failure not in TRANSIENT_STATUS_CODES:
+                raise LifecycleRepositoryError(
+                    "Cosmos chunk lifecycle batch patch failed"
+                )
+            if attempt + 1 < MAX_PATCH_BATCH_ATTEMPTS:
+                time.sleep(PATCH_RETRY_BASE_SECONDS * (2 ** attempt))
+        raise LifecycleRepositoryError(
+            "Cosmos chunk lifecycle batch patch failed after retries"
+        )
 
     def delete_document_and_chunks(
         self,
@@ -216,15 +681,51 @@ class DocumentLifecycleRepository:
         document_key: str,
         etag: str,
     ) -> None:
-        # Chunks are safe to delete unconditionally: each ingestion run mints a new
-        # document_key, so a concurrent re-add can never collide with this document_key's chunks.
+        try:
+            current = self._read_document(source_run_id, document_id)
+        except LifecycleConflictError:
+            return
+        generation = (
+            _require_generation(current)
+            if current.get("status") == DocumentStatus.DELETING.value
+            else _require_generation(current) + 1
+        )
+        try:
+            deleting_document = self._source_documents.patch_item(
+                item=document_id,
+                partition_key=source_run_id,
+                patch_operations=[
+                    {"op": "set", "path": "/status", "value": DocumentStatus.DELETING.value},
+                    {"op": "set", "path": "/lifecycleGeneration", "value": generation},
+                    {"op": "set", "path": "/updatedAt", "value": _now_iso()},
+                ],
+                filter_predicate=(
+                    "from c where c.status = 'ready' OR c.status = 'deleting'"
+                ),
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+        except Exception as error:
+            if _error_status(error) == 404:
+                return
+            if _error_status(error) == 412:
+                raise LifecycleConflictError(
+                    "document already changed or removed"
+                ) from None
+            raise LifecycleRepositoryError("Cosmos document delete start failed") from None
+
+        self.set_document_chunks_retrievable(
+            document_key=document_key,
+            lifecycle_generation=generation,
+            is_retrievable=False,
+        )
         for chunk_id in self._list_chunk_ids(document_key):
             self._delete_item(self._search_chunks, chunk_id, document_key)
         try:
             self._source_documents.delete_item(
                 item=document_id,
                 partition_key=source_run_id,
-                etag=etag,
+                etag=_require_etag(deleting_document, "document deletion"),
                 match_condition=MatchConditions.IfNotModified,
             )
         except Exception as error:
@@ -235,9 +736,16 @@ class DocumentLifecycleRepository:
             raise LifecycleRepositoryError("Cosmos document delete failed") from None
 
     def _list_chunk_ids(self, document_key: str) -> list[str]:
-        query = "SELECT c.id FROM c WHERE c.documentKey = @documentKey"
+        return [row["id"] for row in self._list_chunk_rows(document_key)]
+
+    def _list_chunk_rows(self, document_key: str) -> list[dict[str, Any]]:
+        query = (
+            "SELECT c.id, c.documentKey, c.allowedGroupIds, "
+            "c.isRetrievable, c.lifecycleGeneration FROM c "
+            "WHERE c.documentKey = @documentKey"
+        )
         parameters = [{"name": "@documentKey", "value": document_key}]
-        chunk_ids: list[str] = []
+        rows: list[dict[str, Any]] = []
         continuation: str | None = None
         while True:
             try:
@@ -252,10 +760,21 @@ class DocumentLifecycleRepository:
                 continuation = pager.continuation_token
             except Exception:
                 raise LifecycleRepositoryError("Cosmos chunk id scan failed") from None
-            chunk_ids.extend(row["id"] for row in page)
+            rows.extend(page)
             if continuation is None:
                 break
-        return chunk_ids
+        return rows
+
+    def _read_document(self, source_run_id: str, document_id: str) -> dict[str, Any]:
+        try:
+            return self._source_documents.read_item(
+                item=document_id,
+                partition_key=source_run_id,
+            )
+        except Exception as error:
+            if _error_status(error) == 404:
+                raise LifecycleConflictError("document is missing") from None
+            raise LifecycleRepositoryError("Cosmos document read failed") from None
 
     @staticmethod
     def _delete_item(container: Any, item_id: str, partition_key: str) -> None:
@@ -363,15 +882,114 @@ def _ready_ref_from_row(row: Mapping[str, Any]) -> ReadyDocumentRef:
             allowed_group_ids=tuple(row["allowedGroupIds"]),
             acl_hash=row["aclHash"],
             etag=row["_etag"],
+            source_etag=row.get("eTag") if isinstance(row.get("eTag"), str) else None,
+            lifecycle_generation=_require_generation(row),
+            status=DocumentStatus(row.get("status", DocumentStatus.READY.value)),
         )
-    except KeyError as error:
+    except (KeyError, ValueError) as error:
         raise LifecycleRepositoryError("ready-document row is missing an expected field") from error
+
+
+def _document_version_order(row: Mapping[str, Any]) -> tuple[int, str]:
+    timestamp = row.get("_ts")
+    source_run_id = row.get("sourceRunId")
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, int)
+        or not isinstance(source_run_id, str)
+        or not source_run_id
+    ):
+        raise LifecycleRepositoryError("document-version row is malformed")
+    return timestamp, source_run_id
+
+
+def _lifecycle_ref_from_row(row: Mapping[str, Any]) -> LifecycleDocumentRef:
+    try:
+        groups = row["allowedGroupIds"]
+        pending_groups = row.get("pendingAllowedGroupIds")
+        if not isinstance(groups, list) or not all(
+            isinstance(value, str) for value in groups
+        ):
+            raise ValueError
+        if pending_groups is not None and (
+            not isinstance(pending_groups, list)
+            or not all(isinstance(value, str) for value in pending_groups)
+        ):
+            raise ValueError
+        expected_count = row.get("expectedChunkCount")
+        if expected_count is not None and (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count < 0
+        ):
+            raise ValueError
+        return LifecycleDocumentRef(
+            document_id=row["documentId"],
+            source_run_id=row["sourceRunId"],
+            document_key=row["documentKey"],
+            status=DocumentStatus(row["status"]),
+            lifecycle_generation=_require_generation(row),
+            etag=row["_etag"],
+            allowed_group_ids=tuple(groups),
+            acl_hash=row["aclHash"],
+            expected_chunk_count=expected_count,
+            pending_allowed_group_ids=(
+                tuple(pending_groups) if pending_groups is not None else None
+            ),
+            pending_acl_hash=(
+                row.get("pendingAclHash")
+                if isinstance(row.get("pendingAclHash"), str)
+                else None
+            ),
+            pending_retired_reason=(
+                row.get("pendingRetiredReason")
+                if isinstance(row.get("pendingRetiredReason"), str)
+                else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise LifecycleRepositoryError(
+            "lifecycle-transition row is malformed"
+        ) from error
 
 
 def _error_status(error: Exception) -> int | None:
     for attribute in ("status_code", "status"):
         status = getattr(error, attribute, None)
         if isinstance(status, int):
+            return status
+    return None
+
+
+def _require_generation(item: Mapping[str, Any]) -> int:
+    generation = item.get("lifecycleGeneration")
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+    ):
+        raise LifecycleRepositoryError(
+            "lifecycle generation is missing or malformed"
+        )
+    return generation
+
+
+def _require_etag(item: Mapping[str, Any], operation: str) -> str:
+    etag = item.get("_etag")
+    if not isinstance(etag, str) or not etag:
+        raise LifecycleRepositoryError(f"Cosmos {operation} returned no ETag")
+    return etag
+
+
+def _batch_failure_status(results: Any) -> int | None:
+    if not isinstance(results, list):
+        return None
+    for result in results:
+        if isinstance(result, Mapping):
+            status = result.get("statusCode", result.get("status_code"))
+        else:
+            status = getattr(result, "status_code", None)
+        if isinstance(status, int) and not 200 <= status < 300:
             return status
     return None
 
@@ -385,5 +1003,35 @@ def _validate_page_size(page_size: int) -> None:
         raise ValueError(f"page_size must be between 1 and {INTERNAL_PAGE_SIZE}")
 
 
+def _read_resumable_query_page(
+    iterator: Any,
+    continuation_token: str | None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    pager = iterator.by_page(continuation_token)
+    items: list[dict[str, Any]] = []
+    token = None
+    while True:
+        sdk_page = list(next(pager, []))
+        if not sdk_page:
+            break
+        items.extend(sdk_page)
+        token = pager.continuation_token
+        if token is not None:
+            break
+    return items, token
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _require_utc_scalar(name: str, value: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} is required")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be an ISO-8601 timestamp") from error
+    offset = parsed.utcoffset()
+    if offset is None or offset.total_seconds() != 0:
+        raise ValueError(f"{name} must be a UTC timestamp")

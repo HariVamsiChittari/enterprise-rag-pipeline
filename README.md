@@ -1,13 +1,13 @@
 # Enterprise RAG Pipeline
 
-Secure, ACL-trimmed RAG system that ingests PDFs from a SharePoint document library and serves grounded answers with per-document security trimming. Ingestion extracts, chunks, enriches, and embeds content into Cosmos DB. Retrieval uses a hybrid architecture: an LLM query planner routes simple queries through a fast standard RAG path (~5s target budget) and complex queries through an Agent Framework agentic path (~8-10s target budget), with automatic fallback. Figures are configured timeout budgets, not yet measured in production.
+Secure, ACL-trimmed RAG system that ingests PDFs from one SharePoint document library and serves grounded answers with per-document security trimming. Ingestion extracts, chunks, enriches, and embeds content into Cosmos DB. Retrieval uses an LLM query planner to route one planned query through the standard path and two or more planned queries through an Agent Framework path with automatic fallback.
 
 ## Architecture
 
 - **Ingestion:** Azure Functions (Flex Consumption) with Durable Functions orchestration
-- **Retrieval:** Hybrid RAG (standard + agentic) on ACA (dev) / AKS (prod) with automatic routing
+- **Retrieval:** Hybrid RAG (standard + agentic) on Azure Container Apps with automatic routing
 - **Durable Backend:** Durable Task Scheduler (fresh instance ID per run, tracked via Cosmos)
-- **Storage:** Cosmos DB NoSQL (4 containers: ingestion-runs, source-documents, search-chunks, service-audit)
+- **Storage:** Cosmos DB NoSQL (ingestion-runs, source-documents, search-chunks, retrieval-config, service-audit)
 - **AI Services:** Document Intelligence, Azure AI Language, Azure OpenAI
 - **Auth:** Managed Identity (Azure services) + Certificate credential (Microsoft Graph)
 - **Networking:** VNet-integrated with Private Endpoints
@@ -19,13 +19,14 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed diagrams and data 
 ## How It Works
 
 **Ingestion (full-sync):**
-```
+
+```text
 POST /api/ingestion/full-sync → HTTP 202 + status polling URL
 Orchestrator: activate → discover → [fan-out in waves] → finalize
-Per-document: ACL verify → Download → Extract (DI) → Chunk → Enrich → Embed → Persist
+Per-document: ACL verify → Download → Extract → Chunk → Enrich → Embed → write ineligible chunks → admit generation → READY
 ```
 
-**Incremental sync:** Microsoft Graph webhooks push change notifications in real-time. A daily reconciliation timer (04:00 UTC) runs delta queries as a safety net. Weekly ACL resync (Sunday 03:00 UTC) re-verifies permissions on all indexed documents.
+**Incremental sync:** Microsoft Graph webhooks push change notifications. A daily reconciliation timer runs delta queries as a safety net, weekly ACL resync re-verifies permissions, and a 10-minute lifecycle reconciliation repairs interrupted transitions, duplicate ready versions, and orphan chunks.
 
 **Retrieval:** `POST /api/query` → query planning → embed → ACL-filtered Cosmos search → LLM answer generation with `[S#]` citations.
 
@@ -33,12 +34,13 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed sequence diagrams.
 
 ## Configuration
 
-All settings are environment variables:
+The complete ingestion, Function gateway, retrieval, operations-job, and deployment inventory is [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The tables below summarize the most common runtime settings.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `INGESTION_SOURCE_ID` | Yes | — | Stable source identifier |
 | `SHAREPOINT_ASSIGNED_DRIVE_ID` | Yes | — | SharePoint drive to ingest |
+| `SHAREPOINT_SITE_URL` | Yes | — | HTTPS SharePoint site URL used to bind the configured drive and expand site-group membership |
 | `SHAREPOINT_TENANT_ID` | Yes | — | Entra tenant ID |
 | `SHAREPOINT_APP_CLIENT_ID` | Yes | — | Graph app registration client ID |
 | `SHAREPOINT_CERTIFICATE_SECRET_NAME` | No | `sharepoint-app-cert` | Key Vault secret name for Graph PFX |
@@ -68,9 +70,8 @@ All settings are environment variables:
 | `WEBHOOK_CLIENT_STATE` | Yes | — | Shared secret for Graph webhook clientState validation |
 | `SUBSCRIPTION_RENEW_SCHEDULE` | No | `0 0 2 * * *` | Graph webhook subscription renewal (daily 02:00 UTC) |
 | `FUNCTION_PUBLIC_BASE_URL` | Yes | — | Public HTTPS URL of Function App (for Graph webhook notification URL) |
-| `SHAREPOINT_SITE_URL` | No | — | SharePoint site URL for site group ACL resolution via REST API |
 
-### Retrieval Service (ACA / AKS)
+### Retrieval Service (Azure Container Apps)
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -80,13 +81,18 @@ All settings are environment variables:
 | `CHAT_DEPLOYMENT` | Yes | — | Chat completion model deployment name |
 | `TENANT_ID` | Yes | — | Entra tenant ID for Graph group resolution |
 | `MANAGED_IDENTITY_CLIENT_ID` | Yes | — | User-assigned MI client ID |
+| `RETRIEVAL_API_AUDIENCE` | Yes | — | Exact v2 access-token audience accepted by retrieval |
+| `RETRIEVAL_GATEWAY_CLIENT_ID` | Yes | — | Function UAMI application/client ID |
+| `RETRIEVAL_GATEWAY_PRINCIPAL_ID` | Yes | — | Function UAMI service-principal object ID |
+| `DEPLOYMENT_INSTANCE_ID` | Yes | — | Retrieval catalog partition key |
+| `RETRIEVAL_CATALOG_DIGEST` | Yes | — | Immutable `sha256:<digest>` selecting the startup catalog |
 | `MAX_EVIDENCE_CHUNKS` | No | `5` | Default top-K chunks retrieved when `top_k` not in request |
 | `INCLUDE_CITATIONS` | No | `true` | When `false`, response returns empty citations array |
 | `ACL_ENABLED` | No | `true` | When `false`, skip ACL filtering — all authorized callers see all documents |
-| `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Cosmos retrieval timeout per query |
+| `RETRIEVAL_TIMEOUT_SECONDS` | No | `5.0` | Retrieval fan-out wait bound and query-embedding timeout |
 | `GENERATION_TIMEOUT_SECONDS` | No | `15.0` | Answer generation LLM call timeout |
-| `AGENT_TIMEOUT_SECONDS` | No | `8.0` | Agentic path timeout before fallback |
-| `AGENT_MAX_ITERATIONS` | No | `5` | Max LLM reasoning roundtrips per agentic request |
+| `AGENT_TIMEOUT_SECONDS` | No | `20.0` in Bicep | Agentic path deadline before fallback |
+| `RETRIEVAL_OPERATION_TIMEOUT_SECONDS` | No | `27.0` | ACA wall-clock deadline for `/api/query` |
 | `RATE_LIMIT_RPM` | No | `30` | Per-user requests per minute **per replica** before HTTP 429 (effective ceiling ≈ value × replica count; not a hard DoS control at scale-out — use Front Door WAF for enforcement) |
 | `QUERY_PROXY_TIMEOUT_SECONDS` | No | `30.0` | Function App → retrieval service proxy timeout |
 
@@ -99,12 +105,12 @@ All settings are environment variables:
 | `/api/ingestion/terminate` | POST | Terminate orchestration, force-fail stuck docs, finalize run |
 | `/api/ingestion/retry-failed` | POST | Retry only the failed docs from the current full-sync run |
 | `/api/ingestion/purge` | DELETE | Delete items from a Cosmos container (targeted IDs or purge-all) |
-| `/api/ingestion/inspect` | GET | Read Cosmos data (container, runId, limit) |
+| `/api/ingestion/inspect` | GET | Read a bounded Cosmos sample; `runId` applies only to `source-documents` |
 | `/api/query` | POST | Proxy RAG queries to the retrieval service |
 | `/api/webhook/sharepoint` | POST | Microsoft Graph change notifications (no auth required) |
 | `/api/webhook/lifecycle` | POST | Graph subscription lifecycle events |
 
-Retrieval is served by the hybrid RAG service on ACA / AKS (Function App proxies `/api/query` via `RETRIEVAL_SERVICE_URL`).
+Retrieval is served by Azure Container Apps. The Function validates delegated user claims, then calls retrieval with its managed-identity service token, a bounded gateway context, and a Function-owned request ID.
 
 > **See [docs/API_REFERENCE.md](docs/API_REFERENCE.md)** for the complete API contract: headers, request/response schemas, error codes, and PowerShell examples for every endpoint.
 
@@ -121,7 +127,9 @@ Content-Type: application/json
   "question": "What is the password policy?",
   "mode": "hybrid",
   "history": [],
-  "top_k": 5
+  "top_k": 5,
+  "scoring_profile": "hr-relevance",
+  "expand_synonyms": true
 }
 ```
 
@@ -131,6 +139,10 @@ Content-Type: application/json
 | `mode` | string | No | `hybrid` (default), `vector`, `full_text` |
 | `history` | array | No | Conversation history for multi-turn |
 | `top_k` | int | No | Number of chunks to retrieve (1–20, default: `MAX_EVIDENCE_CHUNKS`) |
+| `scoring_profile` | string | No | Profile from the pinned retrieval catalog; omitted uses the catalog default |
+| `expand_synonyms` | boolean | No | `false` disables expansion; `true` or omitted uses the selected profile's map when catalog synonyms are enabled |
+
+Freshness is not a request field. It is applied automatically when the selected scoring profile declares freshness functions over `sourceModifiedAt`.
 
 **Response:**
 
@@ -148,66 +160,42 @@ For error codes, rate limiting, and multi-turn history format, see [docs/API_REF
 
 ## Idempotent Re-Runs
 
-Full-sync skips unchanged files automatically (same eTag). Use `retry-failed` for failed documents instead of re-running full-sync. Delta-sync retries failures automatically on the next timer tick. See [ARCHITECTURE.md](docs/ARCHITECTURE.md#idempotent-re-runs-skip-if-ready) for details.
+Full sync skips a prior-ready file when its source eTag and available modification timestamp are unchanged. Use `retry-failed` for failed documents instead of re-running full sync. Delta failures retain the previous cursor and are replayed by a later tick. See [ARCHITECTURE.md](docs/ARCHITECTURE.md#idempotent-re-runs-skip-if-ready) for details.
 
 ## Security
 
 - Files without verified Entra security groups are rejected (fail-closed)
 - Only groups with `securityEnabled=true` are accepted
 - Retrieval requires caller's group membership to match document ACLs
-- All Azure access via Managed Identity (no secrets in code)
+- Azure service access uses Managed Identity; the SharePoint certificate is loaded from Key Vault and webhook `clientState` is a secure app setting
 - Graph access via certificate stored in Key Vault
 - Prompt injection defense: hardened system prompt + chunk sanitization (strips injection prefixes) + input segmentation
 - Per-user rate limiting **per replica** (default 30 RPM, configurable via `RATE_LIMIT_RPM`; effective ceiling ≈ value × replica count — not a hard DoS control at scale-out)
 - Thread-safe concurrent retrieval with `threading.Lock` on shared state
-- EasyAuth with Entra ID: tenant-locked, audience-validated; production should set `allowedApplications` to restrict calling clients
+- EasyAuth requires the exact Function audience and configured caller application list in every environment
 - **Known gap**: `allowedApplications` restricts which client apps can call the API, but the Function App does not currently enforce per-user roles on admin/destructive endpoints (`purge`, `terminate`, `retry-failed`, `inspect`) — any caller from an allowed application can invoke them. See `docs/ARCHITECTURE.md` Known Limitations.
-- AKS pods: Pod Security Standards (Restricted) — `runAsNonRoot`, `readOnlyRootFilesystem`, `drop ALL` capabilities
 - OpenAI clients: `max_retries=2` for transient 429/5xx resilience
 
-## Initial Deployment (Bootstrap)
+## Initial Deployment
 
-On first deploy to an empty environment, the ACA uses `mcr.microsoft.com/k8se/quickstart:latest` as a placeholder image (ACR is empty). After infra provisioning, build and push the real image:
-
-```bash
-# 1. Deploy infrastructure (ACA starts with MCR placeholder)
-az deployment group create --resource-group <rg> --template-file infra/main.bicep --parameters infra/main.parameters.dev.bicepparam
-
-# 2. Build and push real image
-az acr build --registry <acr-name> --image retrieval-agent:v1 --file retrieval/Dockerfile app/
-
-# 3. Update ACA to real image
-az containerapp update --name <aca-name> --resource-group <rg> --image <acr>.azurecr.io/retrieval-agent:v1
-
-# 4. Deploy Function App code
-func azure functionapp publish <func-app-name> --python
-```
+Deployment is controlled by [scripts/deploy.ps1](scripts/deploy.ps1). It validates reviewed plan/source hashes and runs `Authority`, `Foundation`, `Build`, `Operations`, `Catalog`, `CatalogVerify`, `Final`, and `Function`; after E2E validation and explicit approval, `OperationsCleanup` removes the temporary publisher job. Serving phases require an immutable image reference (`repository@sha256:<digest>`) and immutable catalog digest. See [docs/AZURE_SETUP.md](docs/AZURE_SETUP.md) for prerequisites and commands.
 
 ## Local Development
 
-```bash
+```powershell
 python -m venv .venv
-.venv/Scripts/activate      # Windows
-pip install -r requirements-dev.txt
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements-dev.txt
 python -m pytest tests/ --ignore=tests/infra/test_aks_contracts.py -q
 ```
 
 ## Deployment
 
-```bash
-# Infrastructure + Function App
-azd provision
-azd deploy
-
-# Retrieval service (ACA)
-cd app
-az acr build --registry <acr-name> --image retrieval-agent:latest --file retrieval/Dockerfile .
-az containerapp update --name <aca-name> --resource-group <rg> --image <acr>.azurecr.io/retrieval-agent:latest
-```
+Use the guarded phases in `scripts/deploy.ps1`; do not deploy mutable image tags or update ACA directly. Preview is the default, and Azure mutation requires `-Execute` plus the reviewed hashes and target identifiers.
 
 ## Project Structure
 
-```
+```text
 ├── azure.yaml             # azd service definitions
 ├── pyproject.toml         # Python project metadata
 ├── requirements-dev.txt   # Dev dependencies (pytest, jsonschema)
@@ -241,10 +229,10 @@ az containerapp update --name <aca-name> --resource-group <rg> --image <acr>.azu
 │       ├── tools.py       # Agent Framework search tool (multi-instance)
 │       ├── telemetry.py   # LLM audit to Cosmos
 │       ├── Dockerfile     # Retrieval container image
-│       └── kubernetes/    # AKS/ACA deployment manifests
+│       └── kubernetes/    # Retained inactive AKS manifest
 ├── infra/                 # Bicep modules (Cosmos, Functions, VNet, PEs)
 ├── evaluation/            # Evaluation schemas (ground-truth, experiments)
 ├── tests/                 # Unit tests (ingestion, retrieval, infra)
-├── docs/                  # ARCHITECTURE.md, API_REFERENCE.md, AZURE_RESOURCES.md, AZURE_SETUP.md, PRODUCTION_READINESS.md, DEMO_RUNBOOK.md, INFRASTRUCTURE_REQUEST.md, archive/
+├── docs/                  # Architecture, API, configuration, setup, readiness, demo, and infrastructure guides
 └── data/                  # Sample Cosmos data exports
 ```

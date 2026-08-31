@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
@@ -26,7 +26,7 @@ DOWNLOAD_HOST_SUFFIXES = (
     "storage.live.com",
     "svc.ms",
 )
-CHILDREN_SELECT = "id,name,eTag,size,file,folder,package,parentReference,webUrl"
+CHILDREN_SELECT = "id,name,eTag,size,file,folder,package,parentReference,webUrl,lastModifiedDateTime"
 SUPPORTED_ACL_ROLES = frozenset({"read", "write", "owner"})
 ACL_POLICY_VERSION = "verified-entra-security-groups-v1"
 
@@ -131,6 +131,7 @@ class DiscoveredPdf:
     e_tag: str
     size_bytes: int
     discovery_ordinal: int
+    last_modified_date_time: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +143,7 @@ class DiscoveredPdf:
             "eTag": self.e_tag,
             "sizeBytes": self.size_bytes,
             "discoveryOrdinal": self.discovery_ordinal,
+            "lastModifiedDateTime": self.last_modified_date_time,
         }
 
 
@@ -269,6 +271,15 @@ def _require_item_text(item: dict[str, Any], field_name: str) -> str:
     return value
 
 
+def _optional_item_text(item: dict[str, Any], field_name: str) -> str | None:
+    value = item.get(field_name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        return None
+    return value
+
+
 def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPdf:
     item_id = _require_item_text(item, "id")
     name = _require_item_text(item, "name")
@@ -288,6 +299,7 @@ def discovered_pdf_from_item(item: dict[str, Any], ordinal: int) -> DiscoveredPd
         e_tag=_require_item_text(item, "eTag"),
         size_bytes=size_bytes,
         discovery_ordinal=ordinal,
+        last_modified_date_time=_optional_item_text(item, "lastModifiedDateTime"),
     )
 
 
@@ -532,7 +544,7 @@ def read_drive_item(
 ) -> dict[str, Any] | None:
     response = client.get(
         f"{GRAPH_ROOT}/drives/{quote(drive_id, safe='')}/items/{quote(item_id, safe='')}",
-        params={"$select": "id,name,cTag,file,folder,webUrl"},
+        params={"$select": "id,name,eTag,cTag,file,folder,webUrl"},
     )
     if response.status_code == 404:
         return None
@@ -541,6 +553,60 @@ def read_drive_item(
     if not isinstance(payload, dict) or payload.get("id") != item_id:
         raise ValueError("Graph drive item response is invalid")
     return payload
+
+
+def validate_sharepoint_drive_site(
+    client: httpx.Client,
+    drive_id: str,
+    site_url: str,
+    max_pages: int,
+) -> None:
+    try:
+        parsed = urlparse(site_url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("SharePoint site URL is invalid") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("SharePoint site URL must be an HTTPS site URL")
+
+    hostname = parsed.hostname.lower()
+    site_path = unquote(parsed.path).rstrip("/")
+    if site_path:
+        site_endpoint = (
+            f"{GRAPH_ROOT}/sites/{quote(hostname, safe='.')}:"
+            f"{quote(site_path, safe='/')}"
+        )
+    else:
+        site_endpoint = f"{GRAPH_ROOT}/sites/{quote(hostname, safe='.')}"
+
+    site_response = client.get(
+        site_endpoint,
+        params={"$select": "id,sharepointIds,webUrl"},
+    )
+    site_response.raise_for_status()
+    site = site_response.json()
+    site_id = site.get("id") if isinstance(site, dict) else None
+    if not isinstance(site_id, str) or not site_id:
+        raise ValueError("Graph SharePoint site response is invalid")
+
+    drives, _ = read_json_pages(
+        client,
+        f"{GRAPH_ROOT}/sites/{quote(site_id, safe=',')}/drives?$select=id,driveType",
+        max_pages,
+    )
+    if not any(
+        drive.get("id") == drive_id and drive.get("driveType") == "documentLibrary"
+        for drive in drives
+    ):
+        raise ValueError("Configured SharePoint site does not own the configured drive")
 
 
 def read_permissions(

@@ -247,6 +247,38 @@ class IngestionRepository:
             allowed_changes={"status", "stage", "updatedAt", "failedAt", "error"},
         )
 
+    def begin_document_admission(
+        self,
+        document: SourceDocumentRecord,
+        etag: str,
+    ) -> VersionedRecord[SourceDocumentRecord]:
+        if (
+            document.status is not DocumentStatus.ADMITTING
+            or document.stage is not DocumentStage.VERIFYING
+            or document.expected_chunk_count is None
+            or document.written_chunk_count != document.expected_chunk_count
+            or not document.allowed_group_ids
+            or not document.acl_hash
+            or document.acl_evaluated_at is None
+        ):
+            raise ValueError("admitting document integrity fields are incomplete")
+        return self._replace_document(
+            document,
+            etag,
+            expected_status=DocumentStatus.PROCESSING,
+            allowed_status=DocumentStatus.ADMITTING,
+            allowed_changes={
+                "status",
+                "stage",
+                "updatedAt",
+                "allowedGroupIds",
+                "aclHash",
+                "aclEvaluatedAt",
+                "expectedChunkCount",
+                "writtenChunkCount",
+            },
+        )
+
     def fail_nonterminal_documents(self, source_id: str, run_id: str, error_message: str) -> int:
         """Mark all discovered/processing docs as failed for orchestration termination."""
         source_run_id = create_source_run_id(source_id, run_id)
@@ -378,7 +410,7 @@ class IngestionRepository:
         return self._replace_document(
             document,
             etag,
-            expected_status=DocumentStatus.PROCESSING,
+            expected_status=DocumentStatus.ADMITTING,
             allowed_status=DocumentStatus.READY,
             allowed_changes={
                 "status",
@@ -846,7 +878,7 @@ class IngestionRepository:
         expected_count = document.expected_chunk_count or 0
         query = (
             "SELECT c.id, c.chunkIndex, c.documentKey, c.documentId, c.sourceId, c.runId, "
-            "c.sourceRunId "
+            "c.sourceRunId, c.allowedGroupIds, c.isRetrievable, c.lifecycleGeneration "
             "FROM c WHERE c.documentKey = @documentKey"
         )
         parameters = [{"name": "@documentKey", "value": document.document_key}]
@@ -878,6 +910,18 @@ class IngestionRepository:
                 if chunk_index >= expected_count:
                     raise RepositoryConflictError("ready verification found missing or extra chunks")
                 _require_chunk_row_identity(row, document)
+                if row.get("isRetrievable") is not True:
+                    raise RepositoryConflictError(
+                        "ready verification found ineligible chunks"
+                    )
+                if row.get("lifecycleGeneration") != document.lifecycle_generation:
+                    raise RepositoryConflictError(
+                        "ready verification found a lifecycle generation mismatch"
+                    )
+                if row.get("allowedGroupIds") != list(document.allowed_group_ids):
+                    raise RepositoryConflictError(
+                        "ready verification found an ACL mismatch"
+                    )
                 seen_ids.add(chunk_id)
                 seen_indices.add(chunk_index)
             if continuation is None:
@@ -1067,9 +1111,12 @@ def _run_from_item(item: Mapping[str, Any]) -> IngestionRunRecord:
 
 def _document_from_item(item: Mapping[str, Any]) -> SourceDocumentRecord:
     values = _snake_keys(_domain_item(item))
+    if "lifecycle_generation" not in values:
+        raise RepositoryDataError("source document is missing lifecycleGeneration")
     values["status"] = DocumentStatus(values["status"])
     values["stage"] = DocumentStage(values["stage"])
     values["allowed_group_ids"] = tuple(values["allowed_group_ids"])
+    values.setdefault("source_modified_at", None)
     for _removed in ("quality_flags", "profiles", "acl_policy_version", "verified_at", "record_type"):
         values.pop(_removed, None)
     if values.get("error") is not None:
@@ -1079,14 +1126,18 @@ def _document_from_item(item: Mapping[str, Any]) -> SourceDocumentRecord:
 
 def _chunk_from_item(item: Mapping[str, Any]) -> SearchChunkRecord:
     values = _snake_keys(_domain_item(item))
+    if "is_retrievable" not in values or "lifecycle_generation" not in values:
+        raise RepositoryDataError(
+            "search chunk is missing lifecycle admission fields"
+        )
     values["allowed_group_ids"] = tuple(values["allowed_group_ids"])
     values["section_path"] = tuple(values["section_path"])
     values["key_phrases"] = tuple(values["key_phrases"])
     values["entities"] = tuple(Entity(**_snake_keys(entity)) for entity in values["entities"])
     values["embedding"] = tuple(values["embedding"])
-    # Backward compat: old chunks may not have searchable_text
     if "searchable_text" not in values:
         values["searchable_text"] = values.get("content", "")
+    values.setdefault("source_modified_at", None)
     for _removed in (
         "source_path", "drive_id", "item_id", "embedding_input_hash",
         "chunking_strategy", "chunking_profile_version", "tokenizer",

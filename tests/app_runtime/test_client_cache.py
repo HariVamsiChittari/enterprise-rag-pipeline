@@ -16,6 +16,7 @@ from typing import Any
 
 import azure.cosmos
 import azure.identity
+import httpx
 import openai
 import pytest
 
@@ -65,6 +66,12 @@ def _fake_config(**overrides: Any) -> SimpleNamespace:
         cosmos_source_documents_container="source-documents",
         cosmos_search_chunks_container="search-chunks",
         openai_endpoint="https://openai.example",
+        key_vault_uri="https://vault.example",
+        certificate_secret_name="sharepoint-cert",
+        tenant_id="tenant-id",
+        app_client_id="app-client-id",
+        drive_id="drive-id",
+        acl_max_pages=10,
         sharepoint_site_url="",
     )
     base.update(overrides)
@@ -98,8 +105,8 @@ def test_build_openai_client_constructs_sdk_client_once(monkeypatch: pytest.Monk
     assert len(FakeAzureOpenAI.instances) == 1
 
 
-def test_build_sharepoint_client_caches_none_without_rebuilding(monkeypatch: pytest.MonkeyPatch) -> None:
-    """When sharepoint_site_url is unset, the factory must cache None, not retry Key Vault on every call."""
+def test_build_sharepoint_client_rejects_missing_site_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Site-group resolution must not be silently disabled by missing configuration."""
 
     def _fail_if_called(*args: Any, **kwargs: Any) -> None:
         raise AssertionError("SecretClient should not be constructed when sharepoint_site_url is empty")
@@ -107,9 +114,50 @@ def test_build_sharepoint_client_caches_none_without_rebuilding(monkeypatch: pyt
     monkeypatch.setattr("azure.keyvault.secrets.SecretClient", _fail_if_called)
     config = _fake_config(sharepoint_site_url="")
 
+    with pytest.raises(EnvironmentError, match="SharePoint site URL"):
+        function_app._build_sharepoint_client(config)
+
+    assert "sharepoint_client" not in function_app._client_cache
+
+
+def test_build_sharepoint_client_constructs_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    secret_clients: list[Any] = []
+    binding_calls: list[tuple[Any, str, str, int]] = []
+
+    class FakeSecretClient:
+        def __init__(self, vault_url: str, credential: Any) -> None:
+            secret_clients.append(self)
+
+        def get_secret(self, name: str) -> SimpleNamespace:
+            return SimpleNamespace(value="Y2VydA==")
+
+    class FakeHttpxClient:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    monkeypatch.setattr("azure.keyvault.secrets.SecretClient", FakeSecretClient)
+    monkeypatch.setattr(azure.identity, "DefaultAzureCredential", lambda **kwargs: object())
+    monkeypatch.setattr(azure.identity, "CertificateCredential", lambda **kwargs: object())
+    monkeypatch.setattr(httpx, "HTTPTransport", lambda **kwargs: object())
+    monkeypatch.setattr(httpx, "Client", FakeHttpxClient)
+    graph_client = object()
+    monkeypatch.setattr(function_app, "_build_graph_client", lambda config: graph_client)
+    monkeypatch.setattr(
+        "ingestion.graph.validate_sharepoint_drive_site",
+        lambda client, drive_id, site_url, max_pages: binding_calls.append(
+            (client, drive_id, site_url, max_pages)
+        ),
+    )
+    config = _fake_config(sharepoint_site_url="https://tenant.sharepoint.com/sites/site")
+
     first = function_app._build_sharepoint_client(config)
     second = function_app._build_sharepoint_client(config)
 
-    assert first is None
-    assert second is None
-    assert "sharepoint_client" in function_app._client_cache
+    assert first is second
+    assert len(secret_clients) == 1
+    assert binding_calls == [(
+        graph_client,
+        config.drive_id,
+        "https://tenant.sharepoint.com/sites/site",
+        config.acl_max_pages,
+    )]

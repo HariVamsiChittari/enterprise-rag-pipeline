@@ -8,7 +8,8 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$ResourceGroup = "rg-rag-project",
+    [Parameter(Mandatory)]
+    [string]$ResourceGroup,
     [string]$DeploymentName = "main",
     [string]$OutputPath = ""
 )

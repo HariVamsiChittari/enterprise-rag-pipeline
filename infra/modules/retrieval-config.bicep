@@ -1,5 +1,4 @@
-// Canonical retrieval-service configuration — single source of truth for ACA and AKS.
-// Both compute targets consume this module's output to ensure env var parity.
+// Canonical host-neutral retrieval-service configuration consumed by ACA.
 
 @description('Cosmos DB endpoint')
 param cosmosEndpoint string
@@ -21,6 +20,25 @@ param tenantId string
 
 @description('Managed identity client ID (target-specific: differs between ACA and AKS)')
 param managedIdentityClientId string
+
+@description('Retrieval API client ID validated as the v2 access-token audience')
+@minLength(1)
+param retrievalApiAudience string
+
+@description('Function managed identity application/client ID allowed to call retrieval')
+param gatewayClientId string
+
+@description('Function managed identity service-principal object ID allowed to call retrieval')
+param gatewayPrincipalId string
+
+@description('Unique deployment instance and Cosmos retrieval-config partition key')
+@minLength(1)
+param deploymentInstanceId string
+
+@description('Immutable retrieval catalog digest')
+@minLength(71)
+@maxLength(71)
+param catalogDigest string
 
 @description('Enable ACL filtering at retrieval time')
 param aclEnabled bool = true
@@ -70,6 +88,12 @@ param openAiApiVersion string = '2024-10-21'
 @description('Include source citations in query responses')
 param includeCitations bool = true
 
+@description('Cosmos container containing versioned retrieval catalogs.')
+param retrievalConfigContainer string = 'retrieval-config'
+
+@description('Wall-clock operation deadline at ACA ingress')
+param operationTimeoutSeconds string = '27.0'
+
 // --- Output: complete env var array consumable by ACA container or AKS configmap ---
 
 var envVars = [
@@ -83,6 +107,11 @@ var envVars = [
   { name: 'CHAT_DEPLOYMENT', value: chatDeploymentName }
   { name: 'TENANT_ID', value: tenantId }
   { name: 'MANAGED_IDENTITY_CLIENT_ID', value: managedIdentityClientId }
+  { name: 'RETRIEVAL_API_AUDIENCE', value: retrievalApiAudience }
+  { name: 'RETRIEVAL_GATEWAY_CLIENT_ID', value: gatewayClientId }
+  { name: 'RETRIEVAL_GATEWAY_PRINCIPAL_ID', value: gatewayPrincipalId }
+  { name: 'DEPLOYMENT_INSTANCE_ID', value: deploymentInstanceId }
+  { name: 'RETRIEVAL_CATALOG_DIGEST', value: catalogDigest }
   { name: 'ACL_ENABLED', value: string(aclEnabled) }
   { name: 'INCLUDE_CITATIONS', value: string(includeCitations) }
   { name: 'MAX_EVIDENCE_CHUNKS', value: maxEvidenceChunks }
@@ -95,6 +124,8 @@ var envVars = [
   { name: 'GRAPH_GROUP_TIMEOUT_SECONDS', value: graphGroupTimeoutSeconds }
   { name: 'OPENAI_API_VERSION', value: openAiApiVersion }
   { name: 'APPLICATIONINSIGHTS_CONNECTION_STRING', value: appInsightsConnectionString }
+  { name: 'RETRIEVAL_CONFIG_CONTAINER', value: retrievalConfigContainer }
+  { name: 'RETRIEVAL_OPERATION_TIMEOUT_SECONDS', value: operationTimeoutSeconds }
 ]
 
 @description('Complete env var array for the retrieval service container')

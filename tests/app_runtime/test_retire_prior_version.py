@@ -28,8 +28,8 @@ class FakeLifecycleRepo:
         self._raise_error = raise_error
         self.delete_calls: list[dict[str, Any]] = []
 
-    def find_ready_document_by_document_id(self, document_id: str) -> ReadyDocumentRef | None:
-        return self._ref
+    def list_ready_document_versions(self, document_id: str) -> tuple[ReadyDocumentRef, ...]:
+        return (self._ref,) if self._ref is not None else ()
 
     def delete_document_and_chunks(
         self, *, source_run_id: str, document_id: str, document_key: str, etag: str

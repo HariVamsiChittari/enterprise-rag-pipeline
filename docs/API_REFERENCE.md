@@ -2,6 +2,8 @@
 
 Complete HTTP API for the Enterprise RAG Pipeline. All routes exposed by the Function App and the retrieval service, with headers, request bodies, responses, and error codes.
 
+For the complete deployment and runtime environment-variable inventory, see [CONFIGURATION.md](CONFIGURATION.md).
+
 ## Contents
 
 - [Authentication](#authentication)
@@ -9,45 +11,25 @@ Complete HTTP API for the Enterprise RAG Pipeline. All routes exposed by the Fun
 - [Ingestion Endpoints](#ingestion-endpoints) (Function App)
 - [Query Endpoint](#query-endpoint) (Function App proxy → retrieval)
 - [Webhook Endpoints](#webhook-endpoints) (Function App, unauthenticated)
-- [Retrieval Service Endpoints](#retrieval-service-endpoints) (ACA/AKS, internal)
+- [Retrieval Service Endpoints](#retrieval-service-endpoints) (Azure Container Apps, internal service contract)
+- [Retrieval Configuration](#retrieval-configuration) (scoring profiles, startup logs)
 - [Error Responses](#error-responses)
 
 ---
 
 ## Authentication
 
-The Function App uses **App Service EasyAuth** with Microsoft Entra ID. Every operator endpoint requires either a Bearer token or a Function App master key.
+The Function App uses **App Service Authentication (EasyAuth)** with Microsoft Entra ID. Every non-webhook endpoint requires an authenticated Bearer token with the exact configured audience from an allowed client application. All Function routes use `AuthLevel.ANONYMOUS`; Function keys do not replace EasyAuth authentication. The `/api/query` gateway adds stricter application validation and requires delegated user claims with `user_impersonation`; ingestion and administrative routes do not currently enforce delegated scope or a per-user admin role.
 
-### Option 1: Bearer Token (recommended for interactive use)
+### Bearer Token
 
 ```powershell
-$clientId = "<ADMIN_API_CLIENT_ID>"   # from AZURE_SETUP.md §1.4
+$clientId = "<ADMIN_API_CLIENT_ID>"   # Function API application client ID
 $token = az account get-access-token --resource "api://$clientId" --query accessToken -o tsv
 $headers = @{ Authorization = "Bearer $token" }
 ```
 
-### Option 2: Function App Master Key (recommended for automation)
-
-```powershell
-$masterKey = az functionapp keys list --name <func-app> --resource-group <rg> --query masterKey -o tsv
-$headers = @{ "x-functions-key" = $masterKey }
-```
-
-### Local Development (bypass EasyAuth)
-
-When running the Function App locally (`func start`), authentication is bypassed. To simulate a caller identity for the retrieval service, set `X-MS-CLIENT-PRINCIPAL` manually:
-
-```powershell
-# Base64-encoded JSON of {claims: [{typ, val}, ...]} — must include oid, tid, and groups
-$claims = @{
-  claims = @(
-    @{ typ = "oid"; val = "<your-user-oid>" }
-    @{ typ = "tid"; val = "<your-tenant-id>" }
-  )
-} | ConvertTo-Json -Compress
-$principal = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($claims))
-$headers["X-MS-CLIENT-PRINCIPAL"] = $principal
-```
+For query automation, obtain a delegated token through an approved client application. App-only callers are rejected by the Function query gateway. Treat access to ingestion, inspect, purge, terminate, and retry endpoints as privileged because EasyAuth client allowlisting is currently their only application-level authorization boundary.
 
 ---
 
@@ -56,9 +38,8 @@ $headers["X-MS-CLIENT-PRINCIPAL"] = $principal
 | Header | Required | Value | Notes |
 |---|---|---|---|
 | `Authorization` | Yes (operator endpoints) | `Bearer <token>` | EasyAuth-validated Entra token |
-| `x-functions-key` | Alternative to Bearer | Function App master key | Bypasses EasyAuth |
 | `Content-Type` | Yes (POST/DELETE with body) | `application/json` | UTF-8 |
-| `X-MS-CLIENT-PRINCIPAL` | Auto-set by EasyAuth | Base64 JSON | Forwarded by `/api/query` proxy |
+| `X-MS-CLIENT-PRINCIPAL` | Platform-generated | Base64 JSON | Consumed by the Function; never accepted from the public request as a gateway substitute |
 | `X-MS-CLIENT-PRINCIPAL-NAME` | Auto-set by EasyAuth | Caller's UPN/email | Used by purge audit trail |
 
 ---
@@ -127,8 +108,9 @@ Authorization: Bearer <token>
 
 Instance IDs are randomly generated per run, not derived from `INGESTION_SOURCE_ID` or the
 orchestration kind — omitting `instanceId` only resolves the *current full-sync* instance.
-To check a delta-sync or ACL-resync tick, use the `instanceId` returned when it started (see
-`webhook_received`/`acl_resync_*` audit records via `/api/ingestion/inspect?container=service-audit`).
+To check a periodic tick, read `currentInstanceId` from the `delta-sync-trigger`,
+`acl-resync-trigger`, or `lifecycle-reconcile-trigger` control record in `ingestion-runs`
+through an approved Cosmos read path, then pass that value as `instanceId`.
 
 **Response — 200 OK**
 
@@ -237,7 +219,7 @@ Read rows from any Cosmos container for debugging. Sanitizes system fields (`_ts
 **Request**
 
 ```http
-GET /api/ingestion/inspect?container=<name>&limit=<n>&runId=<id> HTTP/1.1
+GET /api/ingestion/inspect?container=<name>&limit=<n> HTTP/1.1
 Authorization: Bearer <token>
 ```
 
@@ -247,11 +229,11 @@ Authorization: Bearer <token>
 |---|---|---|---|
 | `container` | Yes | — | One of: `ingestion-runs`, `source-documents`, `search-chunks`, `service-audit` |
 | `limit` | No | `10` | Number of rows (max `200`) |
-| `runId` | No | — | If set, filter by partition `<source_id>:<runId>` (avoids cross-partition query) |
+| `runId` | No | — | Supported only with `container=source-documents`; filters the `/sourceRunId` partition as `<source_id>:<runId>` |
 
-Without `runId`, `service-audit` is queried cross-partition (its partition key is each record's
-own `id`) ordered by `recordedAt DESC`, so the result is the most recent rows, not an arbitrary
-sample. `search-chunks` has no equivalent ordering.
+For `ingestion-runs`, `search-chunks`, and `service-audit`, omit `runId`; their partition keys are not `/sourceRunId`, and supplying it can return an empty result that does not prove absence. Without `runId`, `service-audit` is queried cross-partition and ordered by `recordedAt DESC`, so the result is the most recent rows. `search-chunks` has no equivalent ordering.
+
+Inspect removes Cosmos `_` system properties only. Source documents, chunk content, audit user/tenant IDs, questions, and answer previews can remain in the response. Restrict endpoint access and handle diagnostic output according to its data classification.
 
 **Response — 200 OK**
 
@@ -330,7 +312,7 @@ Content-Type: application/json
 | 400 | `{"error":"ids must be a list with max 100 items"}` | Bulk limit exceeded |
 | 503 | `{"error":"purge_failed"}` | Cosmos error during delete |
 
-**Audit trail**: every purge writes a record to the `service-audit` container with the operator's UPN (`X-MS-CLIENT-PRINCIPAL-NAME` header), `deletedIds` (first 100), `deletedCount`, `failedCount`, `purgeAll`, and `timestamp`.
+**Audit trail**: every purge writes a record to the `service-audit` container with the operator's UPN (`X-MS-CLIENT-PRINCIPAL-NAME` header), `deletedIds` (first 100), `deletedCount`, `failedCount`, `purgeAll`, and `recordedAt`.
 
 ---
 
@@ -338,7 +320,7 @@ Content-Type: application/json
 
 ### `POST /api/query`
 
-RAG query. The Function App validates the caller's Entra token, then proxies to the retrieval service (ACA/AKS) with the `X-MS-CLIENT-PRINCIPAL` header forwarded.
+RAG query. The Function validates the EasyAuth user claims (`tid`, exact `aud`, `oid`, `user_impersonation`, and optional `idtyp=user`), creates a bounded gateway context, obtains a Function-UAMI service token, and calls Azure Container Apps with a Function-owned request ID.
 
 **Request**
 
@@ -351,7 +333,9 @@ Content-Type: application/json
   "question": "What is the password policy?",
   "mode": "hybrid",
   "history": [],
-  "top_k": 5
+  "top_k": 5,
+  "scoring_profile": null,
+  "expand_synonyms": null
 }
 ```
 
@@ -363,11 +347,24 @@ Content-Type: application/json
 | `mode` | string | No | `"hybrid"` | One of: `hybrid`, `vector`, `full_text` |
 | `history` | array<object> | No | `[]` | Conversation history for multi-turn queries. Each item: `{role: "user"\|"assistant", content: "..."}`. Bounded to last 10 messages. |
 | `top_k` | integer | No | `MAX_EVIDENCE_CHUNKS` env var (default 5) | Chunks to retrieve (1–20) |
+| `scoring_profile` | string \| null | No | Pinned catalog's `defaultProfile` | Name of a profile in the pinned catalog. Omitted or `null` selects the catalog default. Unknown names are rejected. |
+| `expand_synonyms` | boolean \| null | No | `null` | `false` disables expansion. `true` or `null` expands only when catalog synonyms are enabled and the selected profile references a loaded map. See [Synonym enablement truth table](#synonym-enablement-truth-table). |
+
+Freshness has no request field. The selected profile automatically applies any configured freshness functions to each candidate's `sourceModifiedAt`.
+
+The deployed example catalog defines:
+
+| Profile | Function aggregation | Synonym map |
+|---|---|---|
+| `hr-relevance` | `sum` | `hr-en` |
+| `hr-relevance-average` | `average` | `hr-en` |
+| `hr-relevance-minimum` | `minimum` | none |
+| `hr-relevance-maximum` | `maximum` | none |
 
 **Path selection is automatic** based on LLM query planner output:
 
-- 1 planned query → **Standard RAG path** (~5s)
-- 2–3 planned queries → **Agentic RAG path** (~8–10s, with automatic fallback to standard on timeout)
+- 1 planned query → **Standard RAG path**
+- 2–3 planned queries → **Agentic RAG path**, with automatic fallback to standard on timeout or agent failure
 
 **Response — 200 OK**
 
@@ -405,15 +402,18 @@ Content-Type: application/json
 
 | Status | Body | Reason |
 |---|---|---|
-| 400 | `{"error":"question_required"}` | Missing or empty `question` |
-| 429 | `{"detail":"rate_limit_exceeded"}` | Per-user **per-replica** sliding window exceeded (default 30 RPM; effective ceiling ≈ `RATE_LIMIT_RPM × replicaCount`, see ARCHITECTURE L8) |
-| 500 | `{"error":"RETRIEVAL_SERVICE_URL must use HTTPS"}` | Misconfigured proxy target |
-| 501 | `{"error":"RETRIEVAL_SERVICE_URL not configured"}` | Env var missing |
-| 503 | `{"error":"service_unavailable"}` | Retrieval service unreachable (timeout, network error) |
+| 400 | `{"error":{"code":"question_required","message":"A question is required."},"request_id":"..."}` | Missing or empty `question` |
+| 400/422/429 | `retrieval_request_failed` Function envelope | Retrieval rejected the body, profile, or rate limit |
+| 401 | `unauthorized` Function envelope | Delegated user claims are missing or invalid |
+| 502 | `retrieval_auth_failed` Function envelope | ACA or retrieval rejected Function service authentication |
+| 502 | `retrieval_unavailable` Function envelope | Retrieval returned a server error |
+| 502 | `invalid_retrieval_response` Function envelope | Retrieval returned malformed, oversized, or contract-incompatible JSON |
+| 503 | `gateway_not_configured` or `service_unavailable` Function envelope | Gateway settings are invalid or the proxy failed |
+| 504 | `retrieval_timeout` Function envelope | Function-to-retrieval call exceeded `QUERY_PROXY_TIMEOUT_SECONDS` |
 
 **Notes**
 
-- The `X-MS-CLIENT-PRINCIPAL` header is auto-forwarded from EasyAuth to the retrieval service for ACL evaluation.
+- The Function does not forward the user's `X-MS-CLIENT-PRINCIPAL`. It sends a managed-identity token, `X-RAG-GATEWAY-CONTEXT`, and `X-RAG-REQUEST-ID`.
 - Answer generation timeout is controlled by `GENERATION_TIMEOUT_SECONDS` (retrieval service).
 - Proxy timeout is controlled by `QUERY_PROXY_TIMEOUT_SECONDS` (Function App, default 30s).
 
@@ -421,7 +421,7 @@ Content-Type: application/json
 
 ## Webhook Endpoints
 
-Webhook endpoints are **excluded from EasyAuth** — they must be publicly reachable so Microsoft Graph can deliver notifications. Security is enforced by matching the `clientState` value against `WEBHOOK_CLIENT_STATE`.
+Webhook endpoints are excluded from EasyAuth so Microsoft Graph can deliver notifications. `/api/webhook/sharepoint` validates `clientState` against `WEBHOOK_CLIENT_STATE`. `/api/webhook/lifecycle` currently parses and logs lifecycle events without validating `clientState`; this is a documented security gap, not a protected endpoint contract.
 
 ### `POST /api/webhook/sharepoint`
 
@@ -503,36 +503,42 @@ Content-Type: application/json
 
 **Response — 200 OK** (empty body)
 
-**Behavior**: currently logs the event as a warning. The next `subscription_renew_timer` tick will create a fresh subscription if `lifecycleEvent=removed`.
+**Behavior**: logs the event as a warning. It does not trigger immediate repair. The next renewal tick recreates the subscription only when renewal reports the persisted subscription missing.
 
 ---
 
 ## Retrieval Service Endpoints
 
-The retrieval service is **internal only** — reachable from the Function App via `RETRIEVAL_SERVICE_URL` (ACA internal FQDN or AKS ClusterIP). Direct external access is blocked by VNet integration.
+The retrieval service runs in an internal ACA managed environment and is reached through its private DNS name. ACA Authentication accepts only the configured Function UAMI application and principal. Application code then validates the service token, `Retrieval.Gateway` role, gateway context, and request ID.
 
 Base URL: `RETRIEVAL_SERVICE_URL` (from Bicep output)
 
 ### `POST /api/query`
 
-Same request/response as the Function App's `/api/query`, but called directly. The Function App proxy forwards `X-MS-CLIENT-PRINCIPAL`; local dev must set it manually (see [Local Development](#local-development-bypass-easyauth)).
+Same request schema and success response as the Function endpoint, but this is an internal service-to-service contract. Delegated callers and manually supplied user headers are not supported.
 
 Request headers required:
 
 | Header | Required | Description |
 |---|---|---|
-| `X-MS-CLIENT-PRINCIPAL` | Yes | Base64 JSON of the caller's claims (auto-set by EasyAuth in production) |
+| `Authorization` | Yes | Function UAMI application token accepted by ACA Authentication |
+| `X-MS-CLIENT-PRINCIPAL` | Platform-generated | ACA claim header for the authenticated Function application |
+| `X-RAG-GATEWAY-CONTEXT` | Yes | Function-generated canonical user `oid`/`tid` context |
+| `X-RAG-REQUEST-ID` | Yes | Canonical UUID generated by the Function |
 | `Content-Type` | Yes | `application/json` |
 
 **Direct-call error responses** (in addition to the query errors documented above):
 
 | Status | Body | Reason |
 |---|---|---|
-| 401 | `{"detail":"missing_auth_header"}` | `X-MS-CLIENT-PRINCIPAL` header not set |
-| 401 | `{"detail":"invalid_principal"}` | Header value is not valid base64 or has no `oid`/`tid` claims |
-| 401 | `{"detail":"tenant_mismatch"}` | Token `tid` claim does not match `TENANT_ID` env var |
+| 400 | `unknown_scoring_profile` application envelope | Requested profile is not in the pinned catalog |
+| 401 | platform or application response | Missing/invalid service identity, gateway role, context, or request ID |
+| 422 | `invalid_request` application envelope | FastAPI body validation failed |
+| 429 | `rate_limit_exceeded` application envelope | Per-user, per-replica rate limit exceeded |
+| 503 | `retrieval_dependency_unavailable` application envelope | Every submitted retrieval task failed or timed out |
+| 504 | `operation_timeout` application envelope | ACA operation deadline exceeded |
 
-Everything else — body schema, response format, error codes — is identical to the Function App query endpoint above.
+The Function normalizes downstream failures, so direct retrieval error bodies are not identical to public Function error bodies.
 
 ---
 
@@ -550,7 +556,7 @@ Liveness probe. Always returns 200 if the process is alive.
 
 ### `GET /health/ready`
 
-Readiness probe. Verifies Cosmos DB connectivity by listing containers.
+Readiness probe. Executes `SELECT TOP 1 c.id` against the first configured chunks container.
 
 **Response — 200 OK**
 
@@ -564,7 +570,167 @@ Readiness probe. Verifies Cosmos DB connectivity by listing containers.
 {"detail": "cosmos_unavailable"}
 ```
 
-Kubernetes / ACA uses this to route traffic only to healthy replicas.
+ACA uses this to route traffic only to ready replicas.
+
+---
+
+## Retrieval Configuration
+
+Scoring profiles and synonym maps are loaded once at retrieval-service startup. They define application-side secondary reranking after Cosmos BM25/vector/RRF retrieval; they are not native Cosmos index scoring profiles and do not claim exact Azure AI Search scoring parity. See [ARCHITECTURE.md — Scoring profiles, freshness, and client-side rerank](ARCHITECTURE.md#scoring-profiles-freshness-and-client-side-rerank).
+
+### Cosmos catalog source
+
+Retrieval requires these startup settings:
+
+| Setting | Purpose |
+|---|---|
+| `RETRIEVAL_CONFIG_CONTAINER` | Cosmos container containing immutable catalog items; default `retrieval-config` |
+| `DEPLOYMENT_INSTANCE_ID` | Catalog partition key |
+| `RETRIEVAL_CATALOG_DIGEST` | Exact immutable `sha256:<64 lowercase hex>` catalog version |
+
+At startup, retrieval point-reads `catalog:<digest>` from the `/deploymentInstanceId` partition. It validates the digest, deployment instance, strict schema, unique names, supported functions, finite values, required default profile, and profile-to-synonym-map references before becoming ready. The optional ETag-protected `active` pointer is publication metadata; runtime does not consult it.
+
+The authoritative authoring example is [app/retrieval/catalog.example.json](../app/retrieval/catalog.example.json). Its deployed profiles are listed in the query request section above.
+
+### Catalog property reference
+
+Client environments should maintain a reviewed catalog JSON file based on `app/retrieval/catalog.example.json`. Do not add hand-written items directly to Cosmos. The publisher validates this authoring schema, computes the content digest, adds immutable metadata, writes the item, and verifies the persisted content.
+
+#### Top-level and retrieval properties
+
+| Property | Required | Allowed value or default | Runtime effect and configuration guidance |
+| --- | --- | --- | --- |
+| `schemaVersion` | Yes | Integer `1` only | Authoring schema version. Change only when the application adds support for another version. |
+| `config` | Yes | Object; no unknown properties | Contains all runtime retrieval configuration. |
+| `config.retrieval` | Yes | Object | Candidate retrieval settings shared by all profiles. |
+| `config.retrieval.overFetchFactor` | Yes | Integer `1`–`50`; example uses `3` | With a scoring profile, requests up to `min(top_k × overFetchFactor, 50)` candidates across planned queries and registered instances before reranking. Higher values can improve reranking recall but increase retrieval work and latency. Start with the validated example value and change it only with relevance/latency evidence. |
+| `config.retrieval.hybridWeights` | Yes | Object containing exactly `vector` and `text` | Supplies both positive positional weights for Cosmos hybrid RRF. |
+| `config.retrieval.hybridWeights.vector` | Yes | Finite number greater than `0`; example `2.0` | Positional weight for `VectorDistance` inside Cosmos hybrid RRF. The ratio to `text` matters; larger relative values favor vector ranking. Used only in hybrid mode. |
+| `config.retrieval.hybridWeights.text` | Yes | Finite number greater than `0`; example `1.0` | Positional weight for `FullTextScore` inside Cosmos hybrid RRF. Larger relative values favor lexical ranking. Used only in hybrid mode. |
+| `config.retrieval.fullTextScoreScope` | Yes | `"Local"` or `"Global"`; example `"Global"` | Passed to Cosmos full-text queries. `Global` uses statistics across physical partitions for more consistent cross-partition ranking; `Local` uses partition-local statistics. Use `Global` unless measured latency/cost evidence justifies `Local`. |
+| `config.defaultProfile` | Yes | Nonempty profile name | Profile used when a request omits or sets `scoring_profile=null`. It must exactly match one entry in `config.profiles`. |
+| `config.synonymsEnabled` | Yes | Boolean | Catalog-wide synonym switch. `false` disables all expansion regardless of profile or request. |
+| `config.profiles` | Yes | Array, maximum 100 entries | Scoring profiles available to requests. Names must be unique, and the array must contain `defaultProfile`. |
+| `config.synonymMaps` | Yes | Array | Named synonym maps. Names must be unique. Every profile `synonymMap` reference must resolve or startup fails closed. |
+
+#### Scoring profile properties
+
+| Property | Required | Allowed value or default | Runtime effect and configuration guidance |
+| --- | --- | --- | --- |
+| `name` | Yes | Nonempty unique string | Public value accepted in request `scoring_profile`. Treat it as a client contract; renaming requires callers to change. |
+| `textWeights` | No | Object; default `{}` | Adds a flat bonus when any normalized query term matches the configured candidate field. This is an application approximation, not a multiplication of Cosmos BM25/vector scores. |
+| `textWeights.<field>` | No | Finite number `>= 0` | Supported fields: `content`, `sourceName`, `sectionPath`, and `keyPhrases`; snake-case aliases are accepted. `0` disables that field bonus. Do not configure both aliases for the same canonical field. Establish values through protected relevance evaluation. |
+| `functionAggregation` | No | `"sum"`, `"average"`, `"minimum"`, or `"maximum"`; default `"sum"` | Combines the profile's function contributions. `average` divides by the number of declared functions. With no functions, the function bonus is `0`. |
+| `synonymMap` | No | Nonempty map name | Associates this profile with one entry in `config.synonymMaps`. Omit it when the profile must never expand synonyms. A missing referenced map fails startup. |
+| `functions` | No | Array, maximum 8; default `[]` | Application-side scoring functions evaluated after the ACL-filtered candidate pool is returned. Only freshness is supported. |
+
+The final application score is `1 / (originalRank + 1)` plus matching text-weight bonuses plus the aggregated function contribution, where `originalRank` is zero-based. Original rank breaks score ties.
+
+#### Freshness function properties
+
+| Property | Required | Allowed value | Runtime effect and configuration guidance |
+| --- | --- | --- | --- |
+| `type` | Yes | `"freshness"` only | Selects the only currently supported function type. |
+| `fieldName` | Yes | `"sourceModifiedAt"` or `"source_modified_at"` | Reads the service-level Microsoft Graph modification timestamp denormalized onto each chunk. Prefer the canonical camel-case name used by the example. |
+| `boost` | Yes | Any finite number | Multiplied by the interpolation factor. Positive values promote recent content, `0` has no effect, and negative values penalize recent content. Use negative values only with explicit evaluation evidence. |
+| `interpolation` | Yes | `"constant"`, `"linear"`, `"quadratic"`, or `"logarithmic"` | Controls decay from the candidate timestamp to the end of `boostingDuration`. `constant` keeps the full contribution until the boundary; `linear` decays evenly; `quadratic` retains more contribution early; `logarithmic` decays more quickly early. |
+| `freshness` | Yes | Object containing only `boostingDuration` | Parameters for the freshness calculation. |
+| `freshness.boostingDuration` | Yes | Positive ISO-8601 day/time duration such as `"P30D"`, `"P180D"`, or `"PT12H"` | Defines the freshness window. At or beyond the window, contribution is `0`. Missing, malformed, timezone-naive, or future candidate timestamps also contribute `0`. Choose the window from the business meaning of “recent,” then verify ranking effects. |
+
+For elapsed fraction `f` in `[0,1)`, the contribution is `boost × factor`: constant uses `1`, linear uses `1-f`, quadratic uses `1-f²`, and logarithmic uses `1 - log(1 + f × (e - 1))`. At `f >= 1`, the factor is `0`.
+
+#### Synonym map properties
+
+| Property | Required | Allowed value or default | Runtime effect and configuration guidance |
+| --- | --- | --- | --- |
+| `name` | Yes | Nonempty unique string | Referenced by profile `synonymMap`. |
+| `format` | Yes | `"solr"` only | Selects the supported rule grammar. |
+| `language` | No | Nonempty string | Accepted as catalog metadata but not currently consumed by expansion logic; it does not enable language-specific tokenization. Omit it unless a client needs informational metadata. |
+| `rules` | Yes | Array of nonempty strings, maximum 20,000 | Parsed at startup. Invalid rules fail startup. Duplicate identical rules are deduplicated. Keep rules reviewed by the domain/relevance owner. |
+
+Supported rule forms:
+
+- Equivalence: `annual leave, vacation, paid time off`. The original query is retained and matching phrases are replaced with other terms.
+- Explicit mapping: `Washington, Wash., WA => WA`. Matching left-side phrases are replaced by right-side values.
+- Matching and deduplication are case-insensitive and phrase-boundary aware.
+- Escape a literal comma or backslash with `\`.
+- A rule can add at most five variants per matched input term, and a query is capped at eight total variants.
+- Expanded terms are bound as Cosmos query parameters; values are not concatenated into SQL.
+
+#### Publisher-generated Cosmos properties
+
+Do not add these fields to the authoring JSON. The publisher creates them:
+
+| Property | Generated value | Purpose |
+| --- | --- | --- |
+| `id` | `catalog:<64 lowercase hex>` | Immutable Cosmos item ID derived from canonical authoring content. |
+| `deploymentInstanceId` | `--deployment-instance-id` value | `/deploymentInstanceId` partition key; maximum 100 characters. |
+| `type` | `retrieval-catalog` | Catalog item discriminator. |
+| `version` | `sha256:<64 lowercase hex>` | Digest pinned into `RETRIEVAL_CATALOG_DIGEST`. |
+| `createdAt` | UTC timestamp | Publication metadata. |
+
+The publisher can also create or replace a separate publication pointer:
+
+| Active-pointer property | Generated value or constraint | Purpose |
+| --- | --- | --- |
+| `id` | `active` | Point-read identifier for publication tooling. |
+| `deploymentInstanceId` | Deployment instance, maximum 100 characters | Partition key. |
+| `type` | `active-retrieval-catalog` | Pointer discriminator. |
+| `catalogId` | `catalog:<64 lowercase hex>` | Immutable catalog item referenced by the pointer. |
+| `version` | `sha256:<64 lowercase hex>` | Referenced catalog digest. |
+| `activatedAt` | UTC timestamp | Activation metadata. |
+| `activatedBy` | Nonempty string, maximum 200 characters | Reviewed publisher/operator identity label. |
+
+Cosmos `_rid`, `_self`, `_etag`, `_attachments`, and `_ts` are service-generated system properties. Publication tooling uses the pointer's Cosmos `_etag` for optimistic replacement. The `active` item is not read by runtime catalog loading.
+
+Supported text fields are `content`, `sourceName`, `sectionPath`, and `keyPhrases`. Text weights apply when normalized query terms match a configured field. The only supported scoring function is freshness over `sourceModifiedAt`. Supported interpolation modes are `constant`, `linear`, `quadratic`, and `logarithmic`; supported aggregation modes are `sum`, `average`, `minimum`, and `maximum`. Magnitude, tag, distance, arbitrary signals, and the legacy `max` alias are rejected.
+
+Hard guardrails include 100 profiles per catalog, eight functions per profile, a 50-candidate global pool, eight full-text query variants, five additions per matched input term, parameter-bound SQL, and a 1.5-MiB serialized catalog limit. Solr equivalence retains the original variant and adds replacements; explicit mappings replace matching left-hand phrases. Prefix reserved comma and backslash characters with `\`.
+
+Validate authoring JSON without changing Azure:
+
+```powershell
+python tools/publish_retrieval_catalog.py validate `
+  --file app/retrieval/catalog.example.json `
+  --deployment-instance-id <deployment-instance-id>
+```
+
+The command prints `catalogId` and `catalogDigest`. The guarded deployment controller publishes and verifies the immutable item through its `Operations`, `Catalog`, and `CatalogVerify` phases, then deploys serving resources through `Final` with `RETRIEVAL_CATALOG_DIGEST`. After E2E validation and explicit approval, `OperationsCleanup` removes the temporary publisher job. Rollback requires a reviewed deployment that pins the previous compatible catalog digest and image/Function release tuple; changing only the publication pointer does not change runtime selection.
+
+### Synonym enablement truth table
+
+Three levels combine. In order of precedence (highest first):
+
+| Catalog `synonymsEnabled` | Selected `scoring_profile.synonymMap` | `expand_synonyms` (request) | Effective behavior |
+|---|---|---|---|
+| `false` | any | any | **No expansion** — deploy toggle wins |
+| `true` | not set | any | **No expansion** — nothing to expand |
+| `true` | set, map loaded | `false` | **No expansion** — request explicit `false` wins |
+| `true` | set, map loaded | `null` (default) | **Expand** using profile's map |
+| `true` | set, map loaded | `true` | **Expand** using profile's map |
+| `true` | set, map NOT loaded | any | **Startup fails closed** — invalid config, service refuses to start |
+
+### Startup logs (redacted)
+
+On successful load, the service logs:
+
+```json
+{
+  "event": "retrieval_service_started",
+  "deployment_instance_id": "aca-e2e-20260827",
+  "catalog_version": "sha256:...",
+  "scoring_profiles": [
+    { "name": "hr-relevance", "weights": ["content", "keyPhrases", "sectionPath", "sourceName"], "functions": ["freshness"] }
+  ],
+  "synonym_maps": ["hr-en"],
+  "synonyms_enabled": true,
+  "default_scoring_profile": "hr-relevance",
+  "full_text_score_scope": "Global",
+  "over_fetch_factor": 5
+}
+```
+
+Rule bodies, weights, boosts, and synonym strings are intentionally omitted from logs.
 
 ---
 
@@ -572,17 +738,17 @@ Kubernetes / ACA uses this to route traffic only to healthy replicas.
 
 ### Standard Envelope
 
-Most Function App error responses use this shape:
+The Function query gateway uses this shape:
 
 ```json
-{"error": "<error_code>"}
+{
+  "error": {"code": "<error_code>", "message": "<safe message>"},
+  "request_id": "<uuid>"
+}
 ```
 
-Retrieval service (FastAPI) errors follow FastAPI's default:
+Registered retrieval handlers use the same shape. EasyAuth and ACA Authentication can reject a request before application code and may return platform-defined bodies. Some ingestion endpoints retain their older compact `{"error":"<code>"}` response.
 
-```json
-{"detail": "<message>"}
-```
 
 ### HTTP Status Meanings
 
@@ -596,9 +762,10 @@ Retrieval service (FastAPI) errors follow FastAPI's default:
 | 404 | Resource not found (orchestration instance, document, container) |
 | 409 | Conflict — already running, or state prevents this operation |
 | 429 | Rate limit exceeded (per-user **per-replica** sliding window on `/api/query`) |
-| 500 | Server misconfiguration (missing env var, invalid config) |
-| 501 | Required env var not configured (`RETRIEVAL_SERVICE_URL`) |
-| 503 | Downstream service unreachable (Cosmos, retrieval service) |
+| 500 | Unhandled server error or endpoint-specific server failure |
+| 502 | Function gateway rejected downstream auth, server error, or malformed response |
+| 503 | Gateway not configured or a required dependency is unavailable |
+| 504 | Function proxy or ACA operation deadline exceeded |
 
 ### Common Error Codes
 
@@ -611,11 +778,22 @@ Retrieval service (FastAPI) errors follow FastAPI's default:
 | `not_found` | `GET /status` | Orchestration instance does not exist |
 | `invalid_container` | `GET /inspect`, `DELETE /purge` | Container name not in allowlist |
 | `invalid_json` | `DELETE /purge` | Body is not valid JSON |
-| `question_required` | `POST /query` | Missing or empty `question` field |
+| `question_required` | Function `POST /query` | Missing or empty `question` field |
+| `unauthorized` | Function `POST /query` | Delegated user claims failed gateway validation |
+| `gateway_not_configured` | Function `POST /query` | Retrieval URL or service scope is missing/invalid |
+| `retrieval_auth_failed` | Function `POST /query` | ACA/retrieval rejected the Function service identity |
+| `retrieval_unavailable` | Function `POST /query` | Retrieval returned a server error |
+| `invalid_retrieval_response` | Function `POST /query` | Retrieval returned malformed, oversized, or incompatible JSON |
+| `retrieval_request_failed` | Function `POST /query` | Retrieval returned a non-authentication 4xx response |
+| `retrieval_timeout` | Function `POST /query` | Function proxy timeout expired |
 | `rate_limit_exceeded` | `POST /query` | Per-user **per-replica** RPM exceeded |
+| `unknown_scoring_profile` | Internal retrieval `POST /query` | Requested profile is not in the pinned catalog |
+| `invalid_request` | Internal retrieval `POST /query` | FastAPI request validation failed |
+| `retrieval_dependency_unavailable` | Internal retrieval `POST /query` | Every submitted retrieval task failed or timed out |
+| `operation_timeout` | Internal retrieval `POST /query` | ACA operation deadline expired |
 | `cosmos_query_failed` | `GET /inspect` | Cosmos SDK exception |
 | `purge_failed` | `DELETE /purge` | Cosmos delete error |
-| `service_unavailable` | `POST /query` | Retrieval service timeout or network error |
+| `service_unavailable` | Function `POST /query` | Unexpected proxy failure |
 
 ---
 
@@ -661,4 +839,4 @@ Invoke-RestMethod -Method POST -Uri "$base/api/ingestion/retry-failed" -Headers 
 - [README.md](../README.md) — Project overview and env var reference
 - [ARCHITECTURE.md](ARCHITECTURE.md) — System design, flows, and data model
 - [AZURE_SETUP.md](AZURE_SETUP.md) — Deployment guide and operations
-- [archive/E2E_TEST_RUNBOOK_2026-08-19.md](archive/E2E_TEST_RUNBOOK_2026-08-19.md) — Validation scenarios with real request/response examples (dated test run, archived)
+- [DEMO_RUNBOOK.md](DEMO_RUNBOOK.md) — Current demo and end-to-end validation procedures

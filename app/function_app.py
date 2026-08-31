@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any
 
 import azure.functions as func
@@ -29,9 +30,17 @@ logger = logging.getLogger("rag-ingestion")
 
 WAVE_SIZE = int(os.getenv("WAVE_SIZE", "4"))
 WAVE_TIMEOUT_MINUTES = int(os.getenv("WAVE_TIMEOUT_MINUTES", "20"))
-RECONCILIATION_SCHEDULE = os.getenv("DELTA_SYNC_SCHEDULE", "0 0 4 * * *")  # daily 04:00 UTC
+PROCESS_DOCUMENT_MAX_ATTEMPTS = int(os.getenv("PROCESS_DOCUMENT_MAX_ATTEMPTS", "5"))
+PROCESS_DOCUMENT_RETRY_DELAY_SECONDS = int(os.getenv("PROCESS_DOCUMENT_RETRY_DELAY_SECONDS", "60"))
+DELTA_SYNC_SCHEDULE = os.getenv("DELTA_SYNC_SCHEDULE", "0 0 4 * * *")  # daily 04:00 UTC
 ACL_RESYNC_SCHEDULE = os.getenv("ACL_RESYNC_SCHEDULE", "0 0 3 * * 0")  # weekly Sunday 03:00 UTC (safety net)
 ACL_RESYNC_PAGE_SIZE = int(os.getenv("ACL_RESYNC_PAGE_SIZE", "50"))
+LIFECYCLE_RECONCILE_SCHEDULE = os.getenv(
+    "LIFECYCLE_RECONCILE_SCHEDULE", "0 */10 * * * *"
+)
+LIFECYCLE_RECONCILE_PAGE_SIZE = int(
+    os.getenv("LIFECYCLE_RECONCILE_PAGE_SIZE", "50")
+)
 SUBSCRIPTION_RENEW_SCHEDULE = os.getenv("SUBSCRIPTION_RENEW_SCHEDULE", "0 0 2 * * *")
 WEBHOOK_CLIENT_STATE = os.getenv("WEBHOOK_CLIENT_STATE", "")
 
@@ -316,28 +325,112 @@ def purge_data(req: func.HttpRequest) -> func.HttpResponse:
 def query_endpoint(req: func.HttpRequest) -> func.HttpResponse:
     """Proxy RAG queries to the internal ACA retrieval service."""
     import httpx
+    import uuid
+    from retrieval.auth import (
+        AuthorizationError,
+        GATEWAY_CONTEXT_HEADER,
+        GATEWAY_REQUEST_ID_HEADER,
+        gateway_context_from_easy_auth_user,
+    )
+
+    request_id = str(uuid.uuid4())
+
+    def error_response(code: str, message: str, status: int) -> func.HttpResponse:
+        return _json_response({
+            "error": {"code": code, "message": message},
+            "request_id": request_id,
+        }, status)
+
     try:
         body = req.get_json()
-        question = body.get("question", "")
-        if not question:
-            return _json_response({"error": "question_required"}, 400)
+        if not isinstance(body, dict):
+            return error_response("invalid_request", "Request body must be an object.", 400)
+        question = body.get("question")
+        if not isinstance(question, str) or not question.strip():
+            return error_response("question_required", "A question is required.", 400)
         retrieval_url = os.getenv("RETRIEVAL_SERVICE_URL", "").strip()
         if not retrieval_url:
-            return _json_response({"error": "RETRIEVAL_SERVICE_URL not configured"}, 501)
-        if not retrieval_url.startswith("https://"):
-            return _json_response({"error": "RETRIEVAL_SERVICE_URL must use HTTPS"}, 500)
-        auth_header = req.headers.get("X-MS-CLIENT-PRINCIPAL", "")
+            return error_response("gateway_not_configured", "Retrieval is unavailable.", 503)
+        try:
+            retrieval_url = _validated_retrieval_service_url(retrieval_url)
+        except ValueError:
+            return error_response("gateway_not_configured", "Retrieval is unavailable.", 503)
+        context = gateway_context_from_easy_auth_user(
+            req.headers.get("X-MS-CLIENT-PRINCIPAL"),
+            expected_tenant_id=os.getenv("TENANT_ID", "").strip(),
+            expected_audience=os.getenv("FUNCTION_API_AUDIENCE", "").strip(),
+        )
+        scope = os.getenv("RETRIEVAL_SERVICE_SCOPE", "").strip()
+        if not scope:
+            return error_response("gateway_not_configured", "Retrieval is unavailable.", 503)
+        token = _build_retrieval_service_credential().get_token(scope)
         proxy_timeout = float(os.getenv("QUERY_PROXY_TIMEOUT_SECONDS", "30.0"))
         with httpx.Client(timeout=proxy_timeout) as client:
             resp = client.post(
                 f"{retrieval_url}/api/query",
                 json=body,
-                headers={"X-MS-CLIENT-PRINCIPAL": auth_header},
+                headers={
+                    "Authorization": f"Bearer {token.token}",
+                    GATEWAY_CONTEXT_HEADER: context.encode(),
+                    GATEWAY_REQUEST_ID_HEADER: request_id,
+                },
             )
-        return func.HttpResponse(resp.text, status_code=resp.status_code, mimetype="application/json")
+        if resp.status_code in (401, 403):
+            logger.warning(
+                "Retrieval gateway rejected request status=%d request_id=%s",
+                resp.status_code,
+                request_id,
+            )
+            return error_response("retrieval_auth_failed", "Retrieval is unavailable.", 502)
+        if resp.status_code >= 500:
+            return error_response("retrieval_unavailable", "Retrieval is unavailable.", 502)
+        if len(resp.content) > 1_048_576:
+            return error_response("invalid_retrieval_response", "Retrieval returned an invalid response.", 502)
+        try:
+            payload = resp.json()
+        except ValueError:
+            return error_response("invalid_retrieval_response", "Retrieval returned an invalid response.", 502)
+        if resp.status_code >= 400:
+            return error_response("retrieval_request_failed", "The retrieval request failed.", resp.status_code)
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("answer"), str)
+            or not isinstance(payload.get("citations"), list)
+        ):
+            return error_response("invalid_retrieval_response", "Retrieval returned an invalid response.", 502)
+        payload["request_id"] = request_id
+        return _json_response(payload, 200)
+    except AuthorizationError:
+        return error_response("unauthorized", "Authentication is required.", 401)
+    except httpx.TimeoutException:
+        return error_response("retrieval_timeout", "Retrieval timed out.", 504)
     except Exception:
         logger.exception("Query proxy failed")
-        return _json_response({"error": "service_unavailable"}, 503)
+        return error_response("service_unavailable", "Retrieval is unavailable.", 503)
+
+
+def _validated_retrieval_service_url(value: str) -> str:
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("invalid retrieval service URL") from error
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    if (
+        parsed.scheme != "https"
+        or not host.endswith(".azurecontainerapps.io")
+        or len(host.split(".")) < 5
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid retrieval service URL")
+    return f"https://{host}"
 
 
 
@@ -390,7 +483,7 @@ async def _start_if_not_running(client, lifecycle_repository, source_id: str, co
     return instance_id
 
 
-@app.timer_trigger(schedule=RECONCILIATION_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
+@app.timer_trigger(schedule=DELTA_SYNC_SCHEDULE, arg_name="timer", run_on_startup=False, use_monitor=True)
 @app.durable_client_input(client_name="client")
 async def reconciliation_timer(timer: func.TimerRequest, client) -> None:
     """Daily safety-net delta-sync — catches changes missed by webhooks."""
@@ -431,6 +524,39 @@ async def acl_resync_timer(timer: func.TimerRequest, client) -> None:
     started = await _start_if_not_running(client, lifecycle_repository, source_id, ACL_RESYNC_TRIGGER_ID, "acl_resync_orchestrator")
     if not started:
         logger.info("acl_resync_timer skipped: previous pass still running")
+
+
+@app.timer_trigger(
+    schedule=LIFECYCLE_RECONCILE_SCHEDULE,
+    arg_name="timer",
+    run_on_startup=False,
+    use_monitor=True,
+)
+@app.durable_client_input(client_name="client")
+async def lifecycle_reconcile_timer(timer: func.TimerRequest, client) -> None:
+    """Repair interrupted persisted lifecycle transitions without external AI calls."""
+    from config import load_config
+    from ingestion.lifecycle_repository import LIFECYCLE_RECONCILE_TRIGGER_ID
+
+    source_id = os.getenv("INGESTION_SOURCE_ID", "").strip()
+    if not source_id:
+        logger.warning(
+            "lifecycle_reconcile_timer skipped: missing INGESTION_SOURCE_ID"
+        )
+        return
+    config = load_config()
+    lifecycle_repository = _build_lifecycle_repository(config)
+    started = await _start_if_not_running(
+        client,
+        lifecycle_repository,
+        source_id,
+        LIFECYCLE_RECONCILE_TRIGGER_ID,
+        "lifecycle_reconcile_orchestrator",
+    )
+    if not started:
+        logger.info(
+            "lifecycle_reconcile_timer skipped: previous pass still running"
+        )
 
 
 
@@ -540,10 +666,9 @@ async def subscription_renew_timer(timer: func.TimerRequest) -> None:
 def full_sync_orchestrator(context: df.DurableOrchestrationContext):
     """Orchestrate: activate → discover → fan-out process → finalize."""
     from datetime import timedelta
-    retry = df.RetryOptions(first_retry_interval_in_milliseconds=5000, max_number_of_attempts=5)
 
-    activated = yield context.call_activity_with_retry(
-        "activate_run_activity", retry, {"instanceId": context.instance_id}
+    activated = yield context.call_activity(
+        "activate_run_activity", {"instanceId": context.instance_id}
     )
     if activated.get("error"):
         return {"status": "failed", "phase": "activate", "error": activated["error"]}
@@ -551,7 +676,7 @@ def full_sync_orchestrator(context: df.DurableOrchestrationContext):
     run_id = activated["runId"]
     run_etag = activated["runEtag"]
 
-    discovered = yield context.call_activity_with_retry("discover_all_activity", retry, {"runId": run_id})
+    discovered = yield context.call_activity("discover_all_activity", {"runId": run_id})
     if discovered.get("error"):
         return {"status": "failed", "phase": "discover", "runId": run_id, "error": discovered["error"]}
 
@@ -563,7 +688,7 @@ def full_sync_orchestrator(context: df.DurableOrchestrationContext):
     for wave_start in range(0, len(documents), WAVE_SIZE):
         wave = documents[wave_start:wave_start + WAVE_SIZE]
         tasks = [
-            context.call_activity_with_retry("process_document_activity", retry, {"runId": run_id, "document": doc})
+            context.call_activity("process_document_activity", {"runId": run_id, "document": doc})
             for doc in wave
         ]
         deadline = context.current_utc_datetime + timedelta(minutes=WAVE_TIMEOUT_MINUTES)
@@ -607,14 +732,13 @@ def full_sync_orchestrator(context: df.DurableOrchestrationContext):
 @app.orchestration_trigger(context_name="context")
 def delta_sync_orchestrator(context: df.DurableOrchestrationContext):
     """One bounded delta-sync tick: adds/updates/deletes since the last cursor."""
-    retry = df.RetryOptions(first_retry_interval_in_milliseconds=5000, max_number_of_attempts=3)
-    result = yield context.call_activity_with_retry("delta_sync_activity", retry, None)
+    result = yield context.call_activity("delta_sync_activity", None)
     if result.get("error"):
         return {"status": "failed", "error": result["error"]}
     # Webhook fired but delta saw no content changes — check for permission drift
     if result.get("itemsSeen", -1) == 0:
-        acl = yield context.call_activity_with_retry(
-            "acl_resync_page_activity", retry, {"continuationToken": None}
+        acl = yield context.call_activity(
+            "acl_resync_page_activity", {"continuationToken": None}
         )
         if not acl.get("error"):
             result["aclResynced"] = acl.get("updated", 0)
@@ -624,12 +748,11 @@ def delta_sync_orchestrator(context: df.DurableOrchestrationContext):
 @app.orchestration_trigger(context_name="context")
 def acl_resync_orchestrator(context: df.DurableOrchestrationContext):
     """Page through all ready documents re-verifying ACLs."""
-    retry = df.RetryOptions(first_retry_interval_in_milliseconds=5000, max_number_of_attempts=3)
     continuation_token: str | None = None
     total_checked = total_updated = total_retired = 0
     while True:
-        result = yield context.call_activity_with_retry(
-            "acl_resync_page_activity", retry, {"continuationToken": continuation_token}
+        result = yield context.call_activity(
+            "acl_resync_page_activity", {"continuationToken": continuation_token}
         )
         if result.get("error"):
             return {"status": "failed", "error": result["error"]}
@@ -648,10 +771,63 @@ def acl_resync_orchestrator(context: df.DurableOrchestrationContext):
 
 
 @app.orchestration_trigger(context_name="context")
+def lifecycle_reconcile_orchestrator(context: df.DurableOrchestrationContext):
+    """Page through and repair all persisted non-ready lifecycle transitions."""
+    continuation_token: str | None = None
+    total_checked = total_repaired = total_failed = 0
+    while True:
+        result = yield context.call_activity(
+            "lifecycle_reconcile_page_activity",
+            {"continuationToken": continuation_token},
+        )
+        if result.get("error"):
+            return {"status": "failed", "error": result["error"]}
+        total_checked += result["checked"]
+        total_repaired += result["repaired"]
+        total_failed += result["failed"]
+        continuation_token = result.get("continuationToken")
+        if continuation_token is None:
+            break
+    continuation_token = None
+    while True:
+        result = yield context.call_activity(
+            "duplicate_version_reconcile_page_activity",
+            {"continuationToken": continuation_token},
+        )
+        if result.get("error"):
+            return {"status": "failed", "error": result["error"]}
+        total_checked += result["checked"]
+        total_repaired += result["repaired"]
+        total_failed += result["failed"]
+        continuation_token = result.get("continuationToken")
+        if continuation_token is None:
+            break
+    continuation_token = None
+    while True:
+        result = yield context.call_activity(
+            "orphan_chunk_reconcile_page_activity",
+            {"continuationToken": continuation_token},
+        )
+        if result.get("error"):
+            return {"status": "failed", "error": result["error"]}
+        total_checked += result["checked"]
+        total_repaired += result["repaired"]
+        total_failed += result["failed"]
+        continuation_token = result.get("continuationToken")
+        if continuation_token is None:
+            break
+    return {
+        "status": "completed",
+        "checked": total_checked,
+        "repaired": total_repaired,
+        "failed": total_failed,
+    }
+
+
+@app.orchestration_trigger(context_name="context")
 def retry_failed_orchestrator(context: df.DurableOrchestrationContext):
     """Reprocess only the failed documents that were reset to discovered."""
     from datetime import timedelta
-    retry = df.RetryOptions(first_retry_interval_in_milliseconds=5000, max_number_of_attempts=5)
     documents = context.get_input()
     if not documents:
         return {"status": "nothing_to_retry"}
@@ -659,8 +835,8 @@ def retry_failed_orchestrator(context: df.DurableOrchestrationContext):
     succeeded = 0
     failed = 0
     for doc_ref in documents:
-        task = context.call_activity_with_retry(
-            "process_document_activity", retry, {"runId": run_id, "document": doc_ref},
+        task = context.call_activity(
+            "process_document_activity", {"runId": run_id, "document": doc_ref},
         )
         deadline = context.current_utc_datetime + timedelta(minutes=WAVE_TIMEOUT_MINUTES)
         timer = context.create_timer(deadline)
@@ -728,41 +904,71 @@ def process_document_activity(payload: dict) -> dict:
     try:
         config = load_config()
         repository = _build_repository(config)
+        lifecycle_repository = _build_lifecycle_repository(config)
         graph_client = _build_graph_client(config)
         di_client = _build_di_client(config) if config.extraction_enabled else None
         language_client = _build_language_client(config) if config.enrichment_enabled else None
         openai_client = _build_openai_client(config)
         audit_container = _build_audit_container(config)
 
-        stored = repository.get_document(document_ref["sourceRunId"], document_ref["documentId"])
-        if stored is None:
-            return {"documentId": document_ref["documentId"], "status": "skipped"}
-
         sp_client = _build_sharepoint_client(config)
         connector = SharePointConnector(graph_client, config.drive_id, sp_client=sp_client, site_url=config.sharepoint_site_url)
-        outcome = process_document(
-            config, stored.record, stored.etag, repository,
-            connector, di_client, language_client, openai_client,
-            audit_container=audit_container,
-        )
-        if outcome.status.value == "succeeded":
-            _retire_prior_version(config, document_ref["documentId"], document_ref["sourceRunId"], audit_container)
-        return {
-            "documentId": outcome.document_id,
-            "status": outcome.status.value,
-            "chunksWritten": outcome.chunks_written,
-            "error": outcome.error.code if outcome.error else None,
-        }
+        for attempt in range(1, PROCESS_DOCUMENT_MAX_ATTEMPTS + 1):
+            stored = repository.get_document(document_ref["sourceRunId"], document_ref["documentId"])
+            if stored is None:
+                return {"documentId": document_ref["documentId"], "status": "skipped"}
+
+            outcome = process_document(
+                config, stored.record, stored.etag, repository, lifecycle_repository,
+                connector, di_client, language_client, openai_client,
+                audit_container=audit_container,
+            )
+            if outcome.status.value == "succeeded":
+                _retire_prior_version(config, document_ref["documentId"], document_ref["sourceRunId"], audit_container)
+                return {
+                    "documentId": outcome.document_id,
+                    "status": outcome.status.value,
+                    "chunksWritten": outcome.chunks_written,
+                    "error": None,
+                }
+            if outcome.error is None or not outcome.error.retryable or attempt >= PROCESS_DOCUMENT_MAX_ATTEMPTS:
+                return {
+                    "documentId": outcome.document_id,
+                    "status": outcome.status.value,
+                    "chunksWritten": outcome.chunks_written,
+                    "error": outcome.error.code if outcome.error else None,
+                }
+
+            failed = repository.get_document(document_ref["sourceRunId"], document_ref["documentId"])
+            if failed is None or failed.record.status.value != "failed":
+                return {
+                    "documentId": outcome.document_id,
+                    "status": "failed",
+                    "chunksWritten": outcome.chunks_written,
+                    "error": "retry_state_conflict",
+                }
+            failed_item = failed.record.to_cosmos_item()
+            failed_item["_etag"] = failed.etag
+            if repository.reset_failed_to_discovered(failed_item) is None:
+                return {
+                    "documentId": outcome.document_id,
+                    "status": "failed",
+                    "chunksWritten": outcome.chunks_written,
+                    "error": "retry_reset_conflict",
+                }
+            jitter = int(document_ref["documentId"][:2], 16) % 30
+            delay = PROCESS_DOCUMENT_RETRY_DELAY_SECONDS + jitter
+            logger.warning(
+                "process_document_activity retrying document=%s attempt=%d delay_seconds=%d error=%s",
+                document_ref["documentId"], attempt + 1, delay, outcome.error.code,
+            )
+            time.sleep(delay)
+
+        raise RuntimeError("process document retry loop exhausted unexpectedly")
     except Exception as error:
         from ingestion.models import safe_error_from_exception
         logger.exception("process_document_activity failed")
         safe = safe_error_from_exception(error, "activity")
-        # Retryable errors must propagate so call_activity_with_retry actually retries, but
-        # re-raise a sanitized message: a raw exception can embed a signed download URL,
-        # tripping a host bug that corrupts Durable's replay state for exceptions containing
-        # credential-like tokens (Azure/azure-functions-durable-python#600).
-        if safe.retryable:
-            raise TimeoutError(safe.code) from None
         return {"documentId": document_ref.get("documentId", ""), "status": "failed", "error": safe.code}
 
 
@@ -868,6 +1074,93 @@ def acl_resync_page_activity(payload: dict) -> dict:
         return {"error": str(error)}
 
 
+@app.activity_trigger(input_name="payload")
+def lifecycle_reconcile_page_activity(payload: dict) -> dict:
+    from config import load_config
+    from ingestion.services import run_lifecycle_reconciliation_page
+
+    try:
+        config = load_config()
+        repository = _build_repository(config)
+        lifecycle_repository = _build_lifecycle_repository(config)
+        outcome, token = run_lifecycle_reconciliation_page(
+            repository,
+            lifecycle_repository,
+            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            continuation_token=payload.get("continuationToken"),
+        )
+        logger.info(
+            "lifecycle_reconcile_page_completed checked=%d repaired=%d "
+            "failed=%d has_more=%s",
+            outcome.checked,
+            outcome.repaired,
+            outcome.failed,
+            token is not None,
+        )
+        return {
+            "checked": outcome.checked,
+            "repaired": outcome.repaired,
+            "failed": outcome.failed,
+            "continuationToken": token,
+        }
+    except Exception:
+        logger.exception("lifecycle_reconcile_page_activity failed")
+        return {"error": "lifecycle_reconciliation_failed"}
+
+
+@app.activity_trigger(input_name="payload")
+def duplicate_version_reconcile_page_activity(payload: dict) -> dict:
+    from config import load_config
+    from ingestion.services import run_duplicate_version_reconciliation_page
+
+    try:
+        config = load_config()
+        repository = _build_repository(config)
+        lifecycle_repository = _build_lifecycle_repository(config)
+        outcome, token = run_duplicate_version_reconciliation_page(
+            config,
+            repository,
+            lifecycle_repository,
+            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            continuation_token=payload.get("continuationToken"),
+        )
+        return {
+            "checked": outcome.checked,
+            "repaired": outcome.repaired,
+            "failed": outcome.failed,
+            "continuationToken": token,
+        }
+    except Exception:
+        logger.exception("duplicate_version_reconcile_page_activity failed")
+        return {"error": "duplicate_version_reconciliation_failed"}
+
+
+@app.activity_trigger(input_name="payload")
+def orphan_chunk_reconcile_page_activity(payload: dict) -> dict:
+    from config import load_config
+    from ingestion.services import run_orphan_chunk_reconciliation_page
+
+    try:
+        config = load_config()
+        repository = _build_repository(config)
+        lifecycle_repository = _build_lifecycle_repository(config)
+        outcome, token = run_orphan_chunk_reconciliation_page(
+            repository,
+            lifecycle_repository,
+            page_size=LIFECYCLE_RECONCILE_PAGE_SIZE,
+            continuation_token=payload.get("continuationToken"),
+        )
+        return {
+            "checked": outcome.checked,
+            "repaired": outcome.repaired,
+            "failed": outcome.failed,
+            "continuationToken": token,
+        }
+    except Exception:
+        logger.exception("orphan_chunk_reconcile_page_activity failed")
+        return {"error": "orphan_chunk_reconciliation_failed"}
+
+
 
 def _retire_prior_version(config, document_id: str, current_source_run_id: str, audit_container=None) -> None:
     """After full-sync re-processes a file, hard-delete any old ready version from a prior run."""
@@ -875,28 +1168,44 @@ def _retire_prior_version(config, document_id: str, current_source_run_id: str, 
     from ingestion.telemetry import write_audit_record
     try:
         lifecycle_repo = _build_lifecycle_repository(config)
-        ref = lifecycle_repo.find_ready_document_by_document_id(document_id)
-        if ref is not None and ref.source_run_id != current_source_run_id:
-            lifecycle_repo.delete_document_and_chunks(
-                source_run_id=ref.source_run_id,
-                document_id=document_id,
-                document_key=ref.document_key,
-                etag=ref.etag,
-            )
-            if audit_container is not None:
-                write_audit_record(audit_container, config.source_id, current_source_run_id, {
-                    "operation": "document_deleted", "documentId": document_id,
-                    "reason": "superseded", "method": "full_sync",
-                    "replacedDocumentKey": ref.document_key,
-                })
-    except LifecycleConflictError:
-        pass
+        refs = lifecycle_repo.list_ready_document_versions(document_id)
+        for ref in refs:
+            if ref.source_run_id == current_source_run_id:
+                continue
+            try:
+                lifecycle_repo.delete_document_and_chunks(
+                    source_run_id=ref.source_run_id,
+                    document_id=document_id,
+                    document_key=ref.document_key,
+                    etag=ref.etag,
+                )
+                if audit_container is not None:
+                    write_audit_record(audit_container, config.source_id, current_source_run_id, {
+                        "operation": "document_deleted", "documentId": document_id,
+                        "reason": "superseded", "method": "full_sync",
+                        "replacedDocumentKey": ref.document_key,
+                    })
+            except LifecycleConflictError:
+                continue
     except Exception:
         logger.warning("retire_prior_version failed for %s", document_id, exc_info=True)
 
 
 # Built once per worker and reused across invocations (Azure Functions Python guidance).
 _client_cache: dict[str, Any] = {}
+
+
+def _build_retrieval_service_credential():
+    if "retrieval_service_credential" not in _client_cache:
+        from azure.identity import ManagedIdentityCredential
+
+        client_id = os.getenv("MANAGED_IDENTITY_CLIENT_ID", "").strip()
+        if not client_id:
+            raise EnvironmentError("MANAGED_IDENTITY_CLIENT_ID is required")
+        _client_cache["retrieval_service_credential"] = ManagedIdentityCredential(
+            client_id=client_id
+        )
+    return _client_cache["retrieval_service_credential"]
 
 
 def _build_repository(config):
@@ -974,30 +1283,35 @@ def _build_graph_client(config):
 
 def _build_sharepoint_client(config):
     """Build an httpx.Client for SharePoint REST API using the same cert but SP scope. Cached (see _build_graph_client)."""
+    if not config.sharepoint_site_url:
+        raise EnvironmentError("Required SharePoint site URL is not configured")
     if "sharepoint_client" not in _client_cache:
         from azure.identity import CertificateCredential, DefaultAzureCredential
         from azure.keyvault.secrets import SecretClient
-        from ingestion.graph import GraphCredentialAuth
+        from ingestion.graph import GraphCredentialAuth, validate_sharepoint_drive_site
         import httpx
         import base64
 
-        if not config.sharepoint_site_url:
-            _client_cache["sharepoint_client"] = None
-        else:
-            credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
-            secret_client = SecretClient(config.key_vault_uri, credential)
-            cert_secret = secret_client.get_secret(config.certificate_secret_name)
-            cert_data = base64.b64decode(cert_secret.value, validate=True)
-            from urllib.parse import urlparse
-            host = urlparse(config.sharepoint_site_url).hostname or ""
-            sp_scope = f"https://{host}/.default"
-            sp_credential = CertificateCredential(
-                tenant_id=config.tenant_id,
-                client_id=config.app_client_id,
-                certificate_data=cert_data,
-            )
-            transport = httpx.HTTPTransport(retries=3)
-            _client_cache["sharepoint_client"] = httpx.Client(auth=GraphCredentialAuth(sp_credential, sp_scope), transport=transport, timeout=60)
+        validate_sharepoint_drive_site(
+            _build_graph_client(config),
+            config.drive_id,
+            config.sharepoint_site_url,
+            config.acl_max_pages,
+        )
+        credential = DefaultAzureCredential(managed_identity_client_id=config.managed_identity_client_id)
+        secret_client = SecretClient(config.key_vault_uri, credential)
+        cert_secret = secret_client.get_secret(config.certificate_secret_name)
+        cert_data = base64.b64decode(cert_secret.value, validate=True)
+        from urllib.parse import urlparse
+        host = urlparse(config.sharepoint_site_url).hostname or ""
+        sp_scope = f"https://{host}/.default"
+        sp_credential = CertificateCredential(
+            tenant_id=config.tenant_id,
+            client_id=config.app_client_id,
+            certificate_data=cert_data,
+        )
+        transport = httpx.HTTPTransport(retries=3)
+        _client_cache["sharepoint_client"] = httpx.Client(auth=GraphCredentialAuth(sp_credential, sp_scope), transport=transport, timeout=60)
     return _client_cache["sharepoint_client"]
 
 

@@ -1,270 +1,108 @@
-# Production Readiness Plan
+# Production Readiness
 
-## Current State (Dev)
+This document separates verified release evidence from production-scale work that remains unproven. It does not convert development estimates into production guarantees.
 
-For full resource SKUs, RBAC, and network configuration, see [AZURE_RESOURCES.md](AZURE_RESOURCES.md). Prod-specific target deltas:
+## Current Verified Baseline
 
-| Resource | Dev Configuration | Prod Target |
-|----------|------------------|-------------|
-| Cosmos DB | Serverless (5,000 RU/s burst) | Provisioned autoscale (Tmax=20,000 RU/s) |
-| OpenAI TPM | 30K TPM | 2M+ TPM (quota increase required) |
-| WAVE_SIZE | 4 | 20 |
-| Language AI | F0 free tier | S tier |
-| Document Intelligence | F0 free tier | S0 standard |
-| Storage redundancy | LRS | ZRS |
+The latest E2E validation was completed on 2026-08-30. Its detailed report is retained outside source control because it contains deployment identifiers; the non-sensitive results are summarized below.
 
-## Bottleneck Analysis (10K Files, ~378 Chunks/File)
+Verified against the reviewed non-production deployment:
 
-| Resource | At Dev Quota | At Prod Quota | Acceptable? |
-|----------|-------------|---------------|-------------|
-| OpenAI embedding | 43 days (30K TPM) | ~16 hours (2M TPM) | Yes |
-| Cosmos chunk writes | 21 hours + 429 failures | ~2 hours (20K autoscale) | Yes |
-| Document Intelligence | ~10 hours | ~10 hours (S0 sufficient) | Yes |
-| Language AI enrichment | ~10 hours (batch=5) | ~10 hours (S sufficient) | Yes |
-| Total pipeline (parallelized) | Blocked | ~16 hours | Yes |
+- ACA revision and immutable image digest remained stable through validation.
+- Immutable retrieval catalog digest was used by all audited scenarios.
+- Four scoring aggregation profiles passed 24 standard/agentic and mode combinations.
+- Synonym enabled/disabled behavior passed with a term-isolated fixture.
+- Freshness arithmetic passed focused tests; the live exact-copy ranking smoke put the newer source first, with the documented reciprocal-rank causality limitation.
+- Delta fixture ingestion/deletion, post-cleanup retrieval, and fixture cleanup were exercised in the cited report. Full sync, denied-principal behavior, and restart recovery require separate same-release evidence before they can be claimed for this release.
+- The temporary catalog publisher job was removed after explicit approval.
 
-## Infrastructure Changes Required
+These results prove functional behavior for the tested corpus and target. They do not prove production capacity, SLOs, disaster recovery, or multi-region behavior.
 
-### 1. Cosmos DB: Serverless → Provisioned Autoscale
+## Release Artifact Contract
 
-Already supported via Bicep parameter. No code changes needed.
+A release is one reviewed tuple:
 
-```
-# infra/main.parameters.prod.bicepparam (already configured)
-param cosmosDbMode = 'provisioned'
-```
+- Source-tree hash and deployment-plan hash.
+- Immutable retrieval image `repository@sha256:<digest>`.
+- Immutable retrieval catalog `sha256:<digest>`.
+- Function package built from the same reviewed source.
+- Exact target subscription, tenant, resource group, region, azd environment, and deployment instance.
 
-**Action**: Update `cosmosSearchChunksAutoscaleMaxRUs` from `1000` to `20000` in `main.parameters.prod.bicepparam` before deploying to production at scale.
+Use `scripts/deploy.ps1`; do not run direct `azd provision`, `az containerapp update`, or `func azure functionapp publish` as production release steps.
 
-| Parameter | Current (Prod) | Recommended (10K files) |
-|-----------|---------------|-------------------------|
-| `cosmosMetadataAutoscaleMaxRUs` | 1000 | 1000 (sufficient) |
-| `cosmosSearchChunksAutoscaleMaxRUs` | 1000 | 20000 |
+Rollback is a new reviewed deployment of a compatible prior tuple. Changing the catalog publication pointer alone does not change runtime selection.
 
-**Cost estimate** (autoscale, idle at 10%):
-- Idle: 2,000 RU/s × $0.008/100 RU/hr ≈ $116/month
-- During ingestion burst: 20,000 RU/s × $0.008/100 RU/hr = $16/hr
+## Required Pre-Release Gates
 
-### 2. OpenAI Quota: 30K → 2M+ TPM
+1. Local unit, contract, and Bicep checks pass.
+2. `Authority` returns reviewed plan/source hashes.
+3. `Foundation`, `Operations`, and `Final` what-if output is reviewed.
+4. External Entra applications, app roles, Graph permissions, Key Vault certificate, and SharePoint site grant are verified without exposing secrets.
+5. ACR returns an immutable image digest.
+6. Catalog validation returns the expected immutable digest.
+7. Function and ACA authentication configurations match the exact audience/application/principal contracts.
+8. Database schemas and partition keys are compatible with the deployed code.
+9. Monitoring is available for requests, dependencies, exceptions, and ACA logs.
 
-**Action**: Request quota increase via Azure Portal → Azure OpenAI → Quotas → `text-embedding-3-large`.
+## Required Post-Deployment Gates
 
-This is not automatable via IaC. Must be done manually per subscription.
+- Verify Function and ACA health, revision, traffic, image digest, catalog digest, and `ACL_ENABLED`.
+- Run authenticated and unauthenticated gateway tests.
+- Run authorized and denied ACL retrieval tests.
+- Validate full sync, delta update/delete, ACL resync/restoration, and lifecycle reconciliation as applicable to the release.
+- Run standard and agentic retrieval across required modes.
+- Validate all deployed scoring profiles, freshness, and synonyms.
+- Verify request/audit correlation and no unexpected dependency failures.
+- Delete all test fixtures and prove manifest/chunk/query cleanup.
+- Remove the temporary catalog job after explicit approval and run a final smoke test.
 
-Formula for WAVE_SIZE: `WAVE_SIZE ≈ TPM / 200,000` (leave headroom for retries).
+## Security Gaps and Boundaries
 
-| TPM Granted | Recommended WAVE_SIZE | Full Sync Time (10K files) |
-|-------------|----------------------|---------------------------|
-| 300K | 4 | ~4.4 days |
-| 1M | 5-8 | ~31 hours |
-| 2M | 10-15 | ~16 hours |
-| 5M | 20-30 | ~6 hours |
+| Area | Current state | Release impact |
+| --- | --- | --- |
+| Function client allowlist | Required in Bicep | Verify exact approved caller before release |
+| Per-user admin authorization | Not enforced on destructive Function endpoints | Production release requires risk acceptance or implementation of app-role checks |
+| Lifecycle webhook | Excluded from EasyAuth and does not validate `clientState` | Security gap requiring risk acceptance or remediation |
+| Retrieval gateway | ACA and application code restrict calls to Function UAMI | Verify app-role assignment externally because Bicep does not mutate Entra |
+| ACL model | Entra security groups only | Direct user shares are unsupported |
+| Rate limiting | In-memory per ACA replica | Not a hard distributed abuse control |
+| Secrets | Certificate in external Key Vault; webhook client state in secure app setting | Verify external vault/network policy and secret rotation process |
+| Query audit data | Stores user/tenant IDs, up to 2,000 question characters, and a 500-character answer preview for the 90-day container TTL; inspect can return these records | Apply privacy classification, least-privilege endpoint access, retention approval, and safe diagnostic handling |
 
-### 3. WAVE_SIZE: 4 → 20 (Environment Variable)
+## Capacity and Reliability Evidence Still Required
 
-Already reads from environment:
+No current repository artifact proves the following for a production workload:
 
-```python
-# function_app.py line 23
-WAVE_SIZE = int(os.getenv("WAVE_SIZE", "4"))
-```
+- Maximum sustainable file count, pages, chunks, or concurrent source changes.
+- Cosmos RU/s, throttling envelope, partition hot spots, or query RU distribution.
+- Azure OpenAI, Document Intelligence, or Language quota required for peak ingestion/query traffic.
+- p50/p95/p99 latency, throughput, saturation, or error-rate SLOs.
+- Scale-out behavior of the per-replica rate limiter.
+- Zone-failure, regional-failure, restore, backup, or disaster-recovery objectives.
+- Multi-library operation from one Function deployment.
 
-**Action**: Set app setting after OpenAI quota is confirmed:
+Treat any prior 10K-file duration, RU, or concurrency number as a planning hypothesis until a representative load test records inputs, duration, throttles, costs, and recovery behavior.
 
-```bash
-az functionapp config appsettings set \
-  --name <func-app-name> \
-  --resource-group <rg-name> \
-  --settings "WAVE_SIZE=20"
-```
+## Production Capacity Plan
 
-## Code Fixes Already Deployed
+Before production approval:
 
-| Fix | File | Purpose |
-|-----|------|---------|
-| Cosmos 429 retry with exponential backoff | `ingestion/repository.py` | `_create_chunk_batch` → `_execute_batch_with_throttle_retry` (5 retries, 1s×2^n backoff) |
-| Language AI batch size 25→5 | `ingestion/enrichment.py` | Complies with entity API limit (max 5 per request) |
-| Error logging before SafeError | `ingestion/services.py` | `logger.error(...)` with `exc_info=True` for App Insights |
+1. Define corpus size, document-size/page distributions, change rate, query concurrency, latency SLOs, RTO/RPO, and cost ceiling.
+2. Select serverless or provisioned Cosmos mode from measured RU demand; do not assume a fixed RU value is sufficient.
+3. Validate Azure OpenAI and AI Services quotas in the target region.
+4. Run staged load tests with representative documents and ACL distributions.
+5. Measure Function/ACA scale, dependency throttling, Cosmos RU, latency percentiles, and failure recovery.
+6. Run lifecycle reconciliation and restart recovery under injected partial failures.
+7. Record halt criteria and the compatible immutable rollback tuple.
 
-## Security Groups (100+ Users)
+## Evaluation Gate
 
-No code changes needed. The existing design handles this:
+Protected evaluation requires approved ground truth, principal cases, dataset manifest, and SME approval. Run `evaluation.generate_rankings` and `evaluation.retrieval_metrics` with the required experiment manifest. Declare Precision@K, Recall@K, MRR, and per-query regression thresholds before examining candidate results.
 
-- `read_verified_acl()` stores `allowed_group_ids` per document and chunk
-- Search queries filter via `ARRAY_CONTAINS(c.allowedGroupIds, <user_group_id>)`
-- Microsoft Graph rate limit (10K req/10 min per app) handles 10K ACL checks
+The evaluator verifies ranking/ground-truth hashes bound by the manifest. Source-tree, image, dependency, catalog, approval, and submitted-context hashes remain release-gate responsibilities outside the evaluator.
 
-## Production Security Hardening
+## Readiness Verdict
 
-### EasyAuth: Restrict Allowed Applications
-
-In production, add the front-end client ID to `allowedApplications` so only your approved app can call the API:
-
-```bash
-az rest --method PUT \
-  --url "https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Web/sites/{func-app}/config/authsettingsV2?api-version=2022-03-01" \
-  --body '{
-    "properties": {
-      "identityProviders": {
-        "azureActiveDirectory": {
-          "validation": {
-            "allowedAudiences": ["api://{client-id}"],
-            "defaultAuthorizationPolicy": {
-              "allowedApplications": ["{frontend-client-id}"]
-            }
-          }
-        }
-      }
-    }
-  }'
-```
-
-Per [MS Learn](https://learn.microsoft.com/azure/app-service/configure-authentication-provider-aad#authorize-requests): only tokens from the named client are accepted.
-
-### Per-User, Per-Replica Rate Limiting
-
-The retrieval service enforces a sliding-window rate limiter (`RATE_LIMIT_RPM`, default 30 requests/minute per user **per replica**). Returns HTTP 429 when exceeded. **Effective ceiling** ≈ `RATE_LIMIT_RPM × replicaCount` — at `maxReplicas=5`, a single user can reach ~150 RPM before any replica rejects. This is **not a hard DoS control** at scale-out; enforce upstream via Azure Front Door + WAF rate-limit rules, Azure API Management, or replace the in-memory limiter with a shared counter (Redis / Cosmos atomic increment).
-
-### Thread Safety
-
-Concurrent retrieval tasks use `threading.Lock` for usage-record collection, ensuring audit data integrity under parallel load.
-
-### Container Security (AKS)
-
-Pod Security Standards (Restricted): `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, `capabilities: drop ALL`, `seccompProfile: RuntimeDefault`. Writable `/tmp` via `emptyDir` (64Mi).
-
-### OpenAI Resilience
-
-Both sync and async OpenAI clients set `max_retries=2` for automatic exponential backoff on transient 429/5xx errors.
-
-## Deployment Checklist
-
-```
-[ ] 1. Request OpenAI quota increase (2M+ TPM) via Azure Portal
-[ ] 2. Wait for quota approval
-[ ] 3. Update prod params: cosmosSearchChunksAutoscaleMaxRUs = 20000
-[ ] 4. Deploy infrastructure: azd provision --environment prod
-[ ] 5. Deploy code: azd deploy --environment prod
-[ ] 6. Build and deploy retrieval image: az acr build + az containerapp update
-[ ] 7. Set WAVE_SIZE app setting (match to granted TPM)
-[ ] 8. Set RETRIEVAL_SERVICE_URL on Function App (HTTPS, internal ACA FQDN)
-[ ] 9. Set WEBHOOK_CLIENT_STATE and FUNCTION_PUBLIC_BASE_URL on Function App
-[ ] 10. Set SHAREPOINT_SITE_URL if site uses site groups for permissions
-[ ] 11. Run full-sync test with 24 files → expect 21+ success
-[ ] 12. Verify webhook subscription created (check logs for subscription_created)
-[ ] 13. Verify reconciliation_timer fires daily at 04:00 UTC (safety-net delta query)
-[ ] 14. Verify acl_resync_timer fires weekly Sunday at 03:00 UTC
-[ ] 15. Test retrieval query via /api/query endpoint
-[ ] 16. Verify service-audit container has both ingestion + retrieval records
-[ ] 17. Monitor Cosmos 429 metrics (should be near zero)
-[ ] 18. Monitor OpenAI 429 metrics (should be within retry budget)
-```
-
-## Rollback Procedure
-
-If a retrieval deployment introduces a regression, roll back to the previous container image tag:
-
-```bash
-az containerapp update --name <aca-name> --resource-group <rg> --image <acr-login-server>/rag-retrieval:<previous-tag>
-```
-
-Verify the previous revision is `Active`/`Running` via `az containerapp revision list --name <aca-name> --resource-group <rg> -o table` before confirming rollback complete. No Cosmos schema changes are made by retrieval deploys, so no data migration or rollback is needed.
-
-For the Function App, redeploy the previous code revision via `func azure functionapp publish <func-app-name> --python` from the last known-good commit, or `azd deploy` after `git checkout <previous-sha>`.
-
-## Orchestration Batching Strategy (continue_as_new)
-
-### Decision: Not Required — Durable Task Scheduler Handles It
-
-The project uses **Durable Task Scheduler** (not Azure Storage provider). DTS manages orchestration history caching, partitioning, and replay internally. The replay overhead that motivates `continue_as_new` batching is primarily an Azure Storage provider concern.
-
-**Evidence**: [MS Learn – Performance and Scale](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-perf-and-scale) states: "The Durable Task Scheduler manages caching internally."
-
-### Why Durable Task Scheduler Over Azure Storage Provider
-
-Both are GA and supported on Flex Consumption. DTS was chosen because:
-
-| Criteria | DTS (chosen) | Azure Storage (alternative) |
-|----------|-------------|---------------------------|
-| Throughput | Very high | Moderate |
-| Max orchestration nodes | Unlimited | 16 partitions |
-| At 10K activities | Designed for this | Queue latency + partition limits |
-| Observability | Built-in dashboard | Manual (App Insights only) |
-| Cost | Consumption SKU (free tier) | ~$0.0004/10K storage transactions |
-| Local dev tooling | Docker emulator | Azurite (simpler, no Docker) |
-
-Azure Storage provider **would work** for dev scale (23 files) but becomes a throughput bottleneck at production scale (10K+ activity invocations). Microsoft explicitly recommends DTS for new projects.
-
-**Reference**: [Storage Providers Comparison – MS Learn](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-storage-providers)
-
-### Scale Thresholds
-
-| File Count | Approach | Rationale |
-|-----------|----------|-----------|
-| ≤500 | Current architecture, no changes | DTS handles replay efficiently |
-| 500–5K | Monitor replay time via App Insights. Add `continue_as_new` if replays >5s | Defensive validation |
-| 5K–10K | Implement `continue_as_new` with BATCH_SIZE=500 if needed | ~30 lines in orchestrator |
-| >10K | Sub-orchestrations by folder/source | Fan-in limited to single VM per MS docs |
-
-### If Batching Becomes Necessary
-
-The implementation is a ~30-line change in `function_app.py` using the standard Eternal Orchestration pattern:
-
-1. First iteration: activate + discover ALL + process first BATCH_SIZE docs
-2. Call `context.continue_as_new(state)` with remaining docs and cumulative counters
-3. Subsequent iterations: process next BATCH_SIZE docs, repeat
-4. Final iteration: process remaining + finalize
-
-Two env vars would control throughput:
-- `WAVE_SIZE` (default 4) = concurrent docs per wave
-- `BATCH_SIZE` (default 200) = docs per orchestration iteration before history reset
-
-**Reference**: [Eternal Orchestrations – MS Learn](https://learn.microsoft.com/en-us/azure/azure-functions/durable/durable-functions-eternal-orchestrations)
-
-### Validation Step Before Implementing
-
-Run 1K+ file ingestion and check:
-```bash
-# Query App Insights for orchestrator replay duration
-traces | where message contains "full_sync_orchestrator" and message contains "IsReplay: True"
-| summarize avg(duration), max(duration) by bin(timestamp, 5m)
-```
-
-If `max(duration) > 5000ms`, implement `continue_as_new` batching.
-
-## Incremental Ingestion (Delta-Sync) — Implemented
-
-Delta-sync is primarily triggered by **Microsoft Graph webhooks** — when a file is added, modified, or deleted in SharePoint, Graph sends a change notification to `POST /api/webhook/sharepoint`, which starts the `delta_sync_orchestrator`. A daily **reconciliation timer** (`DELTA_SYNC_SCHEDULE`, default 04:00 UTC) runs the same delta query as a safety net to catch any missed webhook notifications.
-
-The delta query uses the Microsoft Graph Delta API to detect changed files. Deleted files are hard-deleted from Cosmos (source-documents + search-chunks). Updated files are re-processed, and the old version is retired (`status=retired`, `retired_reason=superseded`). The delta cursor is stored in a dedicated `delta-control` item in `ingestion-runs`.
-
-When the delta feed returns zero content changes (`itemsSeen == 0`), the orchestrator automatically runs one page of ACL resync to catch permission-only changes that Graph does not surface via `@microsoft.graph.sharedChanged`.
-
-ACL resync runs weekly on Sunday at 03:00 UTC (`ACL_RESYNC_SCHEDULE`). It re-verifies document permissions via Graph and the SharePoint REST API (for site group resolution), then patches `allowedGroupIds` on both source-documents and search-chunks when ACLs change. Documents with revoked access are retired (`retired_reason=acl_revoked`).
-
-All timers and webhook handlers skip execution while a full-sync orchestration is running.
-
-## Hybrid RAG Retrieval — Implemented
-
-The retrieval service uses hybrid routing based on LLM query planning:
-
-| Configuration | Env Var | Default | Description |
-|---|---|---|---|
-| Agent timeout | `AGENT_TIMEOUT_SECONDS` | `8.0` | Max time for agentic path before fallback |
-| Agent max iterations | `AGENT_MAX_ITERATIONS` | `5` | Max LLM reasoning roundtrips per request |
-
-### Operational Notes
-
-- All queries are analyzed by the LLM planner regardless of conversation history
-- Simple queries (1 planned query) use the standard path (~5s, lower token cost)
-- Complex queries (2+ planned queries) use the Agent Framework agentic path (~8-10s)
-- Agentic path timeout/error triggers automatic fallback to standard path
-- Structured logs include `path=standard|agentic|agentic_fallback` for monitoring
-- Agent Framework package (`agent-framework-core`, `agent-framework-openai`) must be installed; if unavailable, all queries use standard path
-
-## Dev vs. Prod Parameter Files
-
-| File | Purpose |
-|------|---------|
-| `infra/main.parameters.dev.bicepparam` | Serverless, free tiers, LRS, WAVE_SIZE=4 |
-| `infra/main.parameters.prod.bicepparam` | Provisioned autoscale, standard tiers, ZRS, WAVE_SIZE=20 |
+- **Functional E2E for the tested ACA environment:** passed with documented freshness limitation.
+- **General production readiness:** conditional.
+- **Blocking evidence for production scale:** workload requirements, capacity/load evidence, recovery objectives/tests, and acceptance of or fixes for the listed security gaps.

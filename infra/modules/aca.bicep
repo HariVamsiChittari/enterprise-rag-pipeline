@@ -1,4 +1,6 @@
 @description('Container App name')
+@minLength(2)
+@maxLength(32)
 param containerAppName string
 
 @description('Azure region')
@@ -7,43 +9,52 @@ param location string = resourceGroup().location
 @description('ACR login server (e.g. myacr.azurecr.io)')
 param acrLoginServer string
 
-@description('Container image name and tag (MCR placeholder for initial deploy; CI/CD overrides)')
-param imageName string = 'mcr.microsoft.com/k8se/quickstart:latest'
+@description('Immutable container image name/tag or fully qualified registry reference')
+@minLength(1)
+param imageName string
 
 @description('User-assigned managed identity resource ID for the container app')
 param managedIdentityId string
 
-@description('VNet integration subnet resource ID')
-param infrastructureSubnetId string
-
-@description('Log Analytics workspace resource ID')
-param logAnalyticsWorkspaceId string
+@description('Existing Container Apps managed environment resource ID')
+param managedEnvironmentId string
 
 @description('Retrieval service env vars (from retrieval-config module)')
 param retrievalEnvVars array
 
+@description('Retrieval API application/client ID')
+param retrievalApiClientId string
+
+@description('Retrieval API client ID used as the v2 access-token audience')
+@minLength(1)
+param retrievalApiAudience string
+
+@description('Single-tenant Entra issuer URL')
+@minLength(1)
+param entraIssuer string
+
+@description('Function UAMI application/client ID allowed by ACA auth')
+param gatewayClientId string
+
+@description('Function UAMI service-principal object ID allowed by ACA auth')
+param gatewayPrincipalId string
+
+@description('Container CPU cores')
+param containerCpu string = '0.5'
+
+@description('Container memory')
+param containerMemory string = '1Gi'
+
+@description('Minimum replicas')
+@minValue(1)
+param minReplicas int = 1
+
+@description('Maximum replicas')
+@minValue(1)
+param maxReplicas int = 5
+
 @description('Resource tags')
 param tags object = {}
-
-resource environment 'Microsoft.App/managedEnvironments@2024-03-01' = {
-  name: '${containerAppName}-env'
-  location: location
-  tags: tags
-  properties: {
-    vnetConfiguration: {
-      infrastructureSubnetId: infrastructureSubnetId
-      internal: true
-    }
-    appLogsConfiguration: {
-      destination: 'log-analytics'
-      logAnalyticsConfiguration: {
-        customerId: reference(logAnalyticsWorkspaceId, '2023-09-01').customerId
-        sharedKey: listKeys(logAnalyticsWorkspaceId, '2023-09-01').primarySharedKey
-      }
-    }
-    zoneRedundant: false
-  }
-}
 
 resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
   name: containerAppName
@@ -56,7 +67,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
     }
   }
   properties: {
-    managedEnvironmentId: environment.id
+    managedEnvironmentId: managedEnvironmentId
     configuration: {
       ingress: {
         external: true
@@ -75,10 +86,10 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       containers: [
         {
           name: 'retrieval-agent'
-          image: startsWith(imageName, 'mcr.microsoft.com/') ? imageName : '${acrLoginServer}/${imageName}'
+          image: contains(imageName, '.azurecr.io/') ? imageName : '${acrLoginServer}/${imageName}'
           resources: {
-            cpu: json('0.5')
-            memory: '1Gi'
+            cpu: json(containerCpu)
+            memory: containerMemory
           }
           env: retrievalEnvVars
           probes: [
@@ -98,9 +109,43 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
         }
       ]
       scale: {
-        minReplicas: 1
-        maxReplicas: 5
+        minReplicas: minReplicas
+        maxReplicas: maxReplicas
       }
+    }
+  }
+}
+
+resource authConfig 'Microsoft.App/containerApps/authConfigs@2024-03-01' = {
+  parent: containerApp
+  name: 'current'
+  properties: {
+    platform: {
+      enabled: true
+    }
+    globalValidation: {
+      unauthenticatedClientAction: 'Return401'
+    }
+    identityProviders: {
+      azureActiveDirectory: {
+        enabled: true
+        registration: {
+          clientId: retrievalApiClientId
+          openIdIssuer: entraIssuer
+        }
+        validation: {
+          allowedAudiences: [retrievalApiAudience]
+          defaultAuthorizationPolicy: {
+            allowedApplications: [gatewayClientId]
+            allowedPrincipals: {
+              identities: [gatewayPrincipalId]
+            }
+          }
+        }
+      }
+    }
+    httpSettings: {
+      requireHttps: true
     }
   }
 }
@@ -108,11 +153,8 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
 @description('Container App FQDN (internal)')
 output fqdn string = containerApp.properties.configuration.ingress.fqdn
 
+@description('Container App resource name')
+output containerAppName string = containerApp.name
+
 @description('Container App internal URL')
 output internalUrl string = 'https://${containerApp.properties.configuration.ingress.fqdn}'
-
-@description('ACA environment default domain (for private DNS zone)')
-output environmentDefaultDomain string = environment.properties.defaultDomain
-
-@description('ACA environment static IP (for private DNS A records)')
-output environmentStaticIp string = environment.properties.staticIp

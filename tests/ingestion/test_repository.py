@@ -580,15 +580,16 @@ def test_ready_verification_rejects_missing_and_extra_chunks() -> None:
     chunks = StatefulContainer("documentKey")
     repository = IngestionRepository(StatefulContainer("sourceId"), documents, chunks)
     processing = create_processing_document(repository)
-    repository.write_chunks(build_chunks(1))
-    ready = build_ready_document(processing.record, 2)
+    repository.write_chunks(build_chunks(1, is_retrievable=True))
+    admitting = begin_admission(repository, processing, 2)
+    ready = build_ready_document(admitting.record, 2)
 
     with pytest.raises(RepositoryConflictError, match="missing chunks"):
-        repository.verify_and_mark_document_ready(ready, processing.etag)
+        repository.verify_and_mark_document_ready(ready, admitting.etag)
 
-    repository.write_chunks(build_chunks(3))
+    repository.write_chunks(build_chunks(3, is_retrievable=True))
     with pytest.raises(RepositoryConflictError, match="missing or extra"):
-        repository.verify_and_mark_document_ready(ready, processing.etag)
+        repository.verify_and_mark_document_ready(ready, admitting.etag)
 
 
 def test_ready_verification_consumes_every_projected_page_without_point_reads(
@@ -599,13 +600,14 @@ def test_ready_verification_consumes_every_projected_page_without_point_reads(
     chunks = StatefulContainer("documentKey")
     repository = IngestionRepository(StatefulContainer("sourceId"), documents, chunks)
     processing = create_processing_document(repository)
-    records = build_chunks(205)
+    records = build_chunks(205, is_retrievable=True)
     for record in records:
         chunks._store(record.to_cosmos_item())
 
+    admitting = begin_admission(repository, processing, len(records))
     ready = repository.verify_and_mark_document_ready(
-        build_ready_document(processing.record, len(records)),
-        processing.etag,
+        build_ready_document(admitting.record, len(records)),
+        admitting.etag,
     )
 
     assert ready.record.status is DocumentStatus.READY
@@ -620,16 +622,46 @@ def test_ready_verification_rejects_invalid_chunk_id_index_mapping() -> None:
     chunks = StatefulContainer("documentKey")
     repository = IngestionRepository(StatefulContainer("sourceId"), documents, chunks)
     processing = create_processing_document(repository)
-    records = build_chunks(2)
+    records = build_chunks(2, is_retrievable=True)
     for record in records:
         chunks._store(record.to_cosmos_item())
     second_key = (processing.record.document_key, create_chunk_id(1))
     chunks.items[second_key]["chunkIndex"] = 0
 
+    admitting = begin_admission(repository, processing, 2)
     with pytest.raises(RepositoryConflictError, match="duplicate chunks"):
         repository.verify_and_mark_document_ready(
-            build_ready_document(processing.record, 2),
-            processing.etag,
+            build_ready_document(admitting.record, 2),
+            admitting.etag,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("isRetrievable", False, "ineligible chunks"),
+        ("lifecycleGeneration", 1, "lifecycle generation mismatch"),
+        ("allowedGroupIds", ["group-other"], "ACL mismatch"),
+    ],
+)
+def test_ready_verification_rejects_lifecycle_mismatch(
+    field: str,
+    value: Any,
+    message: str,
+) -> None:
+    documents = StatefulContainer("sourceRunId")
+    chunks = StatefulContainer("documentKey")
+    repository = IngestionRepository(StatefulContainer("sourceId"), documents, chunks)
+    processing = create_processing_document(repository)
+    records = build_chunks(1, is_retrievable=True)
+    chunks._store(records[0].to_cosmos_item())
+    chunks.items[(processing.record.document_key, create_chunk_id(0))][field] = value
+    admitting = begin_admission(repository, processing, 1)
+
+    with pytest.raises(RepositoryConflictError, match=message):
+        repository.verify_and_mark_document_ready(
+            build_ready_document(admitting.record, 1),
+            admitting.etag,
         )
 
 
@@ -638,8 +670,9 @@ def test_concurrent_failed_transition_wins_over_ready() -> None:
     chunks = StatefulContainer("documentKey")
     repository = IngestionRepository(StatefulContainer("sourceId"), documents, chunks)
     processing = create_processing_document(repository)
-    repository.write_chunks(build_chunks(1))
-    ready = build_ready_document(processing.record, 1)
+    repository.write_chunks(build_chunks(1, is_retrievable=True))
+    admitting = begin_admission(repository, processing, 1)
+    ready = build_ready_document(admitting.record, 1)
     failed = replace(
         processing.record,
         status=DocumentStatus.FAILED,
@@ -650,7 +683,7 @@ def test_concurrent_failed_transition_wins_over_ready() -> None:
     documents.before_replace = lambda: documents._store(failed.to_cosmos_item())
 
     with pytest.raises(RepositoryConflictError, match="concurrently"):
-        repository.verify_and_mark_document_ready(ready, processing.etag)
+        repository.verify_and_mark_document_ready(ready, admitting.etag)
 
     stored = repository.get_document(processing.record.source_run_id, processing.record.id)
     assert stored is not None
@@ -1131,7 +1164,29 @@ def build_ready_document(document: SourceDocumentRecord, count: int) -> SourceDo
     )
 
 
-def build_chunks(count: int, *, document: SourceDocumentRecord | None = None) -> tuple[SearchChunkRecord, ...]:
+def begin_admission(
+    repository: IngestionRepository,
+    processing: Any,
+    count: int,
+) -> Any:
+    return repository.begin_document_admission(
+        replace(
+            processing.record,
+            status=DocumentStatus.ADMITTING,
+            stage=DocumentStage.VERIFYING,
+            expected_chunk_count=count,
+            written_chunk_count=count,
+        ),
+        processing.etag,
+    )
+
+
+def build_chunks(
+    count: int,
+    *,
+    document: SourceDocumentRecord | None = None,
+    is_retrievable: bool = False,
+) -> tuple[SearchChunkRecord, ...]:
     source_document = document or build_document()
     records: list[SearchChunkRecord] = []
     for index in range(count):
@@ -1168,6 +1223,33 @@ def build_chunks(count: int, *, document: SourceDocumentRecord | None = None) ->
                 embedded_at=UTC,
                 id=create_chunk_id(index),
                 source_run_id=source_document.source_run_id,
+                is_retrievable=is_retrievable,
             )
         )
     return tuple(records)
+
+
+def _legacy_document_item() -> dict[str, Any]:
+    """Simulate a Cosmos item written before source_modified_at was added."""
+    document = build_document()
+    item = document.to_cosmos_item()
+    item.pop("sourceModifiedAt", None)
+    return item
+
+
+def _legacy_chunk_item() -> dict[str, Any]:
+    document = build_document()
+    chunk = build_chunks(count=1, document=document)[0]
+    item = chunk.to_cosmos_item()
+    item.pop("sourceModifiedAt", None)
+    return item
+
+
+def test_document_from_item_backward_compat_missing_source_modified_at() -> None:
+    record = repository_module._document_from_item(_legacy_document_item())
+    assert record.source_modified_at is None
+
+
+def test_chunk_from_item_backward_compat_missing_source_modified_at() -> None:
+    record = repository_module._chunk_from_item(_legacy_chunk_item())
+    assert record.source_modified_at is None

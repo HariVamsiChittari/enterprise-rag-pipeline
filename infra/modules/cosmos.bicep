@@ -24,14 +24,14 @@ param tags object = {}
 @description('Database name')
 param databaseName string = 'rag-db'
 
-resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2025-05-01-preview' = {
+resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2026-03-15' = {
   name: cosmosAccountName
   location: location
   kind: 'GlobalDocumentDB'
   properties: {
     databaseAccountOfferType: 'Standard'
     consistencyPolicy: {
-      defaultConsistencyLevel: 'Session'
+      defaultConsistencyLevel: 'Strong'
     }
     locations: [
       {
@@ -40,11 +40,10 @@ resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2025-05-01-preview
         isZoneRedundant: false
       }
     ]
-    capacityMode: mode == 'serverless' ? 'Serverless' : 'Provisioned'
-    capabilities: [
+    capabilities: concat(mode == 'serverless' ? [{ name: 'EnableServerless' }] : [], [
       { name: 'EnableNoSQLVectorSearch' }
       { name: 'EnableNoSQLFullTextSearch' }
-    ]
+    ])
     enableAutomaticFailover: false
     enableMultipleWriteLocations: false
     isVirtualNetworkFilterEnabled: true
@@ -54,7 +53,7 @@ resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2025-05-01-preview
   tags: tags
 }
 
-resource database 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2025-05-01-preview' = {
+resource database 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2026-03-15' = {
   parent: cosmosAccount
   name: databaseName
   properties: mode == 'serverless'
@@ -75,7 +74,7 @@ resource database 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases@2025-05-01
       }
 }
 
-resource ingestionRunsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2025-05-01-preview' = {
+resource ingestionRunsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2026-03-15' = {
   parent: database
   name: 'ingestion-runs'
   properties: {
@@ -105,7 +104,7 @@ resource ingestionRunsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDataba
   }
 }
 
-resource sourceDocumentsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2025-05-01-preview' = {
+resource sourceDocumentsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2026-03-15' = {
   parent: database
   name: 'source-documents'
   properties: {
@@ -131,6 +130,8 @@ resource sourceDocumentsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlData
           { path: '/readyAt/?' }
           { path: '/failedAt/?' }
           { path: '/updatedAt/?' }
+          { path: '/sourceModifiedAt/?' }
+          { path: '/lifecycleGeneration/?' }
         ]
         excludedPaths: [
           { path: '/*' }
@@ -153,7 +154,7 @@ resource sourceDocumentsContainer 'Microsoft.DocumentDB/databaseAccounts/sqlData
   }
 }
 
-resource searchChunksContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2025-05-01-preview' = {
+resource searchChunksContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2026-03-15' = {
   parent: database
   name: 'search-chunks'
   properties: {
@@ -178,6 +179,9 @@ resource searchChunksContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabas
           { path: '/pageEnd/?' }
           { path: '/chunkIndex/?' }
           { path: '/createdAt/?' }
+          { path: '/sourceModifiedAt/?' }
+          { path: '/isRetrievable/?' }
+          { path: '/lifecycleGeneration/?' }
         ]
         excludedPaths: [
           { path: '/*' }
@@ -229,7 +233,36 @@ resource searchChunksContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabas
   }
 }
 
-resource serviceAuditContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2025-05-01-preview' = {
+resource retrievalConfigContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2026-03-15' = {
+  parent: database
+  name: 'retrieval-config'
+  properties: {
+    resource: {
+      id: 'retrieval-config'
+      partitionKey: {
+        paths: ['/deploymentInstanceId']
+        kind: 'Hash'
+        version: 2
+      }
+      indexingPolicy: {
+        indexingMode: 'consistent'
+        automatic: true
+        includedPaths: [
+          { path: '/type/?' }
+          { path: '/version/?' }
+          { path: '/createdAt/?' }
+          { path: '/activatedAt/?' }
+        ]
+        excludedPaths: [
+          { path: '/*' }
+        ]
+      }
+    }
+    options: {}
+  }
+}
+
+resource serviceAuditContainer 'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers@2026-03-15' = {
   parent: database
   name: 'service-audit'
   properties: {
@@ -266,6 +299,9 @@ output endpoint string = cosmosAccount.properties.documentEndpoint
 
 @description('Database name')
 output databaseName string = database.name
+
+@description('Retrieval configuration container name')
+output retrievalConfigContainerName string = retrievalConfigContainer.name
 
 @description('Ingestion runs container name')
 output ingestionRunsContainerName string = ingestionRunsContainer.name

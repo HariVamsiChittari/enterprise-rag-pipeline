@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
@@ -10,8 +11,9 @@ import pytest
 
 @pytest.fixture(scope="module")
 def aks_arm():
+    azure_cli = "az.cmd" if os.name == "nt" else "az"
     result = subprocess.run(
-        ["az", "bicep", "build", "--file", "infra/modules/aks.bicep", "--stdout"],
+        [azure_cli, "bicep", "build", "--file", "infra/modules/aks.bicep", "--stdout"],
         capture_output=True,
         text=True,
     )

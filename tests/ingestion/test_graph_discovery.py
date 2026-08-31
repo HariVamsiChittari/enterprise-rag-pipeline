@@ -16,6 +16,7 @@ from ingestion.graph import (
     advance_discovery,
     discover_next_page,
     read_verified_acl,
+    validate_sharepoint_drive_site,
 )
 from ingestion.models import ScaleLimits
 
@@ -151,6 +152,118 @@ def test_read_verified_acl_returns_sorted_verified_security_groups() -> None:
     assert len(acl.acl_hash) == 64
     assert requests[0].endswith("/permissions")
     assert all("/content" not in path for path in requests)
+
+
+def test_read_verified_acl_combines_direct_and_site_group_security_groups() -> None:
+    direct_group_id = "11111111-1111-4111-8111-111111111111"
+    nested_group_id = "22222222-2222-4222-8222-222222222222"
+
+    def graph_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/permissions"):
+            return httpx.Response(200, json={"value": [
+                {
+                    "roles": ["write"],
+                    "grantedToV2": {"group": {"id": direct_group_id}},
+                },
+                {
+                    "roles": ["read"],
+                    "grantedToV2": {"siteGroup": {"id": "4"}},
+                },
+            ]})
+        group_id = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(
+            200, json={"id": group_id, "securityEnabled": True}
+        )
+
+    def sharepoint_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/_api/web/sitegroups(4)/users")
+        return httpx.Response(200, json={"value": [
+            {
+                "PrincipalType": 4,
+                "LoginName": f"c:0t.c|tenant|{nested_group_id}",
+            },
+            {
+                "PrincipalType": 1,
+                "LoginName": "i:0#.f|membership|user@contoso.com",
+            },
+        ]})
+
+    with (
+        httpx.Client(transport=httpx.MockTransport(graph_handler)) as graph_client,
+        httpx.Client(transport=httpx.MockTransport(sharepoint_handler)) as sp_client,
+    ):
+        acl = read_verified_acl(
+            graph_client,
+            "drive",
+            "item",
+            2,
+            sp_client=sp_client,
+            site_url="https://contoso.sharepoint.com/sites/docs",
+        )
+
+    assert acl.allowed_group_ids == (direct_group_id, nested_group_id)
+    assert len(acl.acl_hash) == 64
+
+
+def test_validate_sharepoint_drive_site_requires_drive_in_site_collection() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/drives"):
+            return httpx.Response(200, json={"value": [{
+                "id": "drive-id",
+                "driveType": "documentLibrary",
+            }]})
+        if "/sites/" in request.url.path:
+            return httpx.Response(200, json={
+                "id": "tenant.sharepoint.com,site,web",
+                "webUrl": "https://tenant.sharepoint.com/sites/site",
+            })
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        validate_sharepoint_drive_site(
+            client,
+            "drive-id",
+            "https://tenant.sharepoint.com/sites/site/",
+            2,
+        )
+
+
+def test_validate_sharepoint_drive_site_rejects_mismatched_site() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/drives"):
+            return httpx.Response(200, json={"value": [{
+                "id": "different-drive",
+                "driveType": "documentLibrary",
+            }]})
+        if "/sites/" in request.url.path:
+            return httpx.Response(200, json={
+                "id": "tenant.sharepoint.com,other-site,other-web",
+            })
+        raise AssertionError(f"unexpected request: {request.url}")
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(ValueError, match="does not own"):
+            validate_sharepoint_drive_site(
+                client,
+                "drive-id",
+                "https://tenant.sharepoint.com/sites/wrong",
+                2,
+            )
+
+
+@pytest.mark.parametrize(
+    "site_url",
+    [
+        "http://tenant.sharepoint.com/sites/site",
+        "https://user@tenant.sharepoint.com/sites/site",
+        "https://tenant.sharepoint.com:444/sites/site",
+        "https://tenant.sharepoint.com/sites/site?query=value",
+    ],
+)
+def test_validate_sharepoint_drive_site_rejects_unsafe_url(site_url: str) -> None:
+    with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(500))) as client:
+        with pytest.raises(ValueError, match="HTTPS site URL"):
+            validate_sharepoint_drive_site(client, "drive-id", site_url, 2)
 
 
 @pytest.mark.parametrize("permission", [

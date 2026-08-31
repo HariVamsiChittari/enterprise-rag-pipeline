@@ -3,9 +3,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from retrieval.auth import Principal
 from retrieval.cosmos import RetrievalMode, RetrievedChunk
 from retrieval.cosmos_registry import CosmosRegistry
+from retrieval.pipeline import RetrievalDependencyError
 from retrieval.service import RagService
 
 
@@ -65,6 +68,21 @@ def test_service_does_not_call_answer_model_without_evidence() -> None:
     assert client.chat.completions.create.call_count == 1
 
 
+def test_service_raises_dependency_error_when_every_retrieval_task_fails() -> None:
+    client = Mock()
+    client.chat.completions.create.return_value = completion('{"queries":["question"]}')
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    retriever = Mock()
+    retriever.retrieve.side_effect = RuntimeError("cosmos unavailable")
+
+    with pytest.raises(RetrievalDependencyError, match="retrieval_dependency_unavailable"):
+        RagService(client, _registry(retriever), "embedding", "chat").answer(
+            "question", Principal("user", "tenant", frozenset({"group"})),
+        )
+
+
 def test_full_text_mode_does_not_create_embedding() -> None:
     client = Mock()
     client.chat.completions.create.return_value = completion('{"queries":["question"]}')
@@ -100,11 +118,13 @@ def test_usage_is_tracked_for_embedding_and_generation_calls() -> None:
     )
 
     operations = {record["operation"] for record in result["usage"]}
-    assert operations == {"query_planning", "embedding", "answer_generation"}
+    assert operations == {"query_planning", "embedding", "retrieval_batch", "answer_generation"}
     embedding_record = next(r for r in result["usage"] if r["operation"] == "embedding")
+    retrieval_record = next(r for r in result["usage"] if r["operation"] == "retrieval_batch")
     assert embedding_record["prompt_tokens"] == 12
     assert embedding_record["model"] == "embedding"
     assert isinstance(embedding_record["latency_ms"], int)
+    assert retrieval_record["retrieval_mode"] == "hybrid"
 
 
 def test_usage_is_returned_even_without_evidence() -> None:
@@ -161,6 +181,9 @@ def test_slow_retrieval_query_is_dropped_after_timeout_budget() -> None:
     )
 
     assert [c["chunk_id"] for c in result["citations"]] == ["1"]
+    retrieval_record = next(r for r in result["usage"] if r["operation"] == "retrieval_batch")
+    assert retrieval_record["degraded"] is True
+    assert retrieval_record["timed_out"] == 1
 
 
 def test_plan_queries_returns_single_for_simple_question() -> None:
@@ -205,3 +228,587 @@ def test_plan_queries_uses_history_as_context() -> None:
     assert queries == ["standalone question"]
     call_content = client.chat.completions.create.call_args[1]["messages"][1]["content"]
     assert "history" in call_content
+
+
+from retrieval.cosmos import MAX_CANDIDATE_POOL_TOTAL
+from retrieval.scoring import (
+    FreshnessParameters,
+    ScoringFunction,
+    ScoringProfile,
+)
+from retrieval.service import UnknownScoringProfileError
+
+
+def _raw_candidate(chunk_id: str, *, source_modified_at: str | None = None) -> dict:
+    return {
+        "id": chunk_id,
+        "documentId": f"doc-{chunk_id}",
+        "sourceRunId": "run",
+        "content": f"content {chunk_id}",
+        "sourceName": f"{chunk_id}.pdf",
+        "sourceUrl": f"https://sp.com/{chunk_id}.pdf",
+        "pageStart": 1,
+        "sourceModifiedAt": source_modified_at,
+    }
+
+
+def test_service_omitting_scoring_profile_preserves_current_top_k_order() -> None:
+    """R14 regression guard: no scoring_profile → today's byte-compat path."""
+    client = Mock()
+    client.chat.completions.create.side_effect = [
+        completion('{"queries":["q"]}'),
+        completion("Answer [S1]."),
+    ]
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    retriever = Mock()
+    retriever.retrieve.return_value = [
+        RetrievedChunk("a", "doc1", "a", "a.pdf", "https://sp.com/a.pdf", 1),
+        RetrievedChunk("b", "doc2", "b", "b.pdf", "https://sp.com/b.pdf", 2),
+    ]
+
+    result = RagService(client, _registry(retriever), "embedding", "chat").answer(
+        "q", Principal("user", "tenant", frozenset({"group"}))
+    )
+
+    assert [c["chunk_id"] for c in result["citations"]] == ["a", "b"]
+    call_kwargs = retriever.retrieve.call_args.kwargs
+    assert call_kwargs["over_fetch_factor"] == 1
+    assert call_kwargs["raw"] is False
+
+
+def test_service_with_scoring_profile_uses_over_fetch_and_reranks_by_freshness() -> None:
+    from datetime import datetime, timezone
+
+    client = Mock()
+    client.chat.completions.create.side_effect = [
+        completion('{"queries":["q"]}'),
+        completion("Answer [S1]."),
+    ]
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+
+    older = _raw_candidate("old", source_modified_at="2020-01-01T00:00:00Z")
+    newer = _raw_candidate("new", source_modified_at="2024-01-01T00:00:00Z")
+
+    retriever = Mock()
+    retriever.retrieve.return_value = [older, newer]
+    retriever.to_chunks.return_value = [
+        RetrievedChunk("new", "doc-new", "content new", "new.pdf", "https://sp.com/new.pdf", 1, "2024-01-01T00:00:00Z"),
+        RetrievedChunk("old", "doc-old", "content old", "old.pdf", "https://sp.com/old.pdf", 1, "2020-01-01T00:00:00Z"),
+    ]
+
+    profile = ScoringProfile(
+        name="fresh",
+        functions=(
+            ScoringFunction(
+                type="freshness",
+                field_name="source_modified_at",
+                boost=10.0,
+                interpolation="linear",
+                freshness=FreshnessParameters(boosting_duration_seconds=365 * 86400),
+            ),
+        ),
+    )
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"fresh": profile},
+        over_fetch_factor=5,
+    )
+
+    result = service.answer(
+        "q", Principal("user", "tenant", frozenset({"group"})),
+        scoring_profile="fresh",
+    )
+
+    assert retriever.retrieve.call_args.kwargs["raw"] is True
+    assert retriever.retrieve.call_args.kwargs["over_fetch_factor"] == 1
+    assert retriever.retrieve.call_args.kwargs["top_k"] == 25
+    # First chunk after rerank must be the fresher one (whichever chunk_id the test
+    # asserts is a proxy for order preservation).
+    assert [c["chunk_id"] for c in result["citations"]] == ["new", "old"]
+
+
+def test_service_rejects_unknown_scoring_profile_name() -> None:
+    client = Mock()
+    client.chat.completions.create.return_value = completion('{"queries":["q"]}')
+    retriever = Mock()
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"fresh": ScoringProfile(name="fresh")},
+    )
+    with pytest.raises(UnknownScoringProfileError, match="unknown_scoring_profile"):
+        service.answer(
+            "q", Principal("user", "tenant", frozenset({"group"})),
+            scoring_profile="does-not-exist",
+        )
+
+
+def test_service_bounds_candidate_pool_across_sub_queries() -> None:
+    """R7 M4: the pool never exceeds MAX_CANDIDATE_POOL_TOTAL across all sub-queries."""
+    client = Mock()
+    client.chat.completions.create.side_effect = [
+        completion('{"queries":["a","b","c"]}'),
+        completion("Answer."),
+    ]
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+
+    def _return_many_raw(*_args, **_kwargs):
+        return [_raw_candidate(f"c-{i:03d}", source_modified_at="2024-01-01T00:00:00Z") for i in range(30)]
+
+    retriever = Mock()
+    retriever.retrieve.side_effect = _return_many_raw
+    retriever.to_chunks.side_effect = lambda pool: [
+        RetrievedChunk(item["id"], item["documentId"], item["content"], item["sourceName"], item["sourceUrl"], 1)
+        for item in pool
+    ]
+
+    profile = ScoringProfile(name="p")
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"p": profile}, over_fetch_factor=5,
+    )
+
+    result = service.answer(
+        "q", Principal("user", "tenant", frozenset({"group"})),
+        scoring_profile="p",
+    )
+
+    assert retriever.retrieve.call_count == 3
+    assert [call.kwargs["top_k"] for call in retriever.retrieve.call_args_list] == [9, 8, 8]
+    assert sum(call.kwargs["top_k"] for call in retriever.retrieve.call_args_list) == 25
+    assert all(call.kwargs["over_fetch_factor"] == 1 for call in retriever.retrieve.call_args_list)
+    assert len(result["citations"]) == 5
+
+
+def test_service_keeps_same_chunk_ordinal_from_different_documents() -> None:
+    client = Mock()
+    client.chat.completions.create.side_effect = [
+        completion('{"queries":["q"]}'),
+        completion("Answer [S1]."),
+    ]
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    first = _raw_candidate("chunk:000000")
+    first["documentId"] = "doc-a"
+    second = _raw_candidate("chunk:000000")
+    second["documentId"] = "doc-b"
+    retriever = Mock()
+    retriever.retrieve.return_value = [first, second]
+    retriever.to_chunks.side_effect = lambda pool: [
+        RetrievedChunk(
+            item["id"], item["documentId"], item["content"],
+            item["sourceName"], item["sourceUrl"], 1,
+        )
+        for item in pool
+    ]
+
+    result = RagService(
+        client,
+        _registry(retriever),
+        "embedding",
+        "chat",
+        scoring_profiles={"p": ScoringProfile(name="p")},
+    ).answer(
+        "q", Principal("user", "tenant", frozenset({"group"})), scoring_profile="p",
+    )
+
+    assert {citation["document_id"] for citation in result["citations"]} == {"doc-a", "doc-b"}
+
+
+def test_service_passes_rrf_weights_and_score_scope_from_config() -> None:
+    client = Mock()
+    client.chat.completions.create.side_effect = [
+        completion('{"queries":["q"]}'),
+        completion("Answer [S1]."),
+    ]
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    retriever = Mock()
+    retriever.retrieve.return_value = [
+        RetrievedChunk("a", "doc", "a", "a.pdf", "https://sp.com/a.pdf", 1),
+    ]
+
+    RagService(
+        client, _registry(retriever), "embedding", "chat",
+        full_text_score_scope="Local",
+        hybrid_rrf_weights=(3.0, 1.0),
+    ).answer("q", Principal("user", "tenant", frozenset({"group"})))
+
+    kwargs = retriever.retrieve.call_args.kwargs
+    assert kwargs["full_text_score_scope"] == "Local"
+    assert kwargs["rrf_weights"] == (3.0, 1.0)
+
+
+# --- Phase 2b: 3-level synonym enablement truth table ----------------------------
+
+from retrieval.synonyms import SynonymExpander, SynonymMap
+
+
+def _fresh_expander() -> SynonymExpander:
+    return SynonymExpander(SynonymMap.parse("geo", ["dog, puppy, canine"]))
+
+
+def _profile_with_synonym_map(name: str, map_name: str | None) -> ScoringProfile:
+    return ScoringProfile(name=name, synonym_map=map_name)
+
+
+def _make_retriever_for_profile_path() -> Mock:
+    """Retriever mock that returns raw-dict candidates AND supports to_chunks conversion."""
+    candidate = {
+        "id": "a", "documentId": "doc", "content": "a",
+        "sourceName": "a.pdf", "sourceUrl": "https://sp.com/a.pdf",
+        "pageStart": 1, "sourceModifiedAt": None,
+    }
+    retriever = Mock()
+    retriever.retrieve.return_value = [candidate]
+    retriever.to_chunks.side_effect = lambda pool: [
+        RetrievedChunk(c["id"], c["documentId"], c["content"], c["sourceName"], c["sourceUrl"], 1)
+        for c in pool
+    ]
+    return retriever
+
+
+# --- Phase 2 (2026): private evaluation seams ------------------------------------
+
+
+def test_retrieve_rankings_returns_reranked_chunks_without_answer_generation() -> None:
+    from datetime import datetime, timezone
+
+    older = _raw_candidate("old", source_modified_at="2020-01-01T00:00:00Z")
+    newer = _raw_candidate("new", source_modified_at="2024-01-01T00:00:00Z")
+
+    client = Mock()
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    retriever = Mock()
+    retriever.retrieve.return_value = [older, newer]
+    retriever.to_chunks.return_value = [
+        RetrievedChunk("new", "doc-new", "content new", "new.pdf", "https://sp.com/new.pdf", 1, "2024-01-01T00:00:00Z"),
+        RetrievedChunk("old", "doc-old", "content old", "old.pdf", "https://sp.com/old.pdf", 1, "2020-01-01T00:00:00Z"),
+    ]
+    profile = ScoringProfile(
+        name="fresh",
+        functions=(
+            ScoringFunction(
+                type="freshness",
+                field_name="source_modified_at",
+                boost=10.0,
+                interpolation="linear",
+                freshness=FreshnessParameters(boosting_duration_seconds=365 * 86400),
+            ),
+        ),
+    )
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"fresh": profile},
+    )
+
+    chunks = service.retrieve_rankings(
+        "q", ["q"], Principal("user", "tenant", frozenset({"group"})),
+        mode=RetrievalMode.HYBRID, scoring_profile="fresh",
+        evaluation_as_of=datetime(2025, 1, 1, tzinfo=timezone.utc),
+    )
+
+    assert client.chat.completions.create.call_count == 0
+    assert [chunk.chunk_id for chunk in chunks] == ["new", "old"]
+
+
+def test_retrieve_rankings_rejects_naive_evaluation_as_of() -> None:
+    from datetime import datetime
+
+    client = Mock()
+    retriever = Mock()
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"p": ScoringProfile(name="p")},
+    )
+    with pytest.raises(ValueError, match="timezone_aware"):
+        service.retrieve_rankings(
+            "q", ["q"], Principal("user", "tenant", frozenset({"group"})),
+            scoring_profile="p",
+            evaluation_as_of=datetime(2025, 1, 1),
+        )
+
+
+def test_retrieve_evaluation_pool_reuses_pool_across_multiple_profiles() -> None:
+    """REQ-12: one Cosmos fetch, multiple profiles + shared clock."""
+    from datetime import datetime, timezone
+
+    older = _raw_candidate("old", source_modified_at="2020-01-01T00:00:00Z")
+    newer = _raw_candidate("new", source_modified_at="2024-01-01T00:00:00Z")
+
+    client = Mock()
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    retriever = Mock()
+    retriever.retrieve.return_value = [older, newer]
+    retriever.to_chunks.side_effect = lambda pool: [
+        RetrievedChunk(
+            item["id"], item["documentId"], item["content"],
+            item["sourceName"], item["sourceUrl"], 1,
+            item.get("sourceModifiedAt"),
+        )
+        for item in pool
+    ]
+
+    baseline = ScoringProfile(
+        name="baseline",
+        functions=(
+            ScoringFunction(
+                type="freshness", field_name="source_modified_at",
+                boost=10.0, interpolation="linear",
+                freshness=FreshnessParameters(boosting_duration_seconds=10 * 365 * 86400),
+            ),
+        ),
+        function_aggregation="sum",
+    )
+    candidate_profile = ScoringProfile(
+        name="candidate",
+        functions=(
+            ScoringFunction(
+                type="freshness", field_name="source_modified_at",
+                boost=10.0, interpolation="linear",
+                freshness=FreshnessParameters(boosting_duration_seconds=10 * 365 * 86400),
+            ),
+        ),
+        function_aggregation="maximum",
+    )
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"baseline": baseline, "candidate": candidate_profile},
+    )
+
+    pool = service.retrieve_evaluation_pool(
+        "q", ["q"], Principal("user", "tenant", frozenset({"group"})),
+        scoring_profile="baseline",
+    )
+    now = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    baseline_chunks = pool.rerank(now)
+    candidate_chunks = pool.rerank(now, override_profile=candidate_profile)
+
+    # Cosmos was queried exactly once for the entire evaluation.
+    assert retriever.retrieve.call_count == 1
+    assert [chunk.chunk_id for chunk in baseline_chunks] == ["new", "old"]
+    assert [chunk.chunk_id for chunk in candidate_chunks] == ["new", "old"]
+
+
+def test_retrieve_evaluation_pool_requires_explicit_profile_name() -> None:
+    client = Mock()
+    retriever = Mock()
+    service = RagService(client, _registry(retriever), "embedding", "chat")
+    with pytest.raises(UnknownScoringProfileError):
+        service.retrieve_evaluation_pool(
+            "q", ["q"], Principal("user", "tenant", frozenset({"group"})),
+            scoring_profile="not-configured",
+        )
+
+
+def test_retrieve_evaluation_pool_fails_closed_when_all_retrievals_fail() -> None:
+    """Evaluation must preserve production RetrievalDependencyError semantics."""
+    from datetime import datetime, timezone
+
+    client = Mock()
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    retriever = Mock()
+    retriever.retrieve.side_effect = RuntimeError("cosmos_unavailable")
+    profile = ScoringProfile(name="p")
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"p": profile},
+    )
+    with pytest.raises(RetrievalDependencyError):
+        service.retrieve_evaluation_pool(
+            "q", ["q"], Principal("user", "tenant", frozenset({"group"})),
+            scoring_profile="p",
+        )
+
+
+def test_retrieve_evaluation_pool_passes_acl_ids_unchanged() -> None:
+    """Evaluation must forward the caller's ACL identities to the retriever."""
+    client = Mock()
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    retriever = Mock()
+    retriever.retrieve.return_value = [_raw_candidate("only")]
+    profile = ScoringProfile(name="p")
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"p": profile},
+    )
+    principal = Principal("user", "tenant", frozenset({"g1", "g2", "g3"}))
+    service.retrieve_evaluation_pool(
+        "q", ["q"], principal, scoring_profile="p",
+    )
+    assert retriever.retrieve.call_count == 1
+    acl_ids = retriever.retrieve.call_args.args[2]
+    assert sorted(acl_ids) == ["g1", "g2", "g3"]
+
+
+def test_evaluation_pool_snapshot_is_independent_of_source_mutations() -> None:
+    """Deep-copied snapshot must isolate the pool from later Cosmos response edits."""
+    from datetime import datetime, timezone
+
+    client = Mock()
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    fresh = _raw_candidate("only", source_modified_at="2024-01-01T00:00:00Z")
+    # Give the candidate a nested list so we can detect shared references.
+    fresh["sectionPath"] = ["Header"]
+    retriever = Mock()
+    retriever.retrieve.return_value = [fresh]
+    retriever.to_chunks.side_effect = lambda pool: [
+        RetrievedChunk(
+            item["id"], item["documentId"], item["content"],
+            item["sourceName"], item["sourceUrl"], 1,
+            item.get("sourceModifiedAt"),
+        )
+        for item in pool
+    ]
+    profile = ScoringProfile(name="p")
+    service = RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles={"p": profile},
+    )
+    pool = service.retrieve_evaluation_pool(
+        "q", ["q"], Principal("u", "t", frozenset({"g"})),
+        scoring_profile="p",
+    )
+    # Mutating the retriever's returned list post-fetch must not affect the pool.
+    fresh["sectionPath"].append("Injected")
+    fresh["content"] = "REPLACED"
+
+    reranked = pool.rerank(datetime(2025, 1, 1, tzinfo=timezone.utc))
+    assert [chunk.chunk_id for chunk in reranked] == ["only"]
+    # The snapshot preserved the original nested list and content.
+    assert pool.pool[0]["sectionPath"] == ["Header"]
+    assert pool.pool[0]["content"] != "REPLACED"
+
+
+def _service_with_expander(
+    retriever,
+    client,
+    *,
+    profile: ScoringProfile | None = None,
+    synonyms_enabled: bool = True,
+    map_registered: bool = True,
+) -> RagService:
+    profiles = {profile.name: profile} if profile else {}
+    expanders = {"geo": _fresh_expander()} if map_registered else {}
+    return RagService(
+        client, _registry(retriever), "embedding", "chat",
+        scoring_profiles=profiles,
+        synonym_expanders=expanders,
+        synonyms_enabled=synonyms_enabled,
+    )
+
+
+def _mock_openai(retriever_returns) -> Mock:
+    client = Mock()
+    client.chat.completions.create.side_effect = [
+        completion('{"queries":["dog policy"]}'),
+        completion("Answer [S1]."),
+    ]
+    client.embeddings.create.return_value = SimpleNamespace(
+        data=[SimpleNamespace(embedding=[0.0] * 3072)]
+    )
+    return client
+
+
+def test_synonym_disabled_at_deploy_never_calls_expander() -> None:
+    retriever = _make_retriever_for_profile_path()
+    client = _mock_openai(retriever.retrieve.return_value)
+
+    profile = _profile_with_synonym_map("p", "geo")
+    _service_with_expander(
+        retriever, client, profile=profile, synonyms_enabled=False,
+    ).answer(
+        "dog policy",
+        Principal("u", "t", frozenset({"g"})),
+        scoring_profile="p",
+        expand_synonyms=True,
+    )
+
+    assert retriever.retrieve.call_args.kwargs.get("search_terms") is None
+
+
+def test_synonym_enabled_and_profile_map_but_no_request_flag_expands() -> None:
+    retriever = _make_retriever_for_profile_path()
+    client = _mock_openai(retriever.retrieve.return_value)
+
+    profile = _profile_with_synonym_map("p", "geo")
+    _service_with_expander(
+        retriever, client, profile=profile,
+    ).answer(
+        "dog policy",
+        Principal("u", "t", frozenset({"g"})),
+        scoring_profile="p",
+    )
+
+    terms = retriever.retrieve.call_args.kwargs.get("search_terms")
+    assert terms is not None
+    assert "dog policy" in terms
+    assert "puppy policy" in terms
+
+
+def test_synonym_request_false_overrides_profile_default() -> None:
+    retriever = _make_retriever_for_profile_path()
+    client = _mock_openai(retriever.retrieve.return_value)
+
+    profile = _profile_with_synonym_map("p", "geo")
+    _service_with_expander(
+        retriever, client, profile=profile,
+    ).answer(
+        "dog policy",
+        Principal("u", "t", frozenset({"g"})),
+        scoring_profile="p",
+        expand_synonyms=False,
+    )
+
+    assert retriever.retrieve.call_args.kwargs.get("search_terms") is None
+
+
+def test_synonym_request_true_without_profile_map_is_noop() -> None:
+    retriever = _make_retriever_for_profile_path()
+    client = _mock_openai(retriever.retrieve.return_value)
+
+    profile = _profile_with_synonym_map("p", None)
+    _service_with_expander(
+        retriever, client, profile=profile,
+    ).answer(
+        "dog policy",
+        Principal("u", "t", frozenset({"g"})),
+        scoring_profile="p",
+        expand_synonyms=True,
+    )
+
+    assert retriever.retrieve.call_args.kwargs.get("search_terms") is None
+
+
+def test_synonym_omitted_scoring_profile_preserves_byte_compat_path() -> None:
+    retriever = Mock()
+    retriever.retrieve.return_value = [
+        RetrievedChunk("a", "doc", "a", "a.pdf", "https://sp.com/a.pdf", 1),
+    ]
+    client = _mock_openai(retriever.retrieve.return_value)
+
+    _service_with_expander(
+        retriever, client, profile=None,
+    ).answer(
+        "dog policy",
+        Principal("u", "t", frozenset({"g"})),
+    )
+
+    assert retriever.retrieve.call_args.kwargs.get("search_terms") is None

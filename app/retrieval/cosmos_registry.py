@@ -30,16 +30,28 @@ class CosmosInstanceConfig:
 class CosmosRegistry:
     """source_id -> SecureCosmosRetriever, for RagService's per-instance fan-out."""
 
-    def __init__(self, retrievers: dict[str, SecureCosmosRetriever]) -> None:
+    def __init__(
+        self,
+        retrievers: dict[str, SecureCosmosRetriever],
+        *,
+        clients: tuple[Any, ...] = (),
+    ) -> None:
         if not retrievers:
             raise ValueError("registry must contain at least one Cosmos instance")
         self._retrievers = dict(retrievers)
+        self._clients = clients
 
     def items(self) -> list[tuple[str, SecureCosmosRetriever]]:
         return list(self._retrievers.items())
 
     def __len__(self) -> int:
         return len(self._retrievers)
+
+    def close(self) -> None:
+        for client in self._clients:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
 
 
 def load_cosmos_instance_configs(
@@ -51,7 +63,7 @@ def load_cosmos_instance_configs(
     default_manifests_container: str,
 ) -> tuple[CosmosInstanceConfig, ...]:
     """Parse COSMOS_REGISTRY_JSON if set (a JSON array of instance entries), else fall
-    back to a single instance built from the caller's default (legacy) values."""
+    back to a single instance built from the caller's default values."""
     raw = os.getenv("COSMOS_REGISTRY_JSON", "").strip()
     if not raw:
         return (
@@ -94,15 +106,17 @@ def build_cosmos_registry(
     acl_enabled: bool = True,
 ) -> CosmosRegistry:
     retrievers: dict[str, SecureCosmosRetriever] = {}
+    clients: list[CosmosClient] = []
     for instance in instance_configs:
         cosmos = CosmosClient(url=instance.endpoint, credential=credential)
+        clients.append(cosmos)
         db = cosmos.get_database_client(instance.database)
         retrievers[instance.source_id] = SecureCosmosRetriever(
             db.get_container_client(instance.chunks_container),
             db.get_container_client(instance.manifests_container),
             acl_enabled=acl_enabled,
         )
-    return CosmosRegistry(retrievers)
+    return CosmosRegistry(retrievers, clients=tuple(clients))
 
 
 def _require_str(entry: dict[str, Any], key: str) -> str:

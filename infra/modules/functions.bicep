@@ -88,6 +88,14 @@ param sharePointCertificateSecretName string
 @description('Microsoft Entra application client ID protecting operator endpoints')
 param adminApiClientId string
 
+@description('Function API audience required in delegated user tokens')
+@minLength(1)
+param functionApiAudience string
+
+@description('Managed-identity scope for the retrieval API')
+@minLength(1)
+param retrievalServiceScope string
+
 @description('NCRONTAB schedule for the reconciliation timer (daily safety-net delta query; webhooks are the primary trigger)')
 param deltaSyncSchedule string = '0 0 4 * * *'
 
@@ -99,6 +107,14 @@ param aclResyncSchedule string = '0 0 3 * * 0'
 @maxValue(100)
 param aclResyncPageSize int = 50
 
+@description('NCRONTAB schedule for persisted lifecycle reconciliation')
+param lifecycleReconcileSchedule string = '0 */10 * * * *'
+
+@description('Page size for each lifecycle reconciliation activity')
+@minValue(1)
+@maxValue(100)
+param lifecycleReconcilePageSize int = 50
+
 @description('Internal URL of the retrieval service for query proxy')
 param retrievalServiceUrl string = ''
 
@@ -109,11 +125,13 @@ param webhookClientState string
 @description('NCRONTAB schedule for Graph subscription renewal')
 param subscriptionRenewSchedule string = '0 0 2 * * *'
 
-@description('SharePoint site URL for site group ACL resolution via REST API (empty disables site group resolution)')
-param sharePointSiteUrl string = ''
+@description('SharePoint site URL for site group ACL resolution via REST API')
+@minLength(1)
+param sharePointSiteUrl string
 
-@description('Entra app client IDs allowed to call the API. Empty array = any tenant app (dev default). Populate to restrict which callers can obtain tokens for this audience.')
-param allowedApplicationClientIds array = []
+@description('Entra app client IDs allowed to call the Function API')
+@minLength(1)
+param allowedApplicationClientIds array
 
 @description('Resource tags')
 param tags object = {}
@@ -192,6 +210,22 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         {
           name: 'AZURE_CLIENT_ID'
           value: managedIdentityClientId
+        }
+        {
+          name: 'MANAGED_IDENTITY_CLIENT_ID'
+          value: managedIdentityClientId
+        }
+        {
+          name: 'TENANT_ID'
+          value: entraTenantId
+        }
+        {
+          name: 'FUNCTION_API_AUDIENCE'
+          value: functionApiAudience
+        }
+        {
+          name: 'RETRIEVAL_SERVICE_SCOPE'
+          value: retrievalServiceScope
         }
         {
           name: 'COSMOS_ENDPOINT'
@@ -280,6 +314,14 @@ resource functionApp 'Microsoft.Web/sites@2025-03-01' = {
         {
           name: 'ACL_RESYNC_PAGE_SIZE'
           value: string(aclResyncPageSize)
+        }
+        {
+          name: 'LIFECYCLE_RECONCILE_SCHEDULE'
+          value: lifecycleReconcileSchedule
+        }
+        {
+          name: 'LIFECYCLE_RECONCILE_PAGE_SIZE'
+          value: string(lifecycleReconcilePageSize)
         }
         {
           name: 'CHUNK_MAX_TOKENS'
@@ -399,11 +441,10 @@ resource authSettings 'Microsoft.Web/sites/config@2025-03-01' = {
         }
         validation: {
           allowedAudiences: [
-            'api://${adminApiClientId}'
+            functionApiAudience
           ]
           defaultAuthorizationPolicy: {
             allowedApplications: allowedApplicationClientIds
-            allowedPrincipals: {}
           }
         }
       }

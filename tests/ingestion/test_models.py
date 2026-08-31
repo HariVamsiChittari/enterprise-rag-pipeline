@@ -175,6 +175,25 @@ def test_chunk_record_separates_original_and_embedding_text() -> None:
         "keyPhrases": "succeeded",
         "entities": "succeeded",
     }
+    assert item["isRetrievable"] is False
+    assert item["lifecycleGeneration"] == 0
+
+
+def test_lifecycle_admission_fields_are_strict() -> None:
+    document = document_values()
+    document["lifecycle_generation"] = True
+    with pytest.raises(ValueError, match="lifecycle_generation"):
+        SourceDocumentRecord(**document)
+
+    chunk = chunk_values()
+    chunk["is_retrievable"] = "true"
+    with pytest.raises(ValueError, match="is_retrievable"):
+        SearchChunkRecord(**chunk)
+
+    chunk = chunk_values()
+    chunk["lifecycle_generation"] = -1
+    with pytest.raises(ValueError, match="lifecycle_generation"):
+        SearchChunkRecord(**chunk)
 
 
 
@@ -279,3 +298,33 @@ def chunk_values() -> dict[str, object]:
         "id": create_chunk_id(0),
         "source_run_id": create_source_run_id("source", "run-a"),
     }
+
+
+def test_document_and_chunk_accept_source_modified_at_optional() -> None:
+    doc_values = document_values()
+    doc_values["source_modified_at"] = "2024-05-01T00:00:00Z"
+    record = SourceDocumentRecord(**doc_values)
+    assert record.to_cosmos_item()["sourceModifiedAt"] == "2024-05-01T00:00:00Z"
+
+    chunk = chunk_values()
+    chunk["source_modified_at"] = "2024-05-01T00:00:00Z"
+    chunk_record = SearchChunkRecord(**chunk)
+    assert chunk_record.to_cosmos_item()["sourceModifiedAt"] == "2024-05-01T00:00:00Z"
+
+
+def test_document_source_modified_at_defaults_to_none_and_serializes_as_null() -> None:
+    doc = SourceDocumentRecord(**document_values())
+    assert doc.source_modified_at is None
+    assert doc.to_cosmos_item()["sourceModifiedAt"] is None
+
+
+def test_source_modified_at_must_be_utc_when_present() -> None:
+    doc_values = document_values()
+    doc_values["source_modified_at"] = "2024-05-01T00:00:00+05:00"
+    with pytest.raises(ValueError, match="UTC"):
+        SourceDocumentRecord(**doc_values)
+
+    chunk = chunk_values()
+    chunk["source_modified_at"] = "not-a-timestamp"
+    with pytest.raises(ValueError, match="ISO-8601"):
+        SearchChunkRecord(**chunk)

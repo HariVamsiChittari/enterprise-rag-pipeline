@@ -4,26 +4,35 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Annotated, Any, Callable, Awaitable
+from datetime import datetime
+from typing import Annotated, Any
 
-from retrieval.cosmos import RetrievalMode, RetrievedChunk, SecureCosmosRetriever
-from retrieval.cosmos_registry import CosmosRegistry
-from retrieval.service import _sanitize_chunk
+from retrieval.auth import Principal
+from retrieval.cosmos import RetrievalMode, RetrievedChunk
+from retrieval.pipeline import (
+    citation_label,
+    evidence_identity,
+)
+from retrieval.service import RagService, _sanitize_chunk
 
 
 def make_search_tool(
-    registry: CosmosRegistry,
-    embed_fn: Callable[[str], Awaitable[list[float]]],
-    acl_ids: list[str],
+    rag_service: RagService,
+    principal: Principal,
     retrieved_chunks: list[RetrievedChunk],
     *,
-    acl_enabled: bool = True,
     usage: list[dict[str, Any]] | None = None,
+    scoring_profile: str | None = None,
+    max_evidence: int = 5,
+    expand_synonyms: bool | None = None,
+    forced_mode: RetrievalMode | None = None,
+    now: datetime | None = None,
+    deadline_monotonic: float | None = None,
 ):
     """Create a search tool closure bound to the caller's ACL.
 
-    Fans out retrieval across all registered Cosmos instances and deduplicates.
-    Retrieved chunks are appended to `retrieved_chunks` for citation extraction.
+    RagService owns retrieval behavior. This adapter only applies the agent's cumulative
+    evidence cap, stable citation labels, usage forwarding, and tool-text formatting.
     """
 
     async def search_knowledge_base(
@@ -36,63 +45,71 @@ def make_search_tool(
         when the user asks a factual question that requires grounding from
         indexed documents.
         """
-        retrieval_mode = RetrievalMode(mode) if mode in RetrievalMode.__members__.values() else RetrievalMode.HYBRID
-        embedding: list[float] = []
-        if retrieval_mode in {RetrievalMode.HYBRID, RetrievalMode.VECTOR}:
-            embedding = await embed_fn(query)
-
-        # Timing excludes embed (tracked separately in caller)
-        tool_start = time.perf_counter()
-
-        async def _retrieve_from(retriever: SecureCosmosRetriever) -> list[RetrievedChunk]:
-            return await asyncio.to_thread(
-                retriever.retrieve,
-                query_text=query,
-                embedding=embedding,
-                principal_ids=acl_ids if acl_enabled else [],
-                mode=retrieval_mode,
-                top_k=5,
-            )
-
-        results = await asyncio.gather(
-            *(_retrieve_from(r) for _sid, r in registry.items()),
-            return_exceptions=True,
+        retrieval_mode = forced_mode or (
+            RetrievalMode(mode) if mode in RetrievalMode.__members__.values() else RetrievalMode.HYBRID
         )
-
-        seen: set[str] = set()
-        chunks: list[RetrievedChunk] = []
-        for result in results:
-            if isinstance(result, BaseException):
+        tool_start = time.perf_counter()
+        remaining = (
+            deadline_monotonic - time.monotonic()
+            if deadline_monotonic is not None
+            else None
+        )
+        if remaining is not None and remaining <= 0:
+            raise asyncio.TimeoutError("agent retrieval deadline exceeded")
+        operation = asyncio.to_thread(
+            rag_service.search,
+            query,
+            [query],
+            principal,
+            mode=retrieval_mode,
+            top_k=max_evidence,
+            scoring_profile=scoring_profile,
+            expand_synonyms=expand_synonyms,
+            now=now,
+        )
+        result = (
+            await asyncio.wait_for(operation, timeout=remaining)
+            if remaining is not None
+            else await operation
+        )
+        chunks = list(result.chunks)
+        existing = {
+            evidence_identity(chunk): index
+            for index, chunk in enumerate(retrieved_chunks, start=1)
+        }
+        labeled_chunks: list[tuple[str, RetrievedChunk]] = []
+        for chunk in chunks:
+            identity = evidence_identity(chunk)
+            if identity in existing:
+                labeled_chunks.append((citation_label(existing[identity]), chunk))
                 continue
-            for chunk in result:
-                if chunk.chunk_id not in seen:
-                    seen.add(chunk.chunk_id)
-                    chunks.append(chunk)
-                    if len(chunks) == 5:
-                        break
-            if len(chunks) == 5:
-                break
-
-        retrieved_chunks.extend(chunks)
+            if len(retrieved_chunks) >= max_evidence:
+                continue
+            retrieved_chunks.append(chunk)
+            index = len(retrieved_chunks)
+            existing[identity] = index
+            labeled_chunks.append((citation_label(index), chunk))
 
         if usage is not None:
+            usage.extend(result.usage)
             usage.append({
                 "operation": "tool_invocation",
                 "tool": "search_knowledge_base",
+                "retrieval_mode": retrieval_mode.value,
                 "model": None,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
-                "query": query[:200],
                 "chunks_returned": len(chunks),
+                "scoring_profile": scoring_profile,
                 "latency_ms": int((time.perf_counter() - tool_start) * 1000),
             })
 
-        if not chunks:
+        if not labeled_chunks:
             return "No authorized documents found matching this query."
 
         return "\n\n".join(
-            f"[Source {i}] {chunk.source_name}, page {chunk.page_number} ({chunk.source_url})\n{_sanitize_chunk(chunk.content)}"
-            for i, chunk in enumerate(chunks, start=1)
+            f"{label} {chunk.source_name}, page {chunk.page_number} ({chunk.source_url})\n{_sanitize_chunk(chunk.content)}"
+            for label, chunk in labeled_chunks
         )
 
     return search_knowledge_base

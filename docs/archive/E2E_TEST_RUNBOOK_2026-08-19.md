@@ -1,14 +1,14 @@
 # E2E Test Runbook — Full Sync, Delta-Sync, Webhooks, ACL & Retrieval
 
-Executed 2026-08-19 against `rag-dev-func-apniu6o4` in `rg-rag-project` (eastus2).
+Executed 2026-08-19 against a non-production Function App in eastus2. Concrete deployment identifiers have been removed from this archived record.
 
 ## Variables
 
 ```powershell
-$funcApp   = "rag-dev-func-apniu6o4"
+$funcApp   = "<function-app-name>"
 $base      = "https://$funcApp.azurewebsites.net"
-$masterKey = az functionapp keys list --name $funcApp --resource-group rg-rag-project --query "masterKey" -o tsv
-$token     = az account get-access-token --resource "api://f6a39f07-5d1d-4e83-936c-28d0fed0e3fe" --query accessToken -o tsv
+$masterKey = az functionapp keys list --name $funcApp --resource-group <resource-group> --query "masterKey" -o tsv
+$token     = az account get-access-token --resource "api://<function-api-client-id>" --query accessToken -o tsv
 $authH     = @{Authorization = "Bearer $token"}
 ```
 
@@ -70,7 +70,7 @@ $r.rows | Where-Object { $_.id -eq "webhook-subscription" } | ConvertTo-Json -De
 {
   "id": "webhook-subscription",
   "sourceId": "sharepoint-drive",
-  "subscriptionId": "145a220f-b9f7-4ba7-a81c-a33ad2f2fe26",
+  "subscriptionId": "<graph-subscription-id>",
   "updatedAt": "2026-08-18T15:12:41Z"
 }
 ```
@@ -204,7 +204,7 @@ $r.rows | Where-Object { $_.sourceName -like "*V1*" } `
 
 **Confirmed via App Insights:**
 ```powershell
-az monitor app-insights query --app rag-dev-ai --resource-group rg-rag-project `
+az monitor app-insights query --app <application-insights-name> --resource-group <resource-group> `
   --analytics-query "traces | where timestamp between(datetime('2026-08-19T11:59:00Z') .. datetime('2026-08-19T12:01:00Z')) and message contains 'delta_sync_completed' | project timestamp, message"
 ```
 
@@ -218,7 +218,7 @@ az monitor app-insights query --app rag-dev-ai --resource-group rg-rag-project `
 
 ## D5: Permission Change → ACL Resynced
 
-**SharePoint action:** Remove Entra SG `ba671fcb-7eb5-489a-83b4-c61b95199ee0` from the library's direct permissions.
+**SharePoint action:** Remove Entra SG `<revoked-security-group-id>` from the library's direct permissions.
 
 **Trigger (ACL resync timer — safety-net that queries permissions directly):**
 ```powershell
@@ -254,8 +254,8 @@ Write-Host "ACL hash:   $($doc.aclHash)"
 ```
 
 ```
-Before: ACL groups: 4eac97d2-01ac-459e-a77e-709751964243, ba671fcb-7eb5-489a-83b4-c61b95199ee0
-After:  ACL groups: 4eac97d2-01ac-459e-a77e-709751964243
+Before: ACL groups: <remaining-security-group-id>, <revoked-security-group-id>
+After:  ACL groups: <remaining-security-group-id>
 ```
 
 > **Note:** Both **direct Entra SG grants** and **Entra SGs nested inside SharePoint site groups** are tracked. Site group members are resolved via the SharePoint REST API (`/_api/web/sitegroups({id})/users`) when `SHAREPOINT_SITE_URL` is configured. Permission-only changes (no content change) are caught by the auto ACL resync that runs whenever a webhook fires with zero content changes. The `acl_resync_timer` (weekly Sunday 03:00 UTC) is a secondary safety net for edge cases.
@@ -305,7 +305,7 @@ StatusCode
 ## W4: Duplicate Webhook → Idempotent
 
 ```powershell
-$cs = az functionapp config appsettings list --name $funcApp --resource-group rg-rag-project `
+$cs = az functionapp config appsettings list --name $funcApp --resource-group <resource-group> `
   --query "[?name=='WEBHOOK_CLIENT_STATE'].value" -o tsv
 $body = '{"value":[{"clientState":"' + $cs + '","resource":"drives/b!.../root","changeType":"updated"}]}'
 
@@ -338,7 +338,7 @@ Invoke-WebRequest `
 
 **App Insights confirmed:**
 ```
-subscription_renewed: 145a220f-b9f7-4ba7-a81c-a33ad2f2fe26 expires 2026-09-16T23:16:57Z
+subscription_renewed: <graph-subscription-id> expires 2026-09-16T23:16:57Z
 ```
 
 ---
@@ -383,7 +383,7 @@ No pending changes missed by webhooks.
 
 **Root cause:** Graph returned 410 on the stored cursor AND on both reset-location URLs. The code only handled one level of 410 reset.
 
-**Fix 1 — Double-410 handler** ([graph.py#L448-L458](../app/ingestion/graph.py)):
+**Fix 1 — Double-410 handler** ([graph.py#L448-L458](../../app/ingestion/graph.py)):
 ```python
 except DeltaResetRequired as reset:
     if not allow_reset:
@@ -395,7 +395,7 @@ except DeltaResetRequired as reset:
     is_reset = True
 ```
 
-**Fix 2 — Catch-all re-bootstrap** ([services.py#L371-L376](../app/ingestion/services.py)):
+**Fix 2 — Catch-all re-bootstrap** ([services.py#L371-L376](../../app/ingestion/services.py)):
 ```python
 try:
     delta = connector.read_drive_delta(config.delta_max_pages, delta_link=cursor)
@@ -412,7 +412,7 @@ except DeltaResetRequired:
 
 **Root cause:** `bootstrap_delta_cursor()` did not send `Prefer: deltashowremovedasdeleted, deltatraversepermissiongaps, deltashowsharingchanges` headers. The token obtained without these headers was incompatible with delta reads that included them.
 
-**Fix** ([graph.py#L516](../app/ingestion/graph.py)):
+**Fix** ([graph.py#L516](../../app/ingestion/graph.py)):
 ```python
 # Before:
 response = client.get(url)

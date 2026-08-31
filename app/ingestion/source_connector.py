@@ -25,6 +25,7 @@ from ingestion.graph import (
     discover_next_page,
     download_content_sync,
     read_drive_delta,
+    read_drive_item,
     read_verified_acl,
 )
 
@@ -40,6 +41,8 @@ class SourceConnector(Protocol):
     ) -> DiscoveryStep: ...
 
     def read_verified_acl(self, item_id: str, max_pages: int) -> VerifiedAcl: ...
+
+    def read_item(self, item_id: str) -> dict | None: ...
 
     def download_content_sync(self, item_id: str, max_bytes: int, timeout_seconds: float) -> bytes: ...
 
@@ -67,6 +70,9 @@ class SharePointConnector:
 
     def read_verified_acl(self, item_id: str, max_pages: int) -> VerifiedAcl:
         return read_verified_acl(self.client, self.drive_id, item_id, max_pages, sp_client=self.sp_client, site_url=self.site_url)
+
+    def read_item(self, item_id: str) -> dict | None:
+        return read_drive_item(self.client, self.drive_id, item_id)
 
     def download_content_sync(self, item_id: str, max_bytes: int, timeout_seconds: float) -> bytes:
         return download_content_sync(self.client, self.drive_id, item_id, max_bytes, timeout_seconds)

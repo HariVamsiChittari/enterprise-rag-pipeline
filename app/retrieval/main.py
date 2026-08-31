@@ -8,8 +8,8 @@ import os
 import time
 import threading
 import uuid
-from contextlib import asynccontextmanager
-from dataclasses import asdict
+from contextlib import ExitStack, asynccontextmanager
+from dataclasses import asdict, replace
 from typing import Any
 
 import httpx
@@ -17,19 +17,30 @@ import structlog
 from azure.cosmos import CosmosClient
 from azure.identity import ManagedIdentityCredential
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from openai import AzureOpenAI
 from pydantic import BaseModel, Field
 
 from retrieval.auth import (
     AuthorizationError,
+    GATEWAY_CONTEXT_HEADER,
+    GATEWAY_REQUEST_ID_HEADER,
     GraphGroupResolver,
     Principal,
-    principal_from_easy_auth,
+    principal_from_gateway,
+    parse_gateway_request_id,
 )
+from retrieval.catalog import CatalogError, CosmosCatalogLoader
 from retrieval.config import RetrievalConfig, load_retrieval_config
+from retrieval.config_loader import (
+    redact_catalog,
+)
 from retrieval.cosmos import RetrievalMode, RetrievedChunk
 from retrieval.cosmos_registry import CosmosRegistry, build_cosmos_registry, load_cosmos_instance_configs
-from retrieval.service import RagService
+from retrieval.pipeline import RetrievalDependencyError, citation_label
+from retrieval.service import RagService, UnknownScoringProfileError
+from retrieval.synonyms import SynonymExpander
 from retrieval.telemetry import write_audit_records
 
 try:
@@ -64,6 +75,9 @@ class _AppState:
     group_resolver: GraphGroupResolver
     audit_container: Any
     agent_chat_client: Any
+    scoring_profiles: dict[str, Any]
+    synonym_expanders: dict[str, SynonymExpander]
+    catalog_version: str | None
 
 
 _state = _AppState()
@@ -91,84 +105,243 @@ def _configure_tracing(config: RetrievalConfig) -> None:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    config = load_retrieval_config()
-    _configure_tracing(config)
-    credential = ManagedIdentityCredential(client_id=config.managed_identity_client_id)
+    resources = ExitStack()
+    try:
+        config = load_retrieval_config()
+        _configure_tracing(config)
+        credential = ManagedIdentityCredential(client_id=config.managed_identity_client_id)
+        resources.callback(_close_resource, credential)
 
-    instance_configs = load_cosmos_instance_configs(
-        default_source_id=os.getenv("INGESTION_SOURCE_ID", "default"),
-        default_endpoint=config.cosmos_endpoint,
-        default_database=config.cosmos_database,
-        default_chunks_container=config.cosmos_chunks_container,
-        default_manifests_container=config.cosmos_manifests_container,
-    )
-    registry = build_cosmos_registry(instance_configs, credential, acl_enabled=config.acl_enabled)
+        instance_configs = load_cosmos_instance_configs(
+            default_source_id=os.getenv("INGESTION_SOURCE_ID", "default"),
+            default_endpoint=config.cosmos_endpoint,
+            default_database=config.cosmos_database,
+            default_chunks_container=config.cosmos_chunks_container,
+            default_manifests_container=config.cosmos_manifests_container,
+        )
+        registry = build_cosmos_registry(instance_configs, credential, acl_enabled=config.acl_enabled)
+        resources.callback(_close_resource, registry)
 
-    cosmos = CosmosClient(url=config.cosmos_endpoint, credential=credential)
-    db = cosmos.get_database_client(config.cosmos_database)
-    audit_container = db.get_container_client(config.cosmos_audit_container)
+        cosmos = CosmosClient(url=config.cosmos_endpoint, credential=credential)
+        resources.callback(_close_resource, cosmos)
+        db = cosmos.get_database_client(config.cosmos_database)
+        audit_container = db.get_container_client(config.cosmos_audit_container)
 
-    _state.config = config
-    _state.credential = credential
-    _state.registry = registry
-    _state.audit_container = audit_container
+        _state.credential = credential
+        _state.registry = registry
+        _state.audit_container = audit_container
 
-    def _openai_token_provider() -> str:
-        return credential.get_token("https://cognitiveservices.azure.com/.default").token
+        def _openai_token_provider() -> str:
+            return credential.get_token("https://cognitiveservices.azure.com/.default").token
 
-    _state.openai_client = AzureOpenAI(
-        azure_endpoint=config.openai_endpoint,
-        azure_ad_token_provider=_openai_token_provider,
-        api_version=config.openai_api_version,
-        max_retries=2,
-    )
+        _state.openai_client = AzureOpenAI(
+            azure_endpoint=config.openai_endpoint,
+            azure_ad_token_provider=_openai_token_provider,
+            api_version=config.openai_api_version,
+            max_retries=2,
+        )
+        resources.callback(_close_resource, _state.openai_client)
 
-    if _AGENT_AVAILABLE:
-        try:
-            from agent_framework.openai import OpenAIChatClient
+        if _AGENT_AVAILABLE:
+            try:
+                from agent_framework.openai import OpenAIChatClient
 
-            async def _agent_token_provider() -> str:
-                return await asyncio.to_thread(_openai_token_provider)
+                async def _agent_token_provider() -> str:
+                    return await asyncio.to_thread(_openai_token_provider)
 
-            _state.agent_chat_client = OpenAIChatClient(
-                model=config.chat_deployment,
-                base_url=f"{config.openai_endpoint.rstrip('/')}/openai/v1",
-                api_version=config.agent_api_version,
-                api_key=_agent_token_provider,
-            )
-        except Exception:
-            logger.warning("agent_chat_client_init_failed", exc_info=True)
+                _state.agent_chat_client = OpenAIChatClient(
+                    model=config.chat_deployment,
+                    base_url=f"{config.openai_endpoint.rstrip('/')}/openai/v1",
+                    api_version=config.agent_api_version,
+                    api_key=_agent_token_provider,
+                )
+            except Exception:
+                logger.warning("agent_chat_client_init_failed", exc_info=True)
+                _state.agent_chat_client = None
+        else:
             _state.agent_chat_client = None
-    else:
-        _state.agent_chat_client = None
 
-    _state.rag_service = RagService(
-        _state.openai_client,
-        _state.registry,
-        config.embedding_deployment,
-        config.chat_deployment,
-        retrieval_timeout_seconds=config.retrieval_timeout_seconds,
-        generation_timeout_seconds=config.generation_timeout_seconds,
-        max_evidence=config.max_evidence_chunks,
-        max_planned_queries=config.max_planned_queries,
-        acl_enabled=config.acl_enabled,
-    )
-    _state.group_resolver = GraphGroupResolver(
-        httpx.Client(auth=_TokenRefreshAuth(credential), timeout=config.graph_group_timeout_seconds)
-    )
+        catalog_container = db.get_container_client(config.catalog_container)
+        loaded_catalog = CosmosCatalogLoader(
+            catalog_container,
+            config.deployment_instance_id,
+            config.catalog_digest,
+        ).load()
+        _loaded_profiles = loaded_catalog.profiles
+        _loaded_maps = loaded_catalog.synonym_maps
+        catalog_version = loaded_catalog.version
+        config = replace(
+            config,
+            default_scoring_profile=loaded_catalog.default_profile,
+            over_fetch_factor=loaded_catalog.over_fetch_factor,
+            full_text_score_scope=loaded_catalog.full_text_score_scope,
+            hybrid_rrf_weights=loaded_catalog.hybrid_weights,
+            synonyms_enabled=loaded_catalog.synonyms_enabled,
+        )
+        _state.config = config
+        _loaded_expanders = {
+            name: SynonymExpander(synonym_map) for name, synonym_map in _loaded_maps.items()
+        }
+        _state.scoring_profiles = _loaded_profiles
+        _state.synonym_expanders = _loaded_expanders
+        _state.catalog_version = catalog_version
+        if config.synonyms_enabled and not _loaded_expanders:
+            logger.warning("synonyms_enabled_but_no_maps_loaded")
 
-    logger.info(
-        "retrieval_service_started",
-        cosmos_endpoint=config.cosmos_endpoint,
-        cosmos_instances=len(registry),
-        acl_enabled=config.acl_enabled,
-    )
-    yield
-    _state.rag_service.close()
-    logger.info("retrieval_service_stopped")
+        _state.rag_service = RagService(
+            _state.openai_client,
+            _state.registry,
+            config.embedding_deployment,
+            config.chat_deployment,
+            retrieval_timeout_seconds=config.retrieval_timeout_seconds,
+            generation_timeout_seconds=config.generation_timeout_seconds,
+            max_evidence=config.max_evidence_chunks,
+            max_planned_queries=config.max_planned_queries,
+            acl_enabled=config.acl_enabled,
+            scoring_profiles=_loaded_profiles,
+            default_scoring_profile=config.default_scoring_profile,
+            over_fetch_factor=config.over_fetch_factor,
+            full_text_score_scope=config.full_text_score_scope,
+            hybrid_rrf_weights=config.hybrid_rrf_weights,
+            synonym_expanders=_loaded_expanders,
+            synonyms_enabled=config.synonyms_enabled,
+        )
+        resources.callback(_close_resource, _state.rag_service)
+        graph_client = httpx.Client(
+            auth=_TokenRefreshAuth(credential), timeout=config.graph_group_timeout_seconds,
+        )
+        resources.callback(_close_resource, graph_client)
+        _state.group_resolver = GraphGroupResolver(graph_client)
+
+        logger.info(
+            "retrieval_service_started",
+            cosmos_endpoint=config.cosmos_endpoint,
+            cosmos_instances=len(registry),
+            acl_enabled=config.acl_enabled,
+            scoring_profiles=redact_catalog(_loaded_profiles),
+            synonym_maps=sorted(_loaded_expanders.keys()),
+            default_scoring_profile=config.default_scoring_profile,
+            full_text_score_scope=config.full_text_score_scope,
+            over_fetch_factor=config.over_fetch_factor,
+            synonyms_enabled=config.synonyms_enabled,
+            deployment_instance_id=config.deployment_instance_id,
+            catalog_version=catalog_version,
+        )
+        yield
+    finally:
+        resources.close()
+        logger.info("retrieval_service_stopped")
+
+
+def _close_resource(resource: Any) -> None:
+    close = getattr(resource, "close", None)
+    if not callable(close):
+        return
+    try:
+        close()
+    except Exception:
+        logger.warning("retrieval_resource_close_failed", resource=type(resource).__name__)
 
 
 app = FastAPI(title="RAG Retrieval Agent", lifespan=_lifespan)
+
+
+def _error_request_id(request: Request) -> str:
+    values = request.headers.getlist(GATEWAY_REQUEST_ID_HEADER)
+    if len(values) == 1:
+        try:
+            return parse_gateway_request_id(values[0])
+        except AuthorizationError:
+            pass
+    return str(uuid.uuid4())
+
+
+def _error_response(
+    request: Request,
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {"code": code, "message": message},
+            "request_id": _error_request_id(request),
+        },
+    )
+
+
+@app.middleware("http")
+async def _query_deadline(request: Request, call_next):
+    if request.url.path != "/api/query":
+        return await call_next(request)
+    config = getattr(_state, "config", None)
+    timeout_seconds = getattr(config, "operation_timeout_seconds", 27.0)
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await call_next(request)
+    except TimeoutError:
+        return _error_response(
+            request,
+            status_code=504,
+            code="operation_timeout",
+            message="The retrieval operation timed out.",
+        )
+
+
+@app.exception_handler(UnknownScoringProfileError)
+async def _unknown_scoring_profile_handler(
+    request: Request, error: UnknownScoringProfileError,
+) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=400,
+        code="unknown_scoring_profile",
+        message="The requested scoring profile is unavailable.",
+    )
+
+
+@app.exception_handler(RetrievalDependencyError)
+async def _retrieval_dependency_handler(
+    request: Request, error: RetrievalDependencyError,
+) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=503,
+        code="retrieval_dependency_unavailable",
+        message="Retrieval is temporarily unavailable.",
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _request_validation_handler(
+    request: Request, error: RequestValidationError,
+) -> JSONResponse:
+    return _error_response(
+        request,
+        status_code=422,
+        code="invalid_request",
+        message="The request is invalid.",
+    )
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(
+    request: Request, error: HTTPException,
+) -> JSONResponse:
+    code = str(error.detail) if isinstance(error.detail, str) else "request_failed"
+    message = (
+        "Authentication is required."
+        if error.status_code in (401, 403)
+        else "The request could not be completed."
+    )
+    return _error_response(
+        request,
+        status_code=error.status_code,
+        code=code,
+        message=message,
+    )
 
 _RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "30"))
 _RATE_LIMIT_WINDOW = 60.0
@@ -208,6 +381,8 @@ class QueryRequest(BaseModel):
     history: list[dict[str, str]] = Field(default_factory=list)
     mode: str = Field(default="hybrid", pattern="^(hybrid|vector|full_text)$")
     top_k: int | None = Field(default=None, ge=1, le=20)
+    scoring_profile: str | None = Field(default=None, max_length=200)
+    expand_synonyms: bool | None = Field(default=None)
 
 
 class Citation(BaseModel):
@@ -224,11 +399,16 @@ class QueryResponse(BaseModel):
 
 @app.post("/api/query", response_model=QueryResponse)
 async def query(request: Request, body: QueryRequest, background_tasks: BackgroundTasks):
-    request_id = str(uuid.uuid4())
+    principal = await asyncio.to_thread(_resolve_principal, request)
+    request_id_headers = request.headers.getlist(GATEWAY_REQUEST_ID_HEADER)
+    if len(request_id_headers) != 1:
+        raise HTTPException(status_code=401, detail="invalid_gateway_request_id")
+    try:
+        request_id = parse_gateway_request_id(request_id_headers[0])
+    except AuthorizationError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
     start = time.perf_counter()
     log = logger.bind(request_id=request_id)
-
-    principal = await asyncio.to_thread(_resolve_principal, request)
 
     if not _rate_limiter.is_allowed(principal.user_id):
         raise HTTPException(status_code=429, detail="rate_limit_exceeded")
@@ -247,6 +427,9 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
                  planned_queries=len(queries))
         result = await _run_agentic_path(
             body.question, principal, mode, planning_usage, log,
+            body.scoring_profile,
+            body.expand_synonyms,
+            body.top_k,
         )
         if result is not None:
             path = "agentic"
@@ -261,6 +444,8 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
             _state.rag_service.answer_with_queries,
             body.question, queries, principal, mode, planning_usage,
             body.top_k,
+            body.scoring_profile,
+            body.expand_synonyms,
         )
 
     background_tasks.add_task(
@@ -284,13 +469,20 @@ async def query(request: Request, body: QueryRequest, background_tasks: Backgrou
         request_id, principal.user_id, principal.tenant_id,
         body.question, answer_text, len(result["citations"]),
         path, body.mode, len(queries), int(elapsed * 1000),
+        getattr(_state, "catalog_version", None),
+        body.scoring_profile or getattr(_state.config, "default_scoring_profile", None),
+        _effective_synonym_map(
+            body.scoring_profile, body.expand_synonyms,
+        ),
+        any(record.get("degraded") is True or record.get("retrieval_degraded") is True
+            for record in result.get("usage", [])),
     )
 
     return QueryResponse(
         answer=result["answer"],
         citations=[
             Citation(
-                ref=f"[S{i}]",
+                ref=citation_label(i),
                 source_name=c["source_name"],
                 url=f"{c['source_url']}#page={c['page_number']}" if c.get("source_url") else f"{c['source_name']}#page={c['page_number']}",
             )
@@ -304,6 +496,8 @@ def _write_query_summary(
     container: Any, request_id: str, user_id: str, tenant_id: str,
     question: str, answer: str, citations_count: int,
     path: str, mode: str, planned_queries: int, e2e_latency_ms: int,
+    catalog_version: str | None, scoring_profile: str | None,
+    synonym_map: str | None, retrieval_degraded: bool,
 ) -> None:
     from retrieval.telemetry import write_audit_records
     write_audit_records(container, request_id, user_id, tenant_id, mode, [{
@@ -316,7 +510,22 @@ def _write_query_summary(
         "path": path,
         "planned_queries": planned_queries,
         "e2e_latency_ms": e2e_latency_ms,
+        "catalog_version": catalog_version,
+        "scoring_profile": scoring_profile,
+        "synonym_map": synonym_map,
+        "retrieval_degraded": retrieval_degraded,
     }])
+
+
+def _effective_synonym_map(
+    requested_profile: str | None, expand_synonyms: bool | None,
+) -> str | None:
+    if not getattr(_state.config, "synonyms_enabled", False) or expand_synonyms is False:
+        return None
+    profile_name = requested_profile or getattr(_state.config, "default_scoring_profile", None)
+    profiles = getattr(_state, "scoring_profiles", {}) or {}
+    profile = profiles.get(profile_name) if profile_name else None
+    return profile.synonym_map if profile is not None else None
 
 
 async def _run_agentic_path(
@@ -325,37 +534,28 @@ async def _run_agentic_path(
     mode: RetrievalMode,
     planning_usage: list[dict[str, Any]],
     log: Any,
+    scoring_profile: str | None = None,
+    expand_synonyms: bool | None = None,
+    top_k: int | None = None,
 ) -> dict[str, Any] | None:
     """Run the Agent Framework agent. Returns None on timeout/error (caller falls back)."""
+    # Resolved outside the try/except so a config error (unknown profile) fails fast
+    # instead of routing silently through the standard-path fallback.
+    _state.rag_service.validate_scoring_profile(scoring_profile)
     try:
-        async def _embed(text: str) -> list[float]:
-            start = time.perf_counter()
-            resp = await asyncio.to_thread(
-                _state.openai_client.embeddings.create,
-                model=_state.config.embedding_deployment,
-                input=[text],
-                dimensions=3072,
-                encoding_format="float",
-            )
-            embed_usage = getattr(resp, "usage", None)
-            agentic_usage.append({
-                "operation": "retrieval_embedding",
-                "model": _state.config.embedding_deployment,
-                "prompt_tokens": getattr(embed_usage, "prompt_tokens", 0) if embed_usage else 0,
-                "completion_tokens": 0,
-                "latency_ms": int((time.perf_counter() - start) * 1000),
-            })
-            return list(resp.data[0].embedding)
-
+        agent_deadline = time.monotonic() + _state.config.agent_timeout_seconds
         retrieved_chunks: list[RetrievedChunk] = []
         agentic_usage: list[dict[str, Any]] = []
         search_tool = make_search_tool(
-            registry=_state.registry,
-            embed_fn=_embed,
-            acl_ids=list(principal.acl_ids),
+            rag_service=_state.rag_service,
+            principal=principal,
             retrieved_chunks=retrieved_chunks,
-            acl_enabled=_state.config.acl_enabled,
             usage=agentic_usage,
+            scoring_profile=scoring_profile,
+            max_evidence=top_k or _state.config.max_evidence_chunks,
+            expand_synonyms=expand_synonyms,
+            forced_mode=mode,
+            deadline_monotonic=agent_deadline,
         )
         agent = create_rag_agent(
             _state.agent_chat_client, search_tool, model=_state.config.chat_deployment,
@@ -390,6 +590,8 @@ async def _run_agentic_path(
     except asyncio.TimeoutError:
         log.warning("agent_timeout", timeout=_state.config.agent_timeout_seconds)
         return None
+    except RetrievalDependencyError:
+        raise
     except Exception:
         log.warning("agent_error", exc_info=True)
         return None
@@ -416,13 +618,18 @@ async def health_ready():
 
 
 def _resolve_principal(request: Request) -> Principal:
-    encoded = request.headers.get("X-MS-CLIENT-PRINCIPAL")
-    if not encoded:
-        raise HTTPException(status_code=401, detail="missing_auth_header")
+    service_headers = request.headers.getlist("X-MS-CLIENT-PRINCIPAL")
+    context_headers = request.headers.getlist(GATEWAY_CONTEXT_HEADER)
+    if len(service_headers) != 1 or len(context_headers) != 1:
+        raise HTTPException(status_code=401, detail="invalid_gateway_headers")
     try:
-        return principal_from_easy_auth(
-            encoded,
+        return principal_from_gateway(
+            service_headers[0],
+            context_headers[0],
             expected_tenant_id=_state.config.tenant_id,
+            expected_audience=_state.config.retrieval_audience,
+            expected_gateway_client_id=_state.config.gateway_client_id,
+            expected_gateway_principal_id=_state.config.gateway_principal_id,
             group_resolver=_state.group_resolver,
             acl_enabled=_state.config.acl_enabled,
         )

@@ -1,162 +1,171 @@
 # Troubleshooting
 
-Living runbook of **known, verified** failure classes for the ingestion pipeline. Each entry
-was reproduced and root-caused in production — this is not speculative. Add a new entry only
-after root-causing a real recurring failure; do not pre-document hypothetical issues (they go
-stale and are unreliable).
+These procedures follow the current Function, ACA, Cosmos lifecycle, and guarded deployment contracts. They describe failures observed in prior deployed environments; they are not all production incidents.
 
-Format: **Symptom → Root Cause → Recovery Commands → Verification**.
+## Establish the Target
 
----
+Before diagnosis, capture:
 
-## 1. Full-sync completes with `failed > 0` and/or `runStatus: "finalization_failed"`
+- Subscription, tenant, resource group, azd environment, and deployment instance.
+- Function name and ACA latest ready revision.
+- Full image and catalog digests.
+- Exact orchestration ID or query request ID.
 
-### Symptom
-`GET /api/ingestion/status?instanceId=<full-sync-id>` returns:
-```json
-{
-  "runtimeStatus": "OrchestrationRuntimeStatus.Completed",
-  "output": { "discovered": 22, "succeeded": 19, "failed": 3, "runStatus": "finalization_failed" }
-}
-```
-`GET /api/ingestion/inspect?container=source-documents` shows some documents stuck at
-`status: "processing"`, `error: null` (no error recorded) — they never reach `ready` or `failed`.
+Do not mutate resources until the target and artifact identity are unambiguous.
 
-### Root cause
-Two possible causes, check in this order:
+## Authentication Failures
 
-**A. Retryable errors from a shared dependency (e.g. Azure OpenAI 429 rate limit)** during a
-large fan-out burst. Confirm via Application Insights (this is the *only* place with the actual
-exception — `service-audit` and `source-documents.error` do not capture it):
+### Function returns 401
+
+Check that the token:
+
+- Uses exactly `FUNCTION_API_AUDIENCE`.
+- Comes from an application in `FUNCTION_ALLOWED_CALLER_CLIENT_ID`.
+- Represents a user and includes `user_impersonation` for `/api/query`.
+- Uses the expected tenant.
+
+A Function master key does not bypass EasyAuth.
+
+### Function query returns `retrieval_auth_failed`
+
+Verify:
+
+- `RETRIEVAL_SERVICE_URL` is the expected ACA private FQDN.
+- `RETRIEVAL_SERVICE_SCOPE` targets the retrieval API.
+- ACA Authentication allows the Function UAMI client and principal.
+- The Function UAMI has `Retrieval.Gateway` on the retrieval API application.
+- Retrieval settings contain the matching gateway client/principal IDs and audience.
+
+Do not forward or synthesize a user `X-MS-CLIENT-PRINCIPAL` to ACA. The Function creates `X-RAG-GATEWAY-CONTEXT` and `X-RAG-REQUEST-ID` after validating the delegated user.
+
+## Full Sync Has Failed or Stuck Documents
+
+Inspect the current run and source documents:
+
 ```powershell
-az monitor app-insights query -g rg-rag-project -a rag-dev-ai --analytics-query "traces | where timestamp > ago(2h) | where severityLevel >= 3 | project timestamp, message | order by timestamp desc"
+$rows = (Invoke-RestMethod `
+  -Uri "$baseUrl/api/ingestion/inspect?container=source-documents&limit=200" `
+  -Headers $headers).rows
+$rows | Where-Object status -ne 'ready' |
+  Select-Object sourceName, status, stage, attemptCount, error
 ```
-Look for `openai.RateLimitError` / `RateLimitReached` in the message. This is a capacity issue —
-see the OpenAI TPM/RPM quota for the embedding deployment if it recurs frequently.
 
-**B. Pre-fix code defect (resolved 2026-08-21)** — before the fix in `function_app.py`
-(`process_document_activity` re-raising retryable errors, orchestrator catching wave exceptions
-via `fail_wave_documents_activity`), a retryable error would be silently swallowed after 1
-attempt instead of the configured 5, leaving the document permanently stuck in `processing`.
-If you see this behavior on a Function App older than 2026-08-21, redeploy current
-`app/function_app.py` first.
+The inspect endpoint is capped at 200 rows. `runId` partition filtering applies only to `source-documents`; omit it for other containers.
 
-### Recovery commands
+If the orchestration must be terminated:
+
 ```powershell
-$env:RAG_TOKEN = (az account get-access-token --resource "api://<admin-api-client-id>" --query accessToken -o tsv)
-$base = "https://<func-app-name>.azurewebsites.net"
-$h = @{ Authorization = "Bearer $env:RAG_TOKEN" }
-
-# 1. Identify stuck documents
-Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&limit=50" -Headers $h |
-  Select-Object -ExpandProperty rows | Where-Object { $_.status -ne "ready" } |
-  Select-Object sourceName, status, stage, error
-
-# 2. Terminate the run — force-fails non-terminal docs, finalizes as TERMINATED
-Invoke-RestMethod -Uri "$base/api/ingestion/terminate" -Method POST -Headers $h
-
-# 3. Retry only the failed documents (not a full re-scan)
-Invoke-RestMethod -Uri "$base/api/ingestion/retry-failed" -Method POST -Headers $h
-
-# 4. Poll the retry orchestration until Completed
-Invoke-RestMethod -Uri "$base/api/ingestion/status?instanceId=retry-failed-<full-sync-id>" -Headers $h
+Invoke-RestMethod -Uri "$baseUrl/api/ingestion/terminate" -Method Post -Headers $headers
 ```
-If step 3 returns `409 sync_in_progress`, wait for the current orchestration to finish first.
 
-### Verification
+Retry failed documents and capture the returned random orchestration ID:
+
 ```powershell
-Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&limit=50" -Headers $h |
-  Select-Object -ExpandProperty rows | Where-Object { $_.status -ne "ready" }
-# Expect: no rows returned
+$retry = Invoke-RestMethod `
+  -Uri "$baseUrl/api/ingestion/retry-failed" `
+  -Method Post `
+  -Headers $headers
+
+Invoke-RestMethod `
+  -Uri "$baseUrl/api/ingestion/status?instanceId=$($retry.orchestrationId)" `
+  -Headers $headers
 ```
 
----
+Do not construct `retry-failed-<full-sync-id>`; retry IDs use a new UUID.
 
-## 2. Ingested documents show `pageCount: 2` regardless of actual page count, no error recorded
+## Document Intelligence Rejection
 
-### Symptom
-Every (or most) documents in `source-documents` show `pageCount: 2`, small `writtenChunkCount`
-(e.g. 2 or 8), `status: "ready"`, `error: null` — looks successful but content is truncated.
-Retrieval queries against later pages of the document return "insufficient evidence" even
-though the source PDF clearly has that content.
+`document_intelligence_rejected` is terminal for that document attempt. Verify the source is a valid supported PDF, within size/page limits, and readable through the source connector.
 
-### Root cause
-The Document Intelligence resource is on the **F0 (Free) pricing tier**, which silently
-processes only the first 2 pages of any PDF — no exception is raised. Confirmed via
-[Microsoft Learn: Document Intelligence layout model — Input requirements](https://learn.microsoft.com/azure/ai-services/document-intelligence/prebuilt/layout?view=doc-intel-4.0.0#input-requirements):
-"With a free-tier subscription, only the first two pages are processed."
+Tier changes or AI-service replacements are infrastructure changes. Update reviewed deployment inputs and use `scripts/deploy.ps1`; do not deploy `ai-services.bicep` directly or delete private endpoints to work around access.
 
-Check the tier:
+## SharePoint ACL or Site-Group Failures
+
+Verify:
+
+- `SHAREPOINT_SITE_URL` is present, HTTPS, and resolves to the configured drive.
+- The ingestion app has the required Graph and SharePoint application permissions and site grant.
+- The certificate secret is readable by the Function UAMI.
+- SharePoint site groups contain Entra security groups, not only direct users or sharing links.
+- Entra groups return `securityEnabled=true`.
+
+An ACL-revoked document can be restored only when its current source eTag matches, no active version exists, and it is the authoritative matching historical version.
+
+## Delta Sync Does Not Advance
+
+- Resolve the random instance ID from the `delta-sync-trigger` control record.
+- Inspect the exact orchestration output.
+- Any failed delta item retains the previous cursor; a later tick replays the round.
+- A `410 Gone` cursor causes reset/re-bootstrap handling.
+- A full sync or prior delta run can intentionally suppress a new trigger.
+
+Do not manually replace the cursor unless a separately approved recovery procedure requires it.
+
+## Lifecycle Transition Stuck
+
+The 10-minute lifecycle reconciliation handles:
+
+- `admitting` documents.
+- `acl_refreshing` documents.
+- `retiring` documents.
+- `deleting` documents.
+- Orphan chunks.
+- Older duplicate ready versions when the current full-sync run supplies the ready winner.
+
+Inspect the manifest status, pending fields, lifecycle generation, expected chunk count, and exact document key before intervening.
+
+## Retrieval Startup or Readiness Fails
+
+Readiness executes a small query against the first configured chunks container. Check:
+
+- Cosmos private DNS/network reachability.
+- Retrieval UAMI data-reader assignments on `search-chunks`, `source-documents`, and `retrieval-config`.
+- Exact `DEPLOYMENT_INSTANCE_ID` and `RETRIEVAL_CATALOG_DIGEST`.
+- Presence and validity of `catalog:<digest>` in the deployment-instance partition.
+- Catalog default profile and synonym-map references.
+
+Changing the publication `active` pointer does not change runtime startup selection.
+
+## Query Failures
+
+| Function error code | Meaning |
+| --- | --- |
+| `unauthorized` | Delegated user claims failed validation |
+| `gateway_not_configured` | Retrieval URL or service scope is missing/invalid |
+| `retrieval_auth_failed` | ACA/retrieval rejected Function service authentication |
+| `retrieval_unavailable` | Retrieval returned a server error |
+| `invalid_retrieval_response` | Retrieval returned malformed, oversized, or incompatible JSON |
+| `retrieval_request_failed` | Retrieval returned another 4xx response |
+| `retrieval_timeout` | Function proxy deadline expired |
+
+Use `request_id` to correlate Function logs, ACA logs, and `service-audit`. The audit container is best-effort and has a 90-day TTL.
+
+## Cosmos Throttling
+
+The repositories retry supported 429 paths. Long-running ingestion can therefore be slow without being incorrect. Check dependency telemetry and orchestration progress before terminating.
+
+Do not disable ACL checks, open public Cosmos access, or use account keys to make a diagnostic pass.
+
+## Safe Data Cleanup
+
+`DELETE /api/ingestion/purge` supports exact item IDs and guarded purge-all for `ingestion-runs`, `source-documents`, and `search-chunks`. It refuses `service-audit`.
+
+Prefer exact IDs. A complete cleanup of one document must account for its manifest partition and all chunk IDs in its `documentKey` partition. The inspect endpoint's 200-row cap cannot prove complete large-container cleanup.
+
+## Deployment Failures
+
+Use the controller's preview first:
+
 ```powershell
-az cognitiveservices account list -g rg-rag-project --query "[].{name:name, kind:kind, sku:sku.name}" -o table
+.\scripts\deploy.ps1 -Phase <phase> @target
 ```
 
-### Recovery commands
-```powershell
-# 1. Update infra/main.parameters.dev.bicepparam: useDocumentIntelligenceFreeTier = false (and useLanguageFreeTier = false)
+Common guards:
 
-# 2. Deploy only the ai-services module (does not touch Cosmos/Functions/ACA/networking)
-az deployment group create --resource-group rg-rag-project --template-file "infra/modules/ai-services.bicep" `
-  --parameters documentIntelligenceName=<di-name> languageServiceName=<lang-name> useFreeF0=false useLanguageFreeTier=false location=<region>
+- Plan or source hash changed: rerun `Authority`, review changes, and obtain approval again.
+- Target mismatch: align Azure CLI and azd subscription/location with the reviewed target.
+- Mutable image/tag: run `Build` and set the returned digest reference.
+- Catalog mismatch: validate the exact catalog and set its returned digest.
+- Temporary job remains: run `OperationsCleanup` only after E2E gates and explicit approval.
 
-# 3. Purge stale ingested data (deletes rows only, containers/schema untouched)
-$body = @{ container = "search-chunks"; purgeAll = $true; confirm = "yes" } | ConvertTo-Json
-Invoke-RestMethod -Uri "$base/api/ingestion/purge" -Method DELETE -Headers $h -Body $body -ContentType "application/json"
-# repeat for "source-documents" and "ingestion-runs"
-
-# 4. Re-run full-sync
-Invoke-RestMethod -Uri "$base/api/ingestion/full-sync" -Method POST -Headers $h
-```
-
-### Verification
-```powershell
-Invoke-RestMethod -Uri "$base/api/ingestion/inspect?container=source-documents&limit=50" -Headers $h |
-  Select-Object -ExpandProperty rows | Select-Object sourceName, pageCount, writtenChunkCount
-# Expect: pageCount matches the real page count of each source PDF, not capped at 2
-```
-
----
-
-## 3. Full-sync/delta-sync/ACL-resync fails with "Non-Deterministic workflow detected"
-
-### Symptom
-`GET /api/ingestion/status?instanceId=<id>` returns:
-```json
-{
-  "runtimeStatus": "OrchestrationRuntimeStatus.Failed",
-  "output": "Non-Deterministic workflow detected: A previous execution of this orchestration scheduled a timer task with sequence number 12 named but the current orchestration replay instead produced a ScheduleTaskOrchestratorAction action with this sequence number. Was a change made to the orchestrator code after this instance had already started running?"
-}
-```
-Fails consistently at the same replay sequence number on every retry, even with no code change
-to the orchestrator.
-
-### Root cause
-**Pre-fix code defect (resolved 2026-08-24).** Before the fix, full-sync/delta-sync/ACL-resync
-each reused one fixed, predictable Durable instance ID across every run/tick (derived from
-`INGESTION_SOURCE_ID`). Durable instance-ID reuse is documented as best-effort/racy at the
-storage layer — confirmed by a Microsoft engineer:
-["We cannot reliably silently replace instanceIDs that are in the Pending state ... there exists
-a race condition where you have scheduled an orchestrator to be created but that information has
-not yet been propagated throughout our storage."](https://github.com/Azure/azure-functions-durable-python/issues/410)
-Reusing an ID across separate runs corrupted the replay history, which the Durable Task
-Scheduler surfaced as this error.
-
-If you see this on a Function App older than 2026-08-24, redeploy current `app/function_app.py`,
-`app/ingestion/models.py`, `app/ingestion/services.py`, and `app/ingestion/lifecycle_repository.py`
-first — the fix removes fixed instance IDs entirely (every run/tick gets a fresh, randomly
-generated ID; "is it already running" is tracked via Cosmos instead of polling a fixed ID).
-
-### Recovery commands
-```powershell
-# 1. Terminate the stuck run and force-fail non-terminal docs
-Invoke-RestMethod -Uri "$base/api/ingestion/terminate" -Method POST -Headers $h
-
-# 2. Re-run full-sync — it will get a fresh instance ID, not the failed one
-Invoke-RestMethod -Uri "$base/api/ingestion/full-sync" -Method POST -Headers $h
-```
-
-### Verification
-```powershell
-Invoke-RestMethod -Uri "$base/api/ingestion/status" -Headers $h | ConvertTo-Json -Depth 5
-# Expect: a different "instanceId" than the failed run, and runtimeStatus progressing to Completed
-```
+Do not use direct `az containerapp update`, direct Bicep deployment, or direct Function publishing as recovery shortcuts.

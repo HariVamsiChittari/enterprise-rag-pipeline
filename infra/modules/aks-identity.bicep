@@ -24,6 +24,15 @@ param cosmosDatabaseName string
 @description('Service audit container name (retrieval identity needs write access here only)')
 param serviceAuditContainerName string
 
+@description('Search chunks container name')
+param searchChunksContainerName string
+
+@description('Source documents container name')
+param sourceDocumentsContainerName string
+
+@description('Retrieval catalog container name')
+param retrievalConfigContainerName string
+
 @description('Azure OpenAI account name')
 param openAiAccountName string
 
@@ -32,6 +41,8 @@ param openAiResourceGroupName string
 
 @description('Microsoft Graph service principal object ID (tenant-specific)')
 param graphServicePrincipalId string
+@description('Deploy Microsoft Graph application-role assignments')
+param deployGraphAppRoleAssignments bool = true
 
 @description('Resource tags')
 param tags object = {}
@@ -58,15 +69,24 @@ resource federatedCredential 'Microsoft.ManagedIdentity/userAssignedIdentities/f
   }
 }
 
-// Cosmos DB Built-in Data Reader (00000000-0000-0000-0000-000000000001)
-resource cosmosDataReader 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = {
-  name: '${last(split(cosmosAccountId, '/'))}/${guid(identity.id, cosmosAccountId, 'cosmos-reader')}'
-  properties: {
-    roleDefinitionId: '${cosmosAccountId}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000001'
-    principalId: identity.properties.principalId
-    scope: cosmosAccountId
+var readableContainerNames = [
+  searchChunksContainerName
+  sourceDocumentsContainerName
+  retrievalConfigContainerName
+]
+
+// Cosmos DB Built-in Data Reader (00000000-0000-0000-0000-000000000001), scoped to
+// only the containers used by retrieval.
+resource cosmosDataReaders 'Microsoft.DocumentDB/databaseAccounts/sqlRoleAssignments@2024-05-15' = [
+  for containerName in readableContainerNames: {
+    name: '${last(split(cosmosAccountId, '/'))}/${guid(identity.id, cosmosAccountId, 'cosmos-reader', containerName)}'
+    properties: {
+      roleDefinitionId: '${cosmosAccountId}/sqlRoleDefinitions/00000000-0000-0000-0000-000000000001'
+      principalId: identity.properties.principalId
+      scope: '${cosmosAccountId}/dbs/${cosmosDatabaseName}/colls/${containerName}'
+    }
   }
-}
+]
 
 // Cosmos DB Built-in Data Contributor (00000000-0000-0000-0000-000000000002), scoped ONLY to the
 // service-audit container so the retrieval identity cannot write to search-chunks/source-documents.
@@ -89,13 +109,13 @@ module openAiRoleAssignment 'openai-rbac-aks.bicep' = {
 }
 
 // Microsoft Graph app role assignments for group resolution via /users/{id}/transitiveMemberOf
-resource graphGroupMemberReadAll 'Microsoft.Graph/appRoleAssignedTo@v1.0' = {
+resource graphGroupMemberReadAll 'Microsoft.Graph/appRoleAssignedTo@v1.0' = if (deployGraphAppRoleAssignments) {
   appRoleId: graphAppRoles.groupMemberReadAll
   principalId: identity.properties.principalId
   resourceId: graphServicePrincipalId
 }
 
-resource graphUserReadAll 'Microsoft.Graph/appRoleAssignedTo@v1.0' = {
+resource graphUserReadAll 'Microsoft.Graph/appRoleAssignedTo@v1.0' = if (deployGraphAppRoleAssignments) {
   appRoleId: graphAppRoles.userReadAll
   principalId: identity.properties.principalId
   resourceId: graphServicePrincipalId
